@@ -2630,6 +2630,9 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			ev.Approver = v.ApproverName
 			ev.ApproverType = v.ApproverType
 			ev.ApproverBy = v.By
+			// Non-empty only when the chain allowed for a reason worth
+			// recording, such as llm_fail_mode = "open".
+			ev.Reason = v.Reason
 		}
 
 		// Verdict.
@@ -3036,6 +3039,11 @@ type runApproveCtx struct {
 // `dashboard` is handled inline (no policy entity needed).
 func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveStage, c runApproveCtx) runtime.ApproveVerdict {
 	policy := g.Policy()
+	// failOpen remembers a stage that allowed only because
+	// llm_fail_mode = "open" resolved an undecided verdict, so the
+	// final allow carries that reason and attribution into the
+	// action log instead of looking like a clean model decision.
+	var failOpen *runtime.ApproveVerdict
 	for _, st := range stages {
 		var ar runtime.ApproverRuntime
 		approverType := ""
@@ -3106,10 +3114,17 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 		}
 		if v.Decision == "" {
 			v = resolveUndecidedVerdict(policy, st.Name, approverType, v)
+			if v.Decision == "allow" && failOpen == nil {
+				fo := v
+				failOpen = &fo
+			}
 		}
 		if v.Decision != "allow" {
 			return v
 		}
+	}
+	if failOpen != nil {
+		return *failOpen
 	}
 	return runtime.ApproveVerdict{Decision: "allow"}
 }
