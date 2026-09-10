@@ -145,6 +145,16 @@ rule "allow-telegram" {
 	if !strings.Contains(end.ReqBody, telegramTestPlaceholder) && !strings.Contains(strings.ToLower(end.ReqBody), "redact") {
 		t.Fatalf("request body audit sample = %q, want placeholder or redaction marker", end.ReqBody)
 	}
+	rw := httptest.NewRecorder()
+	(&webMux{g: g}).writeActionFixture(rw, &end)
+	if rw.Code != http.StatusBadRequest {
+		t.Fatalf("fixture export status = %d, want 400 for redacted request body; body=%s", rw.Code, rw.Body.String())
+	}
+	// Token injection edits the body, so the capture is both
+	// transformed and redacted; either reason must be spelled out.
+	if b := rw.Body.String(); !strings.Contains(b, "redacted") && !strings.Contains(b, "transformed") {
+		t.Fatalf("fixture export error = %q, want redacted-body or transformed explanation", b)
+	}
 
 	_ = clientTLS.Close()
 	select {
