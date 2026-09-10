@@ -688,9 +688,25 @@ func teeGatewayLog(path string) error {
 	if err != nil {
 		return err
 	}
-	log.SetOutput(io.MultiWriter(os.Stderr, f))
+	// File first: a write to a broken stderr pipe can still end the
+	// process with SIGPIPE (Go's default for fds 1 and 2), and the
+	// file should have the line by then.
+	log.SetOutput(logTee{f, os.Stderr})
 	log.Printf("log: also writing to %s", path)
 	return nil
+}
+
+// logTee writes every line to all sinks in order and never reports an
+// error: unlike io.MultiWriter it does not stop at the first failing
+// writer, so a closed stderr does not silence the log file (and vice
+// versa). The standard logger discards write errors anyway.
+type logTee []io.Writer
+
+func (t logTee) Write(p []byte) (int, error) {
+	for _, w := range t {
+		_, _ = w.Write(p)
+	}
+	return len(p), nil
 }
 
 // logDashboardAuthState emits a one-line summary of dashboard-auth
@@ -3337,14 +3353,24 @@ func runGateway(args []string) {
 		}
 		log.Fatalf("config: %v", err)
 	}
-	if logPath := cfg.LogPath(); logPath != "" {
-		if err := teeGatewayLog(logPath); err != nil {
-			log.Fatalf("log_path: %v", err)
-		}
-	}
 	stateDir := resolveStateDir(cfg)
+	// Tee the log as early as possible so the file sees the rest of
+	// startup, including a state-dir failure. A log_path inside a
+	// state_dir that does not exist yet (first run) gets one retry
+	// after the directory is created. Lines logged while parsing the
+	// config itself (plugin load messages included) are stderr-only.
+	logPath := cfg.LogPath()
+	teeErr := error(nil)
+	if logPath != "" {
+		teeErr = teeGatewayLog(logPath)
+	}
 	if err := os.MkdirAll(stateDir, 0o700); err != nil {
 		log.Fatalf("state dir: %v", err)
+	}
+	if teeErr != nil {
+		if teeErr = teeGatewayLog(logPath); teeErr != nil {
+			log.Fatalf("log_path: %v", teeErr)
+		}
 	}
 	if err := checkDirWritable(stateDir); err != nil {
 		log.Fatalf("state dir: cannot create files in state_dir %s as uid %d: %v\n      Fix: run the gateway as the user that owns it, `chown` it to that user, or set a writable state_dir in the gateway block of %s.", stateDir, os.Getuid(), err, cfgPath)
