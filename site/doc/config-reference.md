@@ -143,7 +143,8 @@ Targets one channel. Timeout / require_approvers
 override the global defaults block on a per-approver basis.
 
 Credential references a credential whose body satisfies HITLNotifier
-(slack_tokens today; future Discord / Telegram / SMTP credentials).
+(slack_tokens and signal_cli today; future Discord / Telegram / SMTP
+credentials).
 Leave empty for a dashboard-only approver (no channel notification;
 operator clicks approve/deny on the dashboard).
 
@@ -187,7 +188,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -396,6 +397,41 @@ the catchall (one allowed per (profile, endpoint)).
 
 ```hcl
 credential "postgres_credential" "example" {}
+```
+
+### `credential "signal_cli" "<name>"`
+
+A notification-only HITL notifier that delivers approval
+prompts to Signal via a signal-cli-rest-api instance
+(https://github.com/bbernhard/signal-cli-rest-api). Signal has no
+interactive buttons, so the prompt is plain text ending in an
+"Open dashboard" link where the operator approves or denies.
+
+Connection details live in the secret store as named slots, filled via the
+dashboard: api_url (base URL of the signal-cli-rest-api), number (the
+registered E.164 sender), and auth (optional "user:pass" for HTTP basic
+auth). The recipient is the human_approver's channel - an E.164 number or a
+"group.<base64-id>".
+
+DeleteOnDecision remote-deletes the prompt once the operation is decided,
+so a conversation does not fill up with dead approve/deny links. It runs
+off the runtime's HITLMessageUpdater hook - the same one the Slack notifier
+uses to edit its message - so a prompt is only ever removed after the
+decision lands, never on a timer while the operator is still expected to
+act.
+
+Remote-delete needs a real peer: a group with another member, or a
+different number. It does NOT work for Note-to-Self (channel = the
+account's own number): signal-cli returns the sync-envelope timestamp for
+self-sends, not the message timestamp remote-delete needs, so the delete is
+a no-op on the linked phone.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `delete_on_decision` | `bool` | no | Remote-deletes the sent prompt once the HITL operation is decided. Off by default, which leaves the prompts in the conversation as a record of what was asked. |
+
+```hcl
+credential "signal_cli" "example" {}
 ```
 
 ### `credential "slack_tokens" "<name>"`
