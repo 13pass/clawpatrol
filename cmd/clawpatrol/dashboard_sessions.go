@@ -63,26 +63,37 @@ func createDashboardSession(db *sql.DB, username string, ttl time.Duration) (str
 // when the token is missing or expired; ("", false, err) on DB
 // trouble.
 func lookupDashboardSession(db *sql.DB, token string) (string, bool, error) {
+	username, _, ok, err := lookupDashboardSessionUser(db, token)
+	return username, ok, err
+}
+
+// lookupDashboardSessionUser is lookupDashboardSession plus the user's
+// role, read in the same query. role is empty when the session's user
+// row no longer exists.
+func lookupDashboardSessionUser(db *sql.DB, token string) (string, dashboardRole, bool, error) {
 	if db == nil {
-		return "", false, fmt.Errorf("no db")
+		return "", "", false, fmt.Errorf("no db")
 	}
 	if token == "" {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	hash := hashSessionToken(token)
 	var (
 		username  string
 		expiresNs int64
+		role      sql.NullString
 	)
 	err := db.QueryRow(
-		`SELECT username, expires_ns FROM dashboard_sessions WHERE token_hash = ?`,
+		`SELECT s.username, s.expires_ns, u.role
+		 FROM dashboard_sessions s LEFT JOIN dashboard_users u ON u.username = s.username
+		 WHERE s.token_hash = ?`,
 		hash,
-	).Scan(&username, &expiresNs)
+	).Scan(&username, &expiresNs, &role)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", false, nil
+		return "", "", false, nil
 	}
 	if err != nil {
-		return "", false, err
+		return "", "", false, err
 	}
 	now := time.Now()
 	if now.UnixNano() >= expiresNs {
@@ -90,13 +101,17 @@ func lookupDashboardSession(db *sql.DB, token string) (string, bool, error) {
 		// and rules out any later confusion. Errors are non-fatal —
 		// the sweeper will retry.
 		_, _ = db.Exec(`DELETE FROM dashboard_sessions WHERE token_hash = ?`, hash)
-		return "", false, nil
+		return "", "", false, nil
 	}
 	_, _ = db.Exec(
 		`UPDATE dashboard_sessions SET last_seen_ns = ? WHERE token_hash = ?`,
 		now.UnixNano(), hash,
 	)
-	return username, true, nil
+	var userRole dashboardRole
+	if role.Valid {
+		userRole = normalizeDashboardRole(username, role.String)
+	}
+	return username, userRole, true, nil
 }
 
 // revokeDashboardSession deletes the row matching token. Used by the

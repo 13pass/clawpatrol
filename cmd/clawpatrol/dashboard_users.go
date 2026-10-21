@@ -31,6 +31,19 @@ func validDashboardRole(role dashboardRole) bool {
 	return role == dashboardRoleAdmin || role == dashboardRoleMember
 }
 
+// normalizeDashboardRole maps a stored role to one the gate knows,
+// failing closed: root is always an admin, and anything unrecognised
+// (a role written by another version, a hand-edited row) is a member.
+func normalizeDashboardRole(username, stored string) dashboardRole {
+	if username == dashboardRootUsername {
+		return dashboardRoleAdmin
+	}
+	if role := dashboardRole(stored); validDashboardRole(role) {
+		return role
+	}
+	return dashboardRoleMember
+}
+
 // dashboardUsernameRe keeps usernames usable as the `<user>-` prefix of
 // HCL block names a user's config file declares.
 var dashboardUsernameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
@@ -40,8 +53,9 @@ func validDashboardUsername(username string) bool {
 }
 
 var (
-	errDashboardUserExists   = errors.New("dashboard user already exists")
-	errDashboardUserNotFound = errors.New("dashboard user not found")
+	errDashboardUserExists    = errors.New("dashboard user already exists")
+	errDashboardUserNotFound  = errors.New("dashboard user not found")
+	errDashboardUserNotMember = errors.New("dashboard user is not a member")
 )
 
 type dashboardUser struct {
@@ -189,10 +203,44 @@ func lookupDashboardUserRole(db *sql.DB, username string) (dashboardRole, bool, 
 	if err != nil {
 		return "", false, err
 	}
-	if username == dashboardRootUsername {
-		return dashboardRoleAdmin, true, nil
+	return normalizeDashboardRole(username, role), true, nil
+}
+
+// setDashboardMemberPassword resets a member's password and ends their
+// sessions. It never creates a row, so a reset racing a delete cannot
+// bring the account back, and it never touches an admin: an admin's
+// password changes only through that admin (/api/me/password) or, for
+// root, the --set-dashboard-password flag.
+func setDashboardMemberPassword(db *sql.DB, username, password string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
 	}
-	return dashboardRole(role), true, nil
+	if password == "" {
+		return fmt.Errorf("password must not be empty")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), dashboardUsersBcryptCost)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	res, err := db.Exec(
+		`UPDATE dashboard_users SET password_hash = ?, updated_ns = ?
+		 WHERE username = ? AND role = ? AND username != ?`,
+		string(hash), time.Now().UnixNano(), username, string(dashboardRoleMember), dashboardRootUsername,
+	)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		if _, exists, err := lookupDashboardUserRole(db, username); err != nil {
+			return err
+		} else if !exists {
+			return errDashboardUserNotFound
+		}
+		return errDashboardUserNotMember
+	}
+	return revokeAllDashboardSessionsFor(db, username)
 }
 
 func setDashboardUserRole(db *sql.DB, username string, role dashboardRole) error {
@@ -232,10 +280,7 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 		if err := rows.Scan(&u.Username, &role, &u.CreatedNs, &u.UpdatedNs); err != nil {
 			return nil, err
 		}
-		u.Role = dashboardRole(role)
-		if u.Username == dashboardRootUsername {
-			u.Role = dashboardRoleAdmin
-		}
+		u.Role = normalizeDashboardRole(u.Username, role)
 		out = append(out, u)
 	}
 	return out, rows.Err()

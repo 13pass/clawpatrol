@@ -279,7 +279,17 @@ function UserRow({
               </Button>
             </form>
           ) : (
-            <Button size="xs" variant="outline" onClick={() => setResetting(true)}>
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={user.role === "admin"}
+              title={
+                user.role === "admin"
+                  ? "Admins change their own password on the Account page"
+                  : undefined
+              }
+              onClick={() => setResetting(true)}
+            >
               Reset password
             </Button>
           )}

@@ -317,6 +317,45 @@ before the dashboard ever serves a request:
 clawpatrol gateway --set-dashboard-password '<pw>' gateway.hcl
 ```
 
+### Dashboard accounts and roles
+
+`root` is the bootstrap account, and the first admin. Admins can
+add more accounts on the dashboard's Users page, each with a
+username, an initial password and one of two roles:
+
+- **admin** holds every power `root` has, including user
+  management.
+- **member** is refused every management route except its own
+  account (`/api/me`, `/api/me/password`, logout). Scoped access to
+  a member's own profiles is planned; until then a member can log
+  in, change their password, and nothing else.
+
+The role is read from `clawpatrol.db` on every request, so a role
+change or account deletion applies to sessions already open. It
+fails closed: a stored role the gateway does not recognise is
+treated as `member`. Tailnet operators on the `operators`
+allowlist are admins.
+
+Some limits keep one admin from taking over another account:
+
+- An admin can reset a member's password, never an admin's. Admins
+  change their own password on the Account page, which asks for the
+  current one; `root`'s can also be set from the CLI.
+- `root` cannot be deleted or demoted, and nobody can change their
+  own role or delete themselves, so an admin can always log in.
+
+The login form takes a username; leaving it empty means `root`. An
+unknown username costs the same bcrypt work and gets the same
+"wrong username or password" error as a wrong password. There is no
+rate limit on login attempts yet.
+
+Every state-changing dashboard request, including one refused for
+lack of the admin role, and every login attempt is recorded in the
+`dashboard_audit` table: time, username, method, path, target and
+status, never the request body. Admins read it on the Users page.
+Records older than `gateway.dashboard_audit_keep` (default 365
+days) are deleted.
+
 ### Tailnet operator allowlist (tailscale block)
 
 When the `tailscale {}` block is declared the gateway can additionally

@@ -3896,6 +3896,7 @@ func runGateway(args []string) {
 	// 30d, "0" / "off" disables the default sweep), plus per-endpoint
 	// `retention` overrides applied in sweepActions.
 	g.startActionsSweeper(parseDurationOr(cfg.ActionsKeep(), 720*time.Hour))
+	g.startDashboardAuditSweeper(parseDurationOr(cfg.DashboardAuditKeep(), defaultDashboardAuditKeep))
 
 	// HITL notifications fan-out via the approver runtimes
 	// (config/plugins/approvers); the registry's Add hook emits

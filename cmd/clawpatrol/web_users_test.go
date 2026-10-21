@@ -2,10 +2,12 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -196,6 +198,8 @@ func TestUserAdminInvariants(t *testing.T) {
 		want             int
 	}{
 		{"create member", "/api/users/create", `{"username":"bob","password":"bob-passphrase-1234"}`, http.StatusCreated},
+		{"reset member password", "/api/users/update", `{"username":"bob","password":"bob-new-passphrase-1234"}`, http.StatusOK},
+		{"reset root password", "/api/users/update", `{"username":"root","password":"taken-over-passphrase"}`, http.StatusForbidden},
 		{"duplicate", "/api/users/create", `{"username":"alice","password":"alice-passphrase-1234"}`, http.StatusConflict},
 		{"bad username", "/api/users/create", `{"username":"Bob Smith","password":"bob-passphrase-1234"}`, http.StatusBadRequest},
 		{"bad role", "/api/users/create", `{"username":"carol","password":"carol-passphrase-1234","role":"owner"}`, http.StatusBadRequest},
@@ -203,12 +207,21 @@ func TestUserAdminInvariants(t *testing.T) {
 		{"demote root", "/api/users/update", `{"username":"root","role":"member"}`, http.StatusBadRequest},
 		{"unknown user", "/api/users/update", `{"username":"nobody","role":"admin"}`, http.StatusNotFound},
 		{"promote alice", "/api/users/update", `{"username":"alice","role":"admin"}`, http.StatusOK},
+		{"reset admin password", "/api/users/update", `{"username":"alice","password":"taken-over-passphrase"}`, http.StatusForbidden},
+		{"refused reset keeps role", "/api/users/update", `{"username":"alice","role":"member","password":"taken-over-passphrase"}`, http.StatusForbidden},
 		{"delete root", "/api/users/delete", `{"username":"root"}`, http.StatusBadRequest},
 	}
 	for _, tc := range cases {
 		if rw := serveAs(t, h, root, http.MethodPost, tc.path, tc.body); rw.Code != tc.want {
 			t.Errorf("%s: status = %d, want %d (%s)", tc.name, rw.Code, tc.want, rw.Body.String())
 		}
+	}
+
+	if role, _, _ := lookupDashboardUserRole(w.g.db, "alice"); role != dashboardRoleAdmin {
+		t.Errorf("alice role = %q after a refused demote+reset, want admin", role)
+	}
+	if ok, _, _ := checkDashboardPassword(w.g.db, dashboardRootUsername, usersTestRootPassword); !ok {
+		t.Error("root password changed by another admin")
 	}
 
 	alice := sessionCookieFor(t, w, "alice")
@@ -280,12 +293,8 @@ func TestAuditRecordsStateChangesAndLogins(t *testing.T) {
 			t.Errorf("missing audit record %+v; have %+v", want, records)
 		}
 	}
-	// A member refused by the role gate never reaches the audit
-	// middleware: the refusal is the gate's, not a state change.
-	for k := range got {
-		if k.user == "alice" {
-			t.Errorf("unexpected record for refused member request: %+v", k)
-		}
+	if !got[key{"alice", "/api/credentials/clear", auditTargetRoleRefused, http.StatusForbidden}] {
+		t.Errorf("member request refused by the role gate was not audited; have %+v", records)
 	}
 
 	if rw := serveAs(t, h, member, http.MethodGet, "/api/audit", ""); rw.Code != http.StatusForbidden {
@@ -297,5 +306,86 @@ func TestAuditRecordsStateChangesAndLogins(t *testing.T) {
 	}
 	if err := json.Unmarshal(rw.Body.Bytes(), &page); err != nil || len(page.Records) != 1 {
 		t.Fatalf("GET /api/audit?limit=1 = %d records (err %v)", len(page.Records), err)
+	}
+}
+
+func TestUnknownStoredRoleIsTreatedAsMember(t *testing.T) {
+	w := newUsersTestMux(t)
+	if _, err := w.g.db.Exec(`UPDATE dashboard_users SET role = 'Admin' WHERE username = 'alice'`); err != nil {
+		t.Fatal(err)
+	}
+	if role, _, _ := lookupDashboardUserRole(w.g.db, "alice"); role != dashboardRoleMember {
+		t.Fatalf("stored role 'Admin' read as %q, want member", role)
+	}
+	rw := serveAs(t, w.handler(), sessionCookieFor(t, w, "alice"), http.MethodGet, "/api/users", "")
+	if rw.Code != http.StatusForbidden {
+		t.Fatalf("GET /api/users with an unknown stored role = %d, want 403", rw.Code)
+	}
+}
+
+func TestPrincipalRoleFailsClosed(t *testing.T) {
+	cases := map[dashboardRole]dashboardRole{
+		"":                  dashboardRoleAdmin,
+		dashboardRoleAdmin:  dashboardRoleAdmin,
+		dashboardRoleMember: dashboardRoleMember,
+		"owner":             dashboardRoleMember,
+	}
+	for in, want := range cases {
+		if got := principalRole(principal{Owner: "x", Role: in}); got != want {
+			t.Errorf("principalRole(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestMemberPasswordResetNeverRecreatesDeletedUser(t *testing.T) {
+	w := newUsersTestMux(t)
+	if err := deleteDashboardUser(w.g.db, "alice"); err != nil {
+		t.Fatal(err)
+	}
+	if err := setDashboardMemberPassword(w.g.db, "alice", "revived-passphrase-1234"); !errors.Is(err, errDashboardUserNotFound) {
+		t.Fatalf("reset of a deleted user: err = %v, want errDashboardUserNotFound", err)
+	}
+	if _, exists, _ := lookupDashboardUserRole(w.g.db, "alice"); exists {
+		t.Fatal("password reset re-created a deleted user")
+	}
+}
+
+func TestSessionLookupCarriesRole(t *testing.T) {
+	w := newUsersTestMux(t)
+	c := sessionCookieFor(t, w, "alice")
+	user, role, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
+	if err != nil || !ok || user != "alice" || role != dashboardRoleMember {
+		t.Fatalf("lookupDashboardSessionUser = %q %q %v %v", user, role, ok, err)
+	}
+	// A session whose user row is gone (deleted without revocation)
+	// carries no role, and the gate treats it as no session.
+	if _, err := w.g.db.Exec(`DELETE FROM dashboard_users WHERE username = 'alice'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, role, ok, _ := lookupDashboardSessionUser(w.g.db, c.Value); !ok || role != "" {
+		t.Fatalf("orphaned session: role = %q ok = %v, want empty role", role, ok)
+	}
+	if rw := serveAs(t, w.handler(), c, http.MethodGet, "/api/me", ""); rw.Code != http.StatusUnauthorized {
+		t.Fatalf("orphaned session GET /api/me = %d, want 401", rw.Code)
+	}
+}
+
+func TestPruneDashboardAudit(t *testing.T) {
+	w := newUsersTestMux(t)
+	now := time.Now()
+	for _, age := range []time.Duration{48 * time.Hour, time.Hour} {
+		if err := recordDashboardAudit(w.g.db, dashboardAuditRecord{
+			TsNs: now.Add(-age).UnixNano(), Username: "root", AuthKind: "dashboard_password",
+			Method: http.MethodPost, Path: "/api/users/create", Status: http.StatusCreated,
+		}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	n, err := pruneDashboardAudit(w.g.db, now.Add(-24*time.Hour))
+	if err != nil || n != 1 {
+		t.Fatalf("pruneDashboardAudit = %d, %v; want 1 record pruned", n, err)
+	}
+	if records, _ := listDashboardAudit(w.g.db, 0, 0); len(records) != 1 {
+		t.Fatalf("%d records left, want 1", len(records))
 	}
 }

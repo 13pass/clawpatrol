@@ -19,14 +19,18 @@ func auditUsername(username string) string {
 	return username
 }
 
-// principalRole treats a principal without a role (tailnet operators,
-// principals built before roles existed) as an admin, matching
-// roleGate.
+// principalRole is the role roleGate enforces. Principals from the
+// database always carry a normalized role; one built in code without a
+// role (a tailnet operator before roles existed) is an admin, and any
+// other unrecognised role is a member.
 func principalRole(p principal) dashboardRole {
-	if p.Role == "" {
+	switch p.Role {
+	case "":
 		return dashboardRoleAdmin
+	case dashboardRoleAdmin, dashboardRoleMember:
+		return p.Role
 	}
-	return p.Role
+	return dashboardRoleMember
 }
 
 func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
@@ -84,9 +88,11 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 	writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
 }
 
-// apiUsersUpdate changes a user's role and/or resets their password.
-// Root stays an admin, and nobody changes their own role: together
-// these keep at least one admin able to log in.
+// apiUsersUpdate changes a user's role and/or resets a member's
+// password. Root stays an admin, and nobody changes their own role:
+// together these keep at least one admin able to log in. An admin's
+// password is never reset here, so one admin cannot take over another
+// admin's (or root's) account and act under their name.
 func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
@@ -131,19 +137,31 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "password must be at least "+strconv.Itoa(dashboardMinPasswordLen)+" characters", http.StatusBadRequest)
 		return
 	}
-	if body.Role != "" {
-		if err := setDashboardUserRole(w.g.db, body.Username, body.Role); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		log.Printf("dashboard auth: user %q role set to %s", body.Username, body.Role)
-	}
+	// The password step runs first: it is the one that can still be
+	// refused, and a refused request must not leave a role change behind.
 	if body.Password != "" {
-		if err := setDashboardUser(w.g.db, body.Username, body.Password); err != nil {
+		switch err := setDashboardMemberPassword(w.g.db, body.Username, body.Password); {
+		case errors.Is(err, errDashboardUserNotFound):
+			http.Error(rw, err.Error(), http.StatusNotFound)
+			return
+		case errors.Is(err, errDashboardUserNotMember):
+			http.Error(rw, "an admin's password can only be changed by that admin, on the Account page (root also with `clawpatrol gateway --set-dashboard-password`)", http.StatusForbidden)
+			return
+		case err != nil:
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
 		log.Printf("dashboard auth: user %q password reset by an admin", body.Username)
+	}
+	if body.Role != "" {
+		if err := setDashboardUserRole(w.g.db, body.Username, body.Role); errors.Is(err, errDashboardUserNotFound) {
+			http.Error(rw, err.Error(), http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		log.Printf("dashboard auth: user %q role set to %s", body.Username, body.Role)
 	}
 	w.bustStateCache()
 	writeJSON(rw, map[string]any{"ok": true})

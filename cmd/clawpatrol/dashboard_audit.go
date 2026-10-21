@@ -9,8 +9,14 @@ import (
 	"time"
 )
 
-// dashboardAuditMaxPage caps one /api/audit page.
-const dashboardAuditMaxPage = 500
+const (
+	// dashboardAuditMaxPage caps one /api/audit page.
+	dashboardAuditMaxPage = 500
+	// defaultDashboardAuditKeep applies when gateway.dashboard_audit_keep
+	// is unset.
+	defaultDashboardAuditKeep   = 365 * 24 * time.Hour
+	dashboardAuditSweepInterval = time.Hour
+)
 
 type dashboardAuditRecord struct {
 	ID         int64  `json:"id"`
@@ -72,6 +78,38 @@ func listDashboardAudit(db *sql.DB, beforeID int64, limit int) ([]dashboardAudit
 		out = append(out, rec)
 	}
 	return out, rows.Err()
+}
+
+// pruneDashboardAudit deletes records older than before.
+func pruneDashboardAudit(db *sql.DB, before time.Time) (int64, error) {
+	if db == nil {
+		return 0, fmt.Errorf("no db")
+	}
+	res, err := db.Exec(`DELETE FROM dashboard_audit WHERE ts_ns < ?`, before.UnixNano())
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// startDashboardAuditSweeper enforces gateway.dashboard_audit_keep. A
+// keep of 0 keeps the log forever.
+func (g *Gateway) startDashboardAuditSweeper(keep time.Duration) {
+	if g.db == nil || keep == 0 {
+		return
+	}
+	go func() {
+		t := time.NewTicker(dashboardAuditSweepInterval)
+		defer t.Stop()
+		for {
+			if n, err := pruneDashboardAudit(g.db, time.Now().Add(-keep)); err != nil {
+				log.Printf("dashboard audit: retention sweep: %v", err)
+			} else if n > 0 {
+				log.Printf("dashboard audit: pruned %d records older than %s", n, keep)
+			}
+			<-t.C
+		}
+	}()
 }
 
 type auditNoteKey struct{}

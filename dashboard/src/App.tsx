@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { AccountPage } from "./components/AccountPage";
 import { AgentsTable, sortAgents } from "./components/AgentsTable";
 import { AnalyticsPage } from "./components/AnalyticsPage";
@@ -78,7 +78,22 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
+  // Set once /api/state refuses us: members can't read it, so polling
+  // it would only produce a 403 every 5 s.
+  const stateRefused = useRef(false);
+
   async function refresh() {
+    if (stateRefused.current) {
+      try {
+        const me = await getMe();
+        setWhoami(me);
+        // Promoted while the tab was open: resume the full poll.
+        stateRefused.current = me.role === "member";
+      } catch {
+        /* swallow */
+      }
+      if (stateRefused.current) return;
+    }
     try {
       // Single round-trip; getState ETags so the no-change path is a
       // 304 (no body, no JSON parse). Replaces three parallel fetches
@@ -92,7 +107,9 @@ export default function App() {
     } catch {
       // Members are refused /api/state; /api/me still identifies them.
       try {
-        setWhoami(await getMe());
+        const me = await getMe();
+        setWhoami(me);
+        stateRefused.current = me.role === "member";
       } catch {
         /* swallow */
       }

@@ -238,21 +238,29 @@ var memberRoutes = map[string]bool{
 	"/__logout":        true,
 }
 
-// roleGate refuses members every operator route not in memberRoutes.
-// Members may still load the dashboard's static files. Principals
-// without a role (tailnet operators, pre-role sessions) are admins.
+// roleGate refuses every principal that is not an admin the operator
+// routes not in memberRoutes. Members may still load the dashboard's
+// static files. Refused state-changing requests are audited: they are
+// attempts to act beyond the caller's role.
 func (w *webMux) roleGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		p, ok := principalFromContext(r.Context())
-		if !ok || p.Role != dashboardRoleMember || memberRoutes[path] ||
+		if !ok || principalRole(p) == dashboardRoleAdmin || memberRoutes[path] ||
 			!needsOperatorGate(w.authRequirementForPath(path)) || !w.isOperatorSurface(path) {
 			next.ServeHTTP(rw, r)
 			return
 		}
+		if csrfRelevantMethod(r.Method) {
+			w.recordAudit(r, p.Owner, string(p.Kind), auditTargetRoleRefused, http.StatusForbidden)
+		}
 		http.Error(rw, "this action requires the admin role", http.StatusForbidden)
 	})
 }
+
+// auditTargetRoleRefused marks the audit record of a request roleGate
+// refused.
+const auditTargetRoleRefused = "refused: admin role required"
 
 // isOperatorSurface reports whether path is an API or a registered
 // route rather than a static dashboard file.
@@ -424,16 +432,9 @@ func (w *webMux) dashboardAuthGate(next http.Handler) http.Handler {
 		// principal so tailnetGate downstream short-circuits. The
 		// role is read on every request, so a role change applies
 		// to live sessions at once.
-		if username := w.lookupSessionFromRequest(r); username != "" {
-			role, exists, err := lookupDashboardUserRole(w.g.db, username)
-			if err != nil {
-				http.Error(rw, "dashboard auth lookup failed", http.StatusServiceUnavailable)
-				return
-			}
-			if exists {
-				next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), dashboardPasswordPrincipal(username, role))))
-				return
-			}
+		if username, role := w.lookupSessionUserFromRequest(r); username != "" && role != "" {
+			next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), dashboardPasswordPrincipal(username, role))))
+			return
 		}
 
 		// Tailnet allowlist path: defer to tailnetGate so it can
@@ -473,15 +474,22 @@ const dashboardLoginPath = "/__login"
 // when missing/expired/error (the gate treats all three as "no
 // session, redirect to login").
 func (w *webMux) lookupSessionFromRequest(r *http.Request) string {
+	username, _ := w.lookupSessionUserFromRequest(r)
+	return username
+}
+
+// lookupSessionUserFromRequest is lookupSessionFromRequest plus the
+// user's role; the role is empty when the user row is gone.
+func (w *webMux) lookupSessionUserFromRequest(r *http.Request) (string, dashboardRole) {
 	c, err := r.Cookie(cpSessionCookieName)
 	if err != nil || c.Value == "" {
-		return ""
+		return "", ""
 	}
-	username, ok, err := lookupDashboardSession(w.g.db, c.Value)
+	username, role, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
 	if err != nil || !ok {
-		return ""
+		return "", ""
 	}
-	return username
+	return username, role
 }
 
 func safeDashboardLoginNext(next string) string {

@@ -84,7 +84,8 @@ are global per kind across a directory config).
 ### Phase 1 — identity, roles, audit (done)
 
 - Migration: `dashboard_users.role` (`admin` | `member`, root forced
-  to `admin`) and a `dashboard_audit` table.
+  to `admin`; an unrecognised stored role reads as `member`) and a
+  `dashboard_audit` table.
 - Login takes a username (empty means `root`, so existing scripts and
   the first-run flow keep working). Unknown usernames cost the same
   bcrypt work as a wrong password and get the same error.
@@ -96,18 +97,21 @@ are global per kind across a directory config).
   allowlist is only `/api/me`, `/api/me/password` and `/__logout`, so
   adding a member is safe before any scoping exists.
 - Admin API: `GET /api/users`, `POST /api/users/create`,
-  `POST /api/users/update` (role and/or password),
+  `POST /api/users/update` (role and/or a member's password),
   `POST /api/users/delete`. Invariants: `root` cannot be deleted or
-  demoted (the first-run check keys on its row), and an admin cannot
-  change their own role.
+  demoted (the first-run check keys on its row), an admin cannot
+  change their own role, and an admin's password is never reset by
+  another admin — that would let one admin act under another's
+  name in the audit log.
 - Self-service: `GET /api/me`, `POST /api/me/password` (requires the
   current password; rotating revokes all sessions, then re-mints the
   caller's).
 - Audit middleware: every state-changing request to an operator route
   records time, username, auth kind, method, path, status and remote
   address; handlers may attach a target (e.g. the username created).
-  Login successes and failures are recorded too. Bodies are never
-  stored. `GET /api/audit` (admin) pages through it.
+  Requests the role gate refuses and login attempts are recorded too.
+  Bodies are never stored. `GET /api/audit` (admin) pages through it;
+  `gateway.dashboard_audit_keep` (default 365 days) bounds it.
 - UI: username field on the login page; Users admin page and
   change-password on the Account page.
 

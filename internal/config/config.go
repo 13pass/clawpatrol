@@ -223,6 +223,13 @@ type GatewaySettings struct {
 	// time.ParseDuration format.
 	ActionsKeep string `hcl:"actions_keep,optional"`
 
+	// DashboardAuditKeep is the retention floor for the dashboard audit
+	// log (state-changing dashboard requests and login attempts). Rows
+	// older than this are deleted by a background sweeper. Default
+	// 8760h (365d), "0" / "off" keeps them forever. time.ParseDuration
+	// format.
+	DashboardAuditKeep string `hcl:"dashboard_audit_keep,optional"`
+
 	// Limits, if present, overrides the two gateway-wide body-size
 	// limits (rules-engine body buffer and persisted action body
 	// storage). nil uses the DefaultBody*Limit constants, which match
@@ -548,6 +555,10 @@ func (g *Gateway) SessionKeep() string { return g.settings().SessionKeep }
 
 // ActionsKeep returns the raw global actions-retention string, or empty.
 func (g *Gateway) ActionsKeep() string { return g.settings().ActionsKeep }
+
+// DashboardAuditKeep returns the raw dashboard-audit retention string,
+// or empty.
+func (g *Gateway) DashboardAuditKeep() string { return g.settings().DashboardAuditKeep }
 
 // Funnel reports whether the `tailscale { }` block enabled Funnel.
 func (g *Gateway) Funnel() bool {
@@ -1255,6 +1266,7 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 	// (disable) are valid non-duration values.
 	diags = append(diags, validateRetentionDuration("session_keep", gw.Settings.SessionKeep)...)
 	diags = append(diags, validateRetentionDuration("actions_keep", gw.Settings.ActionsKeep)...)
+	diags = append(diags, validateRetentionDuration("dashboard_audit_keep", gw.Settings.DashboardAuditKeep)...)
 
 	diags = append(diags, validateLimits(gw.Settings.Limits)...)
 
