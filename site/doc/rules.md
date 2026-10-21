@@ -385,6 +385,15 @@ CEL condition. It does not look at the request body or headers — it
 matches the resolved credential name, not the credential's secret
 contents. It is checked *before* the CEL condition.
 
+### Rules created from the dashboard
+
+A request on the dashboard can be turned into a rule — deny,
+pre-approve, or require approval. An admin's go to the dashboard file
+at priority 100. A member's go to the member's own file at priority
+50, pinned with `profile` and `credential` to the request's profile
+and credential. To keep an admin rule above every member rule, give it
+priority 100 or more.
+
 ### `profile = X`
 
 `profile` is the same kind of top-level predicate as `credential`:

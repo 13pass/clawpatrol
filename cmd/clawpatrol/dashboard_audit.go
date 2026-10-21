@@ -149,12 +149,20 @@ func (a *auditStatusWriter) Unwrap() http.ResponseWriter {
 	return a.ResponseWriter
 }
 
+// auditReadOnlyPosts are POST routes that change nothing: rule
+// previews, which the dashboard re-runs on every option change.
+var auditReadOnlyPosts = map[string]bool{
+	"/api/rules/preview":        true,
+	"/api/actions/rule-preview": true,
+}
+
 // auditLog records every state-changing request to an operator route
 // once its handler returns. It runs inside the auth gates, so the
 // principal is known. Bodies are never recorded.
 func (w *webMux) auditLog(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
-		if !csrfRelevantMethod(r.Method) || !needsOperatorGate(w.authRequirementForPath(r.URL.Path)) {
+		if !csrfRelevantMethod(r.Method) || auditReadOnlyPosts[r.URL.Path] ||
+			!needsOperatorGate(w.authRequirementForPath(r.URL.Path)) {
 			next.ServeHTTP(rw, r)
 			return
 		}

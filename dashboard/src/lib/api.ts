@@ -465,12 +465,17 @@ export type Whoami = {
   auth_method: AuthMethod;
   role?: DashboardRole;
   public_url?: string;
+  // profiles / approver are known only from /api/me (members).
+  profiles?: string[];
+  approver?: string;
 };
 
 type MeResp = {
   username: string;
   role: DashboardRole;
   auth_kind: "dashboard_password" | "tailnet";
+  profiles: string[];
+  approver: string;
 };
 
 // getMe is the one identity call a member may make; the SPA falls
@@ -485,6 +490,8 @@ export async function getMe(): Promise<Whoami> {
     host: "",
     auth_method: me.auth_kind === "dashboard_password" ? "password" : "tailscale",
     role: me.role,
+    profiles: me.profiles,
+    approver: me.approver,
   };
 }
 
@@ -500,14 +507,22 @@ export async function changeOwnPassword(current: string, next: string): Promise<
 export type DashboardUser = {
   username: string;
   role: DashboardRole;
+  profiles: string[];
+  approver: string;
   created_ns: number;
   updated_ns: number;
 };
 
-export async function listUsers(): Promise<DashboardUser[]> {
+// listUsers also returns what the config declares, for assignment:
+// every profile, and every human_approver a user's rules may route to.
+export async function listUsers(): Promise<{
+  users: DashboardUser[];
+  profiles: string[];
+  human_approvers: string[];
+}> {
   const r = await api("/api/users");
   if (!r.ok) throw new Error(await r.text());
-  return ((await r.json()) as { users: DashboardUser[] }).users;
+  return r.json();
 }
 
 async function postUsers(path: string, body: object): Promise<void> {
@@ -523,10 +538,122 @@ export function createUser(username: string, password: string, role: DashboardRo
   return postUsers("/api/users/create", { username, password, role });
 }
 
-// updateUser changes the role and/or resets the password; omitted
-// fields are left as they are.
-export function updateUser(username: string, change: { role?: DashboardRole; password?: string }) {
+// updateUser changes the role, resets a member's password, or sets the
+// profiles and approver; omitted fields are left as they are.
+export function updateUser(
+  username: string,
+  change: { role?: DashboardRole; password?: string; profiles?: string[]; approver?: string },
+) {
   return postUsers("/api/users/update", { username, ...change });
+}
+
+// A request turned into a rule: what it does and how much it matches.
+export type RuleVerdict = "deny" | "allow" | "approve";
+export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
+export type RuleRequest = {
+  verdict: RuleVerdict;
+  scope: RuleScope;
+  // approver applies to admins only; a member's own approver is used.
+  approver?: string;
+  pin_header?: string;
+};
+
+export type ScopedRule = {
+  rule_name: string;
+  endpoint_name: string;
+  family: string;
+  condition?: string;
+  credential?: string;
+  profile?: string;
+  hcl: string;
+  warnings?: string[];
+  new_endpoint?: boolean;
+  profile_additions?: string[];
+};
+
+export type RulePreviewResp = {
+  rule: ScopedRule;
+  file: string;
+  recent_matches: number;
+  recent_sampled: number;
+  writes_enabled: boolean;
+  writes_unavailable?: string;
+};
+
+async function postJSON<T>(path: string, body: object): Promise<T> {
+  const r = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function previewRule(actionID: string, req: RuleRequest) {
+  return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
+}
+
+export function createRule(actionID: string, req: RuleRequest) {
+  return postJSON<{ ok: boolean; rule_name: string; file: string }>("/api/rules/create", {
+    action_id: actionID,
+    ...req,
+  });
+}
+
+export type MyActionRow = {
+  cursor: number;
+  id: string;
+  ts_ns: number;
+  family?: string;
+  host: string;
+  method?: string;
+  path?: string;
+  status?: string;
+  action?: string;
+  endpoint?: string;
+  rule?: string;
+  profile?: string;
+};
+
+// getMyActions pages newest first through the requests the caller may
+// see; pass the smallest cursor seen as `before` for the next page.
+export async function getMyActions(before?: number): Promise<MyActionRow[]> {
+  const q = before ? `?before=${before}` : "";
+  const r = await api(`/api/my/actions${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  return ((await r.json()) as { actions: MyActionRow[] }).actions;
+}
+
+export type MyRule = {
+  name: string;
+  endpoints: string[];
+  priority: number;
+  disabled: boolean;
+  condition?: string;
+  credential?: string;
+  profile?: string;
+  verdict?: string;
+  approve?: string[];
+  reason?: string;
+};
+
+export async function getMyRules(): Promise<{
+  file: string;
+  rules: MyRule[];
+  unavailable?: string;
+}> {
+  const r = await api("/api/my/rules");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function setMyRuleDisabled(name: string, disabled: boolean) {
+  return postJSON<{ ok: boolean }>("/api/my/rules/update", { name, disabled });
+}
+
+export function deleteMyRule(name: string) {
+  return postJSON<{ ok: boolean }>("/api/my/rules/delete", { name });
 }
 
 export function deleteUser(username: string) {
@@ -700,6 +827,8 @@ export type EventRecord = {
   // credential is the bare name of the credential the gateway resolved
   // for the request before matching; absent when none was resolved.
   credential?: string;
+  // profile is the profile the requesting peer was bound to.
+  profile?: string;
   // approver/* are populated when action is "approved" or "denied":
   // the approver entity's HCL block name, plugin type
   // (human_approver / llm_approver / dashboard) and the per-approver

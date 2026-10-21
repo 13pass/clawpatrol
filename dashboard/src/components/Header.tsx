@@ -47,6 +47,16 @@ export function Header({ whoami, currentRoute }: { whoami: Whoami | null; curren
               </NavLink>
             </>
           )}
+          <NavLink
+            href="#/requests"
+            label={isMember ? "My requests" : "Requests"}
+            active={currentRoute === "requests" || currentRoute === "request"}
+          >
+            <Icon paths={["M4 6h16", "M4 12h16", "M4 18h10"]} />
+          </NavLink>
+          <NavLink href="#/rules" label="Rules" active={currentRoute === "rules"}>
+            <Icon paths={["M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z", "m9 12 2 2 4-4"]} />
+          </NavLink>
           <NavLink href="#/account" label="Account" active={currentRoute === "account"}>
             <AccountIcon />
           </NavLink>

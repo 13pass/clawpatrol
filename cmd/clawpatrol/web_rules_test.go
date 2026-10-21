@@ -227,6 +227,11 @@ func TestMemberRulePreviewCreateAndManage(t *testing.T) {
 	if len(audited) != 3 {
 		t.Errorf("alice's rule changes audited as %v, want create, update and delete", audited)
 	}
+	for _, rec := range records {
+		if rec.Path == "/api/rules/preview" {
+			t.Errorf("read-only preview audited: %+v", rec)
+		}
+	}
 }
 
 func TestMemberRuleOnUnknownHostClaimsOnlyTheirProfile(t *testing.T) {

@@ -31,11 +31,14 @@ const INPUT_CLASS =
 // them, and read the dashboard audit log.
 export function UsersPage({ whoami }: { whoami: Whoami | null }) {
   const [users, setUsers] = useState<DashboardUser[]>([]);
+  const [declared, setDeclared] = useState<Declared>({ profiles: [], approvers: [] });
   const [err, setErr] = useState("");
 
   async function refresh() {
     try {
-      setUsers(await listUsers());
+      const list = await listUsers();
+      setUsers(list.users);
+      setDeclared({ profiles: list.profiles, approvers: list.human_approvers });
       setErr("");
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e));
@@ -54,7 +57,12 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
       </Section>
       <Section title="Users">
         {err && <div className="text-xs text-danger-500 px-4 py-2">{err}</div>}
-        <UsersTable users={users} self={whoami?.user ?? ""} onChanged={refresh} />
+        <UsersTable
+          users={users}
+          declared={declared}
+          self={whoami?.user ?? ""}
+          onChanged={refresh}
+        />
       </Section>
       <Section title="Audit log">
         <AuditLog />
@@ -62,6 +70,9 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
     </Main>
   );
 }
+
+// Declared is what the config offers for assignment.
+type Declared = { profiles: string[]; approvers: string[] };
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -166,10 +177,12 @@ function RoleSelect({
 
 function UsersTable({
   users,
+  declared,
   self,
   onChanged,
 }: {
   users: DashboardUser[];
+  declared: Declared;
   self: string;
   onChanged: () => void;
 }) {
@@ -180,13 +193,21 @@ function UsersTable({
           <tr>
             <Th>Username</Th>
             <Th>Role</Th>
+            <Th>Profiles</Th>
+            <Th>Reviewer</Th>
             <Th>Created</Th>
             <Th>Actions</Th>
           </tr>
         </thead>
         <tbody>
           {users.map((u) => (
-            <UserRow key={u.username} user={u} isSelf={u.username === self} onChanged={onChanged} />
+            <UserRow
+              key={u.username}
+              user={u}
+              declared={declared}
+              isSelf={u.username === self}
+              onChanged={onChanged}
+            />
           ))}
         </tbody>
       </table>
@@ -208,10 +229,12 @@ function Td({ children }: { children: ReactNode }) {
 
 function UserRow({
   user,
+  declared,
   isSelf,
   onChanged,
 }: {
   user: DashboardUser;
+  declared: Declared;
   isSelf: boolean;
   onChanged: () => void;
 }) {
@@ -242,6 +265,37 @@ function UserRow({
           disabled={isRoot || isSelf}
           onChange={(role) => run(() => updateUser(user.username, { role }))}
         />
+      </Td>
+      <Td>
+        {user.role === "admin" ? (
+          <span className="text-text-muted">all</span>
+        ) : (
+          <ProfileChecklist
+            username={user.username}
+            declared={declared.profiles}
+            owned={user.profiles}
+            onChange={(profiles) => run(() => updateUser(user.username, { profiles }))}
+          />
+        )}
+      </Td>
+      <Td>
+        {user.role === "admin" ? (
+          <span className="text-text-muted">—</span>
+        ) : (
+          <select
+            value={user.approver}
+            onChange={(e) => run(() => updateUser(user.username, { approver: e.target.value }))}
+            aria-label={`Reviewer for ${user.username}`}
+            className={INPUT_CLASS + " bg-canvas"}
+          >
+            <option value="">the dashboard</option>
+            {declared.approvers.map((a) => (
+              <option key={a} value={a}>
+                {a}
+              </option>
+            ))}
+          </select>
+        )}
       </Td>
       <Td>
         <span className="font-mono">{fmtDateTime(user.created_ns / NS_PER_MS)}</span>
@@ -310,6 +364,40 @@ function UserRow({
         {err && <div className="text-xs text-danger-500 mt-1">{err}</div>}
       </Td>
     </tr>
+  );
+}
+
+// ProfileChecklist assigns the profiles a member owns. A profile the
+// config no longer declares stays listed so it can be removed.
+function ProfileChecklist({
+  username,
+  declared,
+  owned,
+  onChange,
+}: {
+  username: string;
+  declared: string[];
+  owned: string[];
+  onChange: (profiles: string[]) => void;
+}) {
+  const all = [...new Set([...declared, ...owned])].sort();
+  if (all.length === 0) return <span className="text-text-muted">none declared</span>;
+  return (
+    <div className="flex flex-wrap gap-x-3 gap-y-1">
+      {all.map((p) => (
+        <label key={p} className="flex items-center gap-1 font-mono">
+          <input
+            type="checkbox"
+            checked={owned.includes(p)}
+            aria-label={`${username} owns profile ${p}`}
+            onChange={(e) =>
+              onChange(e.target.checked ? [...owned, p] : owned.filter((x) => x !== p))
+            }
+          />
+          <span className={declared.includes(p) ? "" : "line-through text-text-muted"}>{p}</span>
+        </label>
+      ))}
+    </div>
   );
 }
 

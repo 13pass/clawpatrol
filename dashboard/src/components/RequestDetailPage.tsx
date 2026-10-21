@@ -8,6 +8,7 @@ import {
   type EventRecord,
   type FacetSchema,
   type RulePreview,
+  type Whoami,
 } from "../lib/api";
 import { splitBodyCapture, type BodyCaptureState } from "../lib/bodyCapture";
 import { copyText, headersToJSON } from "../lib/clipboard";
@@ -19,6 +20,7 @@ import { ApprovalStatusIcon, LockGlyph, rowDescriptors } from "./LiveRequests";
 import { Main } from "./Main";
 import { Modal } from "./Modal";
 import { PageTitle, type Crumb } from "./PageTitle";
+import { RuleBuilderModal } from "./RuleBuilder";
 import { Tag } from "./Tag";
 
 // isDenyAction matches every action label the dispatcher emits for a
@@ -44,7 +46,15 @@ function approverKindLabel(type?: string): string {
   }
 }
 
-export function RequestDetailPage({ id, agents }: { id: string; agents: Agent[] }) {
+export function RequestDetailPage({
+  id,
+  agents,
+  whoami,
+}: {
+  id: string;
+  agents: Agent[];
+  whoami: Whoami | null;
+}) {
   const [ev, setEv] = useState<EventRecord | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const { byFamily } = useFacets();
@@ -128,7 +138,7 @@ export function RequestDetailPage({ id, agents }: { id: string; agents: Agent[] 
             {fullUrl}
           </span>
           <span className="ml-auto">
-            <ActionButtons ev={ev} />
+            <ActionButtons ev={ev} whoami={whoami} />
           </span>
         </div>
         <div className="flex items-center gap-4 text-xs text-text-muted flex-wrap">
@@ -227,18 +237,27 @@ export function RequestDetailPage({ id, agents }: { id: string; agents: Agent[] 
   );
 }
 
-function ActionButtons({ ev }: { ev: EventRecord }) {
+// ActionButtons: "Create a rule…" builds a deny / pre-approve /
+// require-approval rule server-side, for anyone. Admins also keep the
+// raw-HCL "Block requests like this" editor and the fixture download.
+function ActionButtons({ ev, whoami }: { ev: EventRecord; whoami: Whoami | null }) {
   const [ruleOpen, setRuleOpen] = useState(false);
+  const [builderOpen, setBuilderOpen] = useState(false);
+  const isAdmin = whoami?.role !== "member";
   const canBlock = !!ev.id && ev.action !== "in_flight" && (!!ev.endpoint || ev.mode === "splice");
   return (
     <div className="flex items-center gap-2 flex-wrap justify-end">
-      {canBlock && (
+      {canBlock && <Button onClick={() => setBuilderOpen(true)}>Create a rule…</Button>}
+      {canBlock && isAdmin && (
         <Button variant="outline" onClick={() => setRuleOpen(true)}>
           Block requests like this
         </Button>
       )}
-      <DownloadActionButton ev={ev} />
+      {isAdmin && <DownloadActionButton ev={ev} />}
       {ruleOpen && <RulePreviewModal ev={ev} onClose={() => setRuleOpen(false)} />}
+      {builderOpen && (
+        <RuleBuilderModal ev={ev} whoami={whoami} onClose={() => setBuilderOpen(false)} />
+      )}
     </div>
   );
 }

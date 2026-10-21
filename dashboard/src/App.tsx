@@ -13,6 +13,8 @@ import { OnboardPage } from "./components/OnboardPage";
 import { PageTitle } from "./components/PageTitle";
 import { PluginsPage } from "./components/PluginsPage";
 import { RequestDetailPage } from "./components/RequestDetailPage";
+import { RequestsPage } from "./components/RequestsPage";
+import { RulesPage } from "./components/RulesPage";
 import { SettingsPage } from "./components/SettingsPage";
 import { UsersPage } from "./components/UsersPage";
 import {
@@ -34,6 +36,8 @@ type Route =
   | { name: "settings" }
   | { name: "plugins" }
   | { name: "users" }
+  | { name: "requests" }
+  | { name: "rules" }
   | { name: "account" };
 
 function parseRoute(): Route {
@@ -52,6 +56,8 @@ function parseRoute(): Route {
   if (h === "#/devices") return { name: "devices" };
   if (h === "#/account") return { name: "account" };
   if (h === "#/users") return { name: "users" };
+  if (h === "#/requests") return { name: "requests" };
+  if (h === "#/rules") return { name: "rules" };
   if (h === "#/analytics") return { name: "analytics" };
   const a = h.match(/^#\/analytics\/([^/]+)$/);
   if (a) return { name: "analytics", ip: decodeURIComponent(a[1]) };
@@ -127,16 +133,23 @@ export default function App() {
     setRoute(parseRoute());
   }
 
-  // Members only have their account until the gateway's APIs are
-  // scoped to their own profiles; every other route lands there.
+  // Members get their account, their requests (and a request's page,
+  // to turn it into a rule) and their rules; every other route is
+  // refused to them by the gateway, so it lands on the account page.
   const isMember = whoami?.role === "member";
+  const memberRoutes = ["account", "requests", "request", "rules"];
+  const shown = isMember && !memberRoutes.includes(route.name) ? "account" : route.name;
 
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
       <UpdateNotice update={update} />
-      <Header whoami={whoami} currentRoute={isMember ? "account" : route.name} />
-      {isMember || route.name === "account" ? (
+      <Header whoami={whoami} currentRoute={shown} />
+      {shown === "account" ? (
         <AccountPage whoami={whoami} />
+      ) : route.name === "requests" ? (
+        <RequestsPage isMember={isMember} />
+      ) : route.name === "rules" ? (
+        <RulesPage />
       ) : route.name === "users" ? (
         <UsersPage whoami={whoami} />
       ) : route.name === "main" ? (
@@ -160,7 +173,7 @@ export default function App() {
       ) : route.name === "analytics" ? (
         <AnalyticsPage ip={route.ip} agents={agents} />
       ) : route.name === "request" ? (
-        <RequestDetailPage id={route.id} agents={agents} />
+        <RequestDetailPage id={route.id} agents={agents} whoami={whoami} />
       ) : route.name === "onboard" ? (
         <OnboardPage code={route.code} />
       ) : route.name === "settings" ? (
@@ -171,7 +184,7 @@ export default function App() {
         />
       ) : route.name === "plugins" ? (
         <PluginsPage />
-      ) : (
+      ) : route.name === "device" ? (
         <DevicePage
           ip={route.ip}
           agents={agents}
@@ -181,6 +194,8 @@ export default function App() {
           onConnect={(id) => setConnectId(id)}
           onRefresh={refresh}
         />
+      ) : (
+        <AccountPage whoami={whoami} />
       )}
       {connectId && (
         <ConnectModal

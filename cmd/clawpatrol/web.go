@@ -242,6 +242,7 @@ var memberRoutes = map[string]bool{
 	"/api/my/rules/delete": true,
 	"/api/rules/preview":   true,
 	"/api/rules/create":    true,
+	"/api/facets":          true,
 }
 
 // roleGate refuses every principal that is not an admin the operator

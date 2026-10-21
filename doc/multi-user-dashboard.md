@@ -135,7 +135,29 @@ can go upstream alone; details in `doc/multi-file-config.md`.
   in `.hcl`, so inside the config directory it would be loaded as
   config.
 
-### Phase 3 — rules from requests
+### Phase 3 — rules from requests (done)
+
+Built as planned, with three changes found on the way:
+
+- **Rules can be pinned to a profile** (`profile = profile.X`, a
+  predicate checked like `credential`). Credentials are global and
+  several profiles can list one, so the planned `credential =` pin
+  alone would have let a member's rule reach other profiles sharing
+  that credential. Every member rule carries both pins.
+- **Each action records its profile** (`actions.profile`, stamped by
+  the event sink from the peer IP), so a member's view does not follow
+  later profile reassignments.
+- **Members see their own requests** — `GET /api/my/actions` and
+  `GET /api/actions/<id>` (404 outside their profiles) were pulled
+  forward from phase 4, since a rule is made from a request.
+
+Routes: `POST /api/rules/preview`, `POST /api/rules/create` (admins:
+`90-dashboard.hcl`, unpinned, priority 100), `GET /api/my/rules`,
+`POST /api/my/rules/update` (disable / enable), `POST
+/api/my/rules/delete`. Admins assign profiles and the approver on the
+Users page. A member `allow` at priority 50 overrides an admin rule at
+the default priority 0: admin rules that members must not override
+belong at 100 or above.
 
 - `dashboard_user_profiles(username, profile)`, admin-managed.
 - Rule dialog on the request page: verdict (`deny`, `allow`,
