@@ -3275,10 +3275,6 @@ func unmarshalHeaders(s string, dst *map[string]string) {
 	}
 }
 
-var sensitiveHeader = regexp.MustCompile(
-	`(?i)auth|token|secret|key|password|cookie`,
-)
-
 func flatHeaders(h http.Header) map[string]string {
 	return flatHeadersRedacted(h, nil)
 }
@@ -3286,7 +3282,7 @@ func flatHeaders(h http.Header) map[string]string {
 func flatHeadersRedacted(h http.Header, redactions []string) map[string]string {
 	out := make(map[string]string, len(h))
 	for k, v := range h {
-		if sensitiveHeader.MatchString(k) {
+		if runtime.IsSensitiveHeader(k) {
 			out[k] = "***"
 		} else {
 			out[k] = redactCredentialSample(strings.Join(v, ", "), redactions)

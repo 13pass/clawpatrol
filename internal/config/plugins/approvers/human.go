@@ -71,8 +71,13 @@ type HumanApprover struct {
 	// placeholders. When set, the expanded text replaces the default
 	// section body in the Slack (or other notifier) card. Supported
 	// vars mirror the CEL facet namespace: {{http.method}},
-	// {{http.path}}, {{k8s.verb}}, {{sql.tables}}, {{http.body_json.resource_id}},
-	// {{profile}}, {{endpoint}}, {{reason}}, etc.
+	// {{http.path}}, {{http.headers.X-Caller-Id}}, {{k8s.verb}},
+	// {{sql.tables}}, {{body_json.resource_id}}, {{profile}},
+	// {{endpoint}}, {{reason}}, etc. Headers that may carry a
+	// credential (auth, token, secret, key, password, cookie) render
+	// as "***". Substituted values come from the request, so they are
+	// escaped for the notifier: on Slack they cannot add links or
+	// mentions.
 	// Classifier (if also set) still runs; Message takes display precedence.
 	Message string `hcl:"message,optional"`
 }
@@ -172,7 +177,11 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 			if notifier, ok := ent.Body.(runtime.HITLNotifier); ok {
 				var msg string
 				if h.Message != "" {
-					msg = expandMessage(h.Message, req)
+					var escape func(string) string
+					if e, ok := notifier.(runtime.HITLMessageValueEscaper); ok {
+						escape = e.EscapeHITLMessageValue
+					}
+					msg = expandMessage(h.Message, req, escape)
 				}
 				target := runtime.HITLTarget{
 					CredentialName:           h.Credential,

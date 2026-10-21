@@ -7,11 +7,17 @@ import (
 	"strings"
 
 	"github.com/denoland/clawpatrol/internal/config/facet"
+	"github.com/denoland/clawpatrol/internal/config/match"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 // templateVarRe matches {{var}} placeholders, capturing the var name.
 var templateVarRe = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
+
+const (
+	headerVarPrefix   = "http.headers."
+	maskedHeaderValue = "***"
+)
 
 // expandMessage substitutes {{var}} placeholders in tmpl using fields
 // from req. Supported vars:
@@ -22,22 +28,49 @@ var templateVarRe = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
 //     k8s.verb, k8s.resource, k8s.namespace, k8s.name
 //     sql.verb, sql.tables, sql.functions, sql.statement
 //   - JSON body access: body_json.<field> or body_json.<a>.<b>...
+//   - Request headers: http.headers.<Name>, matched case-insensitively,
+//     multiple values joined with ", ". Headers that may carry a
+//     credential (runtime.IsSensitiveHeader) render as "***".
 //
-// Unknown vars are left as-is. Expansions are not recursed.
-func expandMessage(tmpl string, req runtime.ApproveRequest) string {
+// Substituted values pass through escape (nil means none), which
+// makes them inert in the notifier's message format; the template's
+// own text does not. Unknown vars, including absent headers, are left
+// as-is. Expansions are not recursed.
+func expandMessage(tmpl string, req runtime.ApproveRequest, escape func(string) string) string {
+	if escape == nil {
+		escape = func(s string) string { return s }
+	}
 	vars := buildTemplateVars(req)
 	return templateVarRe.ReplaceAllStringFunc(tmpl, func(m string) string {
 		key := strings.TrimSpace(m[2 : len(m)-2])
 		if v, ok := vars[key]; ok {
-			return v
+			return escape(v)
+		}
+		if v, ok := headerVar(key, req.Request); ok {
+			return escape(v)
 		}
 		return m
 	})
 }
 
+func headerVar(key string, req *match.Request) (string, bool) {
+	name, ok := strings.CutPrefix(key, headerVarPrefix)
+	if !ok || name == "" || req == nil {
+		return "", false
+	}
+	values := req.Headers.Values(name)
+	if len(values) == 0 {
+		return "", false
+	}
+	if runtime.IsSensitiveHeader(name) {
+		return maskedHeaderValue, true
+	}
+	return strings.Join(values, ", "), true
+}
+
 func buildTemplateVars(req runtime.ApproveRequest) map[string]string {
 	vars := map[string]string{
-		"profile":  req.AgentIP,
+		"profile":  req.Profile,
 		"host":     req.Host,
 		"endpoint": runtime.HITLEndpointLabel(req),
 		"reason":   req.Reason,

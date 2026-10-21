@@ -525,6 +525,11 @@ func slackDecidedBySuffix(by string) string {
 
 var slackMrkdwnEscaper = strings.NewReplacer("&", "&amp;", "<", "&lt;", ">", "&gt;")
 
+// EscapeHITLMessageValue implements runtime.HITLMessageValueEscaper.
+func (s *SlackTokens) EscapeHITLMessageValue(v string) string {
+	return slackMrkdwnEscape(v)
+}
+
 func slackMrkdwnEscape(s string) string {
 	return slackMrkdwnEscaper.Replace(s)
 }
