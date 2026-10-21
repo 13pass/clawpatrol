@@ -548,6 +548,7 @@ func pgHandleOversizeFrame(ch *runtime.ConnHandle, upstream net.Conn, credName, 
 	mreq := &match.Request{
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
+		Profile:    ch.Profile,
 		Credential: credName,
 		Database:   database,
 		Meta:       &sqlfacet.Meta{},
@@ -652,6 +653,7 @@ func pgEvaluateInfo(ch *runtime.ConnHandle, info pgInfo, credName, database stri
 	mreq := &match.Request{
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
+		Profile:    ch.Profile,
 		Credential: credName,
 		Database:   database,
 		Meta: &sqlfacet.Meta{

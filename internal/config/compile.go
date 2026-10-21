@@ -258,8 +258,11 @@ type CompiledRule struct {
 	Disabled   bool
 	Condition  string
 	Credential string
-	Matcher    match.Matcher
-	Outcome    Outcome
+	// Profile, when set, is the bare-name profile the requesting peer
+	// must be bound to, checked like Credential.
+	Profile string
+	Matcher match.Matcher
+	Outcome Outcome
 }
 
 // Outcome captures a rule's verdict + (when applicable) approve chain.

@@ -95,6 +95,13 @@ func MatchRequest(ep *config.CompiledEndpoint, req *match.Request) *config.Compi
 				continue
 			}
 		}
+		// Profile predicate: same shape, against the profile the
+		// requesting peer is bound to.
+		if r.Profile != "" {
+			if req == nil || req.Profile != r.Profile {
+				continue
+			}
+		}
 		if r.Matcher == nil {
 			// Empty match = match-everything; produced by Compile
 			// for catch-all rules without a condition. A catch-all

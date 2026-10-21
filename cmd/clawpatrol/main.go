@@ -2799,6 +2799,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			Headers:   req.Header,
 			Body:      matchBody,
 			PeerIP:    pip,
+			Profile:   profile,
 			Truncated: truncated,
 		}
 		// clickhouse_https carries the agent-declared database in

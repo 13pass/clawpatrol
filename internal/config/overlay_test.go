@@ -134,3 +134,27 @@ func TestDirFileNamesMatchesLoaderDiscovery(t *testing.T) {
 		t.Fatalf("DirFileNames = %q", got)
 	}
 }
+
+func TestRuleProfilePinMustNameADeclaredProfile(t *testing.T) {
+	dir := t.TempDir()
+	writeHCL(t, dir, "00-gateway.hcl", overlayGatewayHCL)
+	writeHCL(t, dir, "10-endpoints.hcl", overlayEndpointsHCL)
+	writeHCL(t, dir, "15-profiles.hcl", `
+credential "bearer_token" "gh" {
+  endpoint = https.github
+}
+profile "team-a" {
+  credentials = [bearer_token.gh]
+}
+`)
+	_, diags := config.LoadDirOverlay(dir, map[string][]byte{"20-rules.hcl": []byte(`
+rule "pinned" {
+  endpoint = https.github
+  profile  = profile.nobody
+  verdict  = "deny"
+}
+`)})
+	if !diags.HasErrors() || !strings.Contains(diags.Error(), "nobody") {
+		t.Fatalf("pin to an undeclared profile: diags = %v", diags)
+	}
+}

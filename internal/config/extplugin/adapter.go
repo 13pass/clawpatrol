@@ -709,6 +709,7 @@ func evaluateDecoded(ch *runtime.ConnHandle, summary string, action map[string]a
 		req = builtinRequestFor(ch.Endpoint.Family, ch.PeerIP, summary, action, streamBytes)
 		req.Truncated = truncated
 	}
+	req.Profile = ch.Profile
 
 	rule := runtime.MatchRequest(ch.Endpoint, req)
 	var v Verdict

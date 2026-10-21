@@ -653,6 +653,7 @@ been inferred from the endpoint refs.
 | `disabled` | `bool` | no | Keeps the rule in config while excluding it from runtime evaluation. |
 | `condition` | `string` | no | A CEL expression evaluated against the family-specific variable set. An absent / empty condition matches everything — the catch-all pattern (`rule "X-default" { priority = -100; verdict = "deny" }`) relies on this. |
 | `credential` | `ref(credential)` | no | Credential, if set, is a bare-name reference to a credential block. The runtime treats it as an extra match predicate (request must have been dispatched against this credential) evaluated before the CEL expression. |
+| `profile` | `ref(profile)` | no | Profile, if set, is a bare-name reference to a profile block. The runtime treats it as an extra match predicate (the requesting peer must be bound to this profile) evaluated before the CEL expression. Endpoints and credentials can be shared by several profiles; this is what keeps a rule to one of them. |
 | `verdict` | `string` | no | The outcome when the rule matches. Set exactly one of `verdict` (`"allow"` / `"deny"`) or `approve`. |
 | `reason` | `string` | no | The operator-facing explanation recorded when the rule matches. |
 | `approve` | `[]ref(approver)` | no | A list of bare-name approver references. The approvers run in order; the request is allowed only if every stage approves. Set this *or* `verdict`, not both. |

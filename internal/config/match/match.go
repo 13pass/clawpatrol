@@ -25,6 +25,10 @@ type Request struct {
 	Credential string // bare-name reference of the credential the
 	// agent dispatched against, "" if none
 	PeerIP string // source IP of the agent — used to scope per-device rules
+	// Profile is the profile the requesting peer is bound to. A rule
+	// pinned with `profile = profile.X` matches only requests whose
+	// Profile is X.
+	Profile string
 
 	// Database is the agent-declared target database. Postgres reads
 	// it from the StartupMessage `database` parameter (falling back to

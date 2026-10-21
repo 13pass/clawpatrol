@@ -1658,3 +1658,36 @@ profile "default" { credentials = [postgres_credential.bare-cred] }
 		t.Errorf("rule-less endpoint: got %+v, want nil (pass-through)", r)
 	}
 }
+
+// TestMatchRequestProfilePin: a credential shared by two profiles,
+// and a rule pinned to one of them. The pin keeps the rule off the
+// other profile's traffic, and off requests with no profile at all.
+func TestMatchRequestProfilePin(t *testing.T) {
+	cp := compileFixture(t, `
+endpoint "https" "gitlab" { hosts = ["gitlab.com"] }
+credential "bearer_token" "shared" { endpoint = https.gitlab }
+profile "team-a" { credentials = [bearer_token.shared] }
+profile "team-b" { credentials = [bearer_token.shared] }
+
+rule "team-a-deny" {
+  endpoint   = https.gitlab
+  credential = bearer_token.shared
+  profile    = profile.team-a
+  verdict    = "deny"
+}
+`)
+	ep := cp.Endpoints["gitlab"]
+	for _, tc := range []struct {
+		profile string
+		want    bool
+	}{
+		{"team-a", true},
+		{"team-b", false},
+		{"", false},
+	} {
+		req := &match.Request{Family: "http", Method: "GET", Credential: "shared", Profile: tc.profile}
+		if got := runtime.MatchRequest(ep, req) != nil; got != tc.want {
+			t.Errorf("profile %q: matched = %v, want %v", tc.profile, got, tc.want)
+		}
+	}
+}

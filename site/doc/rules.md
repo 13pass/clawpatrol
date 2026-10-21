@@ -385,6 +385,24 @@ CEL condition. It does not look at the request body or headers — it
 matches the resolved credential name, not the credential's secret
 contents. It is checked *before* the CEL condition.
 
+### `profile = X`
+
+`profile` is the same kind of top-level predicate as `credential`:
+the rule applies only to requests from peers bound to profile `X`,
+checked before the CEL condition. Endpoints and credentials can be
+shared by several profiles — a rule on a shared endpoint, or pinned
+to a shared credential, otherwise applies to all of them.
+
+```hcl
+rule "team-a-allow-reads" {
+  endpoint   = https.gitlab
+  credential = bearer_token.gitlab-shared
+  profile    = profile.team-a
+  condition  = "http.method == 'GET'"
+  verdict    = "allow"
+}
+```
+
 ### Outcome dispatch
 
 After a rule matches:

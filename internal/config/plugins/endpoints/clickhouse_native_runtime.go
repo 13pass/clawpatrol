@@ -927,6 +927,7 @@ func chEvaluateSQL(ctx context.Context, ch *runtime.ConnHandle, sql, credName, d
 	mreq := &match.Request{
 		Family:     "sql",
 		PeerIP:     ch.PeerIP,
+		Profile:    ch.Profile,
 		Credential: credName,
 		Database:   database,
 		Meta: &sqlfacet.Meta{

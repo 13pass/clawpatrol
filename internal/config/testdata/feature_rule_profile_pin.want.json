@@ -1,0 +1,59 @@
+{
+  "gateway": {
+    "public_url": "https://gw.example.test",
+    "state_dir": "/opt/clawpatrol",
+    "wireguard": {
+      "subnet_cidr": "10.55.0.0/24"
+    }
+  },
+  "policy": {
+    "credentials": {
+      "gitlab-shared": {
+        "body": {
+          "IdempotencyKey": false
+        },
+        "endpoint": "gitlab",
+        "type": "bearer_token"
+      }
+    },
+    "endpoints": {
+      "gitlab": {
+        "body": {
+          "Hosts": [
+            "gitlab.com"
+          ]
+        },
+        "family": "http",
+        "type": "https"
+      }
+    },
+    "profiles": {
+      "team-a": {
+        "credentials": [
+          "gitlab-shared"
+        ]
+      },
+      "team-b": {
+        "credentials": [
+          "gitlab-shared"
+        ]
+      }
+    },
+    "rules": {
+      "team-a-allow-reads": {
+        "body": {
+          "name": "team-a-allow-reads",
+          "family": "http",
+          "endpoints": [
+            "gitlab"
+          ],
+          "priority": 50,
+          "condition": "http.method == 'GET'",
+          "credential": "gitlab-shared",
+          "profile": "team-a",
+          "verdict": "allow"
+        }
+      }
+    }
+  }
+}

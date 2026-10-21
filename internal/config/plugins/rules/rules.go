@@ -55,6 +55,13 @@ type RuleBody struct {
 	// evaluated before the CEL expression.
 	Credential string `hcl:"credential,optional"`
 
+	// Profile, if set, is a bare-name reference to a profile block.
+	// The runtime treats it as an extra match predicate (the
+	// requesting peer must be bound to this profile) evaluated before
+	// the CEL expression. Endpoints and credentials can be shared by
+	// several profiles; this is what keeps a rule to one of them.
+	Profile string `hcl:"profile,optional"`
+
 	// Verdict is the outcome when the rule matches. Set exactly one
 	// of `verdict` (`"allow"` / `"deny"`) or `approve`.
 	Verdict string `hcl:"verdict,optional"`
@@ -77,6 +84,7 @@ type Rule struct {
 	Disabled   bool                  `json:"disabled,omitempty"`
 	Condition  string                `json:"condition,omitempty"`
 	Credential string                `json:"credential,omitempty"`
+	Profile    string                `json:"profile,omitempty"`
 	Verdict    string                `json:"verdict,omitempty"` // "allow" | "deny" | "" (when Approve is set)
 	Reason     string                `json:"reason,omitempty"`
 	Approve    []config.ApproveStage `json:"approve,omitempty"`
@@ -100,6 +108,7 @@ func (r *Rule) Compile() (*config.CompiledRule, []string, error) {
 		Disabled:   r.Disabled,
 		Condition:  r.Condition,
 		Credential: r.Credential,
+		Profile:    r.Profile,
 		Matcher:    matcher,
 		Outcome: config.Outcome{
 			Verdict: r.Verdict,
@@ -252,6 +261,7 @@ func build(body any, name string, ctx *config.BuildCtx) (any, hcl.Diagnostics) {
 		Disabled:   rb.Disabled,
 		Condition:  rb.Condition,
 		Credential: rb.Credential,
+		Profile:    rb.Profile,
 		Verdict:    rb.Verdict,
 		Reason:     rb.Reason,
 	}
@@ -339,6 +349,9 @@ func emitRule(body any, _ string, b *hclwrite.Body) {
 	if r.Credential != "" {
 		config.SetIdent(b, "credential", ri.Ref(config.KindCredential, r.Credential))
 	}
+	if r.Profile != "" {
+		config.SetIdent(b, "profile", ri.Ref(config.KindProfile, r.Profile))
+	}
 	if r.Condition != "" {
 		b.SetAttributeValue("condition", cty.StringVal(r.Condition))
 	}
@@ -382,6 +395,7 @@ func Plugin() *config.Plugin {
 			{Path: "Endpoint", Kind: config.KindEndpoint, Optional: true},
 			{Path: "Endpoints[*]", Kind: config.KindEndpoint, Optional: true},
 			{Path: "Credential", Kind: config.KindCredential, Optional: true},
+			{Path: "Profile", Kind: config.KindProfile, Optional: true},
 		},
 		Validate:    validate,
 		Build:       build,

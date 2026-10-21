@@ -53,6 +53,7 @@ type Action struct {
 	Host       string      `json:"host,omitempty"`
 	Credential string      `json:"credential,omitempty"`
 	PeerIP     string      `json:"peer_ip,omitempty"`
+	Profile    string      `json:"profile,omitempty"`
 	HTTP       *HTTPAction `json:"http,omitempty"`
 	K8s        *K8sAction  `json:"k8s,omitempty"`
 	SQL        *SQLAction  `json:"sql,omitempty"`
@@ -379,7 +380,7 @@ func stripPort(s string) string {
 // us the facets, regardless of what the parser thought).
 func (f *Fixture) ToMatchRequest(family string, parseSQL func(string) (any, bool)) (*match.Request, error) {
 	a := &f.Action
-	req := &match.Request{Family: family, Credential: a.Credential, PeerIP: a.PeerIP}
+	req := &match.Request{Family: family, Credential: a.Credential, PeerIP: a.PeerIP, Profile: a.Profile}
 	switch {
 	case a.HTTP != nil:
 		req.Method = a.HTTP.Method

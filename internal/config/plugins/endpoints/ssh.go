@@ -927,6 +927,7 @@ func (rt *SSHEndpointRuntime) makeGate(ch *runtime.ConnHandle, emit func(runtime
 		req := &match.Request{
 			Family:     "ssh",
 			PeerIP:     ch.PeerIP,
+			Profile:    ch.Profile,
 			Credential: credName,
 			User:       agentUser,
 			Meta:       m,
