@@ -424,6 +424,16 @@ type HITLNotifier interface {
 	NotifyHITL(ctx context.Context, req ApproveRequest, target HITLTarget) error
 }
 
+// HITLMessageValueEscaper is implemented by notifiers whose message
+// format gives some characters meaning (Slack mrkdwn turns `<url|x>`
+// into a link and `<!channel>` into a mention). Values substituted
+// into an approver's message template come from the request, so the
+// agent controls them; they are escaped for the notifier before they
+// reach the card. The operator's template text is not escaped.
+type HITLMessageValueEscaper interface {
+	EscapeHITLMessageValue(s string) string
+}
+
 // HITLMessageUpdateSink records a channel-specific message reference
 // (for example Slack channel/ts) after a notifier posts a prompt.
 // Implementations must not store tokens or other secrets in ref.

@@ -32,17 +32,22 @@ const (
 //     multiple values joined with ", ". Headers that may carry a
 //     credential (runtime.IsSensitiveHeader) render as "***".
 //
-// Unknown vars, including absent headers, are left as-is. Expansions
-// are not recursed.
-func expandMessage(tmpl string, req runtime.ApproveRequest) string {
+// Substituted values pass through escape (nil means none), which
+// makes them inert in the notifier's message format; the template's
+// own text does not. Unknown vars, including absent headers, are left
+// as-is. Expansions are not recursed.
+func expandMessage(tmpl string, req runtime.ApproveRequest, escape func(string) string) string {
+	if escape == nil {
+		escape = func(s string) string { return s }
+	}
 	vars := buildTemplateVars(req)
 	return templateVarRe.ReplaceAllStringFunc(tmpl, func(m string) string {
 		key := strings.TrimSpace(m[2 : len(m)-2])
 		if v, ok := vars[key]; ok {
-			return v
+			return escape(v)
 		}
 		if v, ok := headerVar(key, req.Request); ok {
-			return v
+			return escape(v)
 		}
 		return m
 	})

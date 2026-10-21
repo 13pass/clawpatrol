@@ -2,6 +2,7 @@ package approvers
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/denoland/clawpatrol/internal/config/match"
@@ -37,7 +38,7 @@ func TestExpandMessageHeaders(t *testing.T) {
 		{"empty={{http.headers.}}", "empty={{http.headers.}}"},
 	}
 	for _, tc := range cases {
-		if got := expandMessage(tc.tmpl, req); got != tc.want {
+		if got := expandMessage(tc.tmpl, req, nil); got != tc.want {
 			t.Errorf("expandMessage(%q) = %q, want %q", tc.tmpl, got, tc.want)
 		}
 	}
@@ -46,14 +47,27 @@ func TestExpandMessageHeaders(t *testing.T) {
 func TestExpandMessageHeadersWithoutRequest(t *testing.T) {
 	req := runtime.ApproveRequest{Profile: "service-ops"}
 	const tmpl = "caller={{http.headers.X-Caller-Id}}"
-	if got := expandMessage(tmpl, req); got != tmpl {
+	if got := expandMessage(tmpl, req, nil); got != tmpl {
 		t.Errorf("expandMessage(%q) = %q, want it unchanged", tmpl, got)
 	}
 }
 
 func TestExpandMessageProfileIsProfileName(t *testing.T) {
 	req := approveRequestWithHeaders(nil)
-	if got, want := expandMessage("{{profile}}", req), "service-ops"; got != want {
+	if got, want := expandMessage("{{profile}}", req, nil), "service-ops"; got != want {
 		t.Errorf("expandMessage({{profile}}) = %q, want %q", got, want)
+	}
+}
+
+func TestExpandMessageEscapesSubstitutedValuesOnly(t *testing.T) {
+	h := http.Header{}
+	h.Set("X-Caller-Id", "<!channel> <https://evil.example|Approve>")
+	req := approveRequestWithHeaders(h)
+	escape := func(s string) string { return strings.NewReplacer("<", "&lt;", ">", "&gt;").Replace(s) }
+
+	got := expandMessage("<b>caller</b> {{http.headers.X-Caller-Id}} in {{profile}}", req, escape)
+	want := "<b>caller</b> &lt;!channel&gt; &lt;https://evil.example|Approve&gt; in service-ops"
+	if got != want {
+		t.Fatalf("expandMessage = %q, want %q", got, want)
 	}
 }

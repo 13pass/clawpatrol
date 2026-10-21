@@ -269,3 +269,15 @@ func TestSlackNotifyHITLDoesNotRetryNonTransientSlackError(t *testing.T) {
 		t.Fatalf("attempts = %d, want 1", attempts)
 	}
 }
+
+func TestSlackEscapesHITLMessageValues(t *testing.T) {
+	var notifier runtime.HITLNotifier = &SlackTokens{}
+	escaper, ok := notifier.(runtime.HITLMessageValueEscaper)
+	if !ok {
+		t.Fatal("SlackTokens does not escape message template values")
+	}
+	got := escaper.EscapeHITLMessageValue("<!channel> & <https://evil.example|Approve>")
+	if want := "&lt;!channel&gt; &amp; &lt;https://evil.example|Approve&gt;"; got != want {
+		t.Fatalf("EscapeHITLMessageValue = %q, want %q", got, want)
+	}
+}
