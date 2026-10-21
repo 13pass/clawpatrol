@@ -3819,6 +3819,7 @@ func runGateway(args []string) {
 		hitl:      newHITLRegistry(sink),
 		onboard:   newOnboardRegistry(),
 	}
+	sink.SetProfileResolver(g.profileFor)
 	g.cfg.Store(cfg)
 	// A tunnel plugin opens its transport through the gateway's brokered
 	// dial (HostTunnel.DialUpstream); when the tunnel has no `via` parent

@@ -147,6 +147,7 @@ func (a *Action) unmarshal(data []byte) error {
 		Host       string          `json:"host"`
 		Credential string          `json:"credential"`
 		PeerIP     string          `json:"peer_ip"`
+		Profile    string          `json:"profile"`
 		HTTP       json.RawMessage `json:"http,omitempty"`
 		K8s        json.RawMessage `json:"k8s,omitempty"`
 		SQL        json.RawMessage `json:"sql,omitempty"`
@@ -159,6 +160,7 @@ func (a *Action) unmarshal(data []byte) error {
 	a.Host = raw.Host
 	a.Credential = raw.Credential
 	a.PeerIP = raw.PeerIP
+	a.Profile = raw.Profile
 	count := 0
 	if len(raw.HTTP) > 0 {
 		count++

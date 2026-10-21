@@ -2078,6 +2078,7 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 		endpoint       sql.NullString
 		rule           sql.NullString
 		credential     sql.NullString
+		profile        sql.NullString
 		approver       sql.NullString
 		approverType   sql.NullString
 		approverBy     sql.NullString
@@ -2088,7 +2089,7 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 		       reason, req_sha, resp_sha,
 		       req_body, resp_body, req_body_state, resp_body_state, req_transformed,
 		       req_headers, resp_headers, extra,
-		       endpoint, rule, credential,
+		       endpoint, rule, credential, profile,
 		       approver, approver_type, approver_by
 		FROM actions WHERE action_id = ?`, actionID,
 	).Scan(
@@ -2097,7 +2098,7 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 		&action, &reason, &reqSha, &respSha,
 		&reqBody, &respBody, &reqBodyState, &respBodyState, &reqTransformed,
 		&reqHeaders, &respHeaders, &extra,
-		&endpoint, &rule, &credential,
+		&endpoint, &rule, &credential, &profile,
 		&approver, &approverType, &approverBy,
 	)
 	if err != nil {
@@ -2131,6 +2132,7 @@ func (w *webMux) loadAction(actionID string) (*Event, error) {
 	e.Endpoint = endpoint.String
 	e.Rule = rule.String
 	e.Credential = credential.String
+	e.Profile = profile.String
 	e.Approver = approver.String
 	e.ApproverType = approverType.String
 	e.ApproverBy = approverBy.String
@@ -2201,7 +2203,7 @@ func (w *webMux) writeActionFixture(rw http.ResponseWriter, ev *Event) {
 	// matching. Without it a fixture for a request whose rule pinned
 	// one of several credentials bound to the endpoint replays with an
 	// empty credential and never reaches that rule.
-	fx := &Fixture{Match: m, Action: Action{PeerIP: ev.AgentIP, Credential: ev.Credential}}
+	fx := &Fixture{Match: m, Action: Action{PeerIP: ev.AgentIP, Credential: ev.Credential, Profile: ev.Profile}}
 	switch ep.Family {
 	case "http":
 		if err := validateHTTPFixtureBodyCapture(ev); err != nil {
@@ -2864,6 +2866,10 @@ type Event struct {
 	// so a replay reaches the same credential-pinned rules the gateway
 	// evaluated.
 	Credential string `json:"credential,omitempty"`
+
+	// Profile is the profile the requesting peer was bound to, filled
+	// in by Sink.Emit from AgentIP. "" for events with no peer.
+	Profile string `json:"profile,omitempty"`
 }
 
 // eventPacket carries an event plus its marshaled JSON bytes. drain()
@@ -2890,6 +2896,10 @@ type Sink struct {
 	recentNext int
 	recentLen  int
 	recentCap  int
+
+	// profileFor resolves an event's AgentIP to its profile; set once
+	// the gateway exists (SetProfileResolver).
+	profileFor atomic.Pointer[func(peerIP string) string]
 
 	// closed flips once Close has run. Emit checks it as the cheap
 	// pre-flight; the deferred recover handles the residual race where
@@ -2930,7 +2940,7 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 		       method, path, status, bytes_in, bytes_out,
 		       ms, action, reason, req_sha, resp_sha,
 		       req_body_state, resp_body_state, req_transformed, extra,
-		       endpoint, rule, credential,
+		       endpoint, rule, credential, profile,
 		       approver, approver_type, approver_by
 		FROM actions ORDER BY id DESC LIMIT ?`, n)
 	if err != nil {
@@ -2962,6 +2972,7 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 			endpoint       sql.NullString
 			rule           sql.NullString
 			credential     sql.NullString
+			profile        sql.NullString
 			approver       sql.NullString
 			approverType   sql.NullString
 			approverBy     sql.NullString
@@ -2971,7 +2982,7 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 			&method, &path, &status, &in, &ot, &ms,
 			&action, &reason, &reqSha, &respSha,
 			&reqBodyState, &respBodyState, &reqTransformed, &extra,
-			&endpoint, &rule, &credential,
+			&endpoint, &rule, &credential, &profile,
 			&approver, &approverType, &approverBy,
 		); err != nil {
 			return nil, err
@@ -2983,6 +2994,7 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 		e.Endpoint = endpoint.String
 		e.Rule = rule.String
 		e.Credential = credential.String
+		e.Profile = profile.String
 		e.AgentIP = agentIP.String
 		e.Method = method.String
 		e.Path = path.String
@@ -3016,12 +3028,25 @@ func readTailEvents(db *sql.DB, n int) ([]Event, error) {
 	return out, nil
 }
 
+// SetProfileResolver makes Emit stamp each event with the profile
+// of its peer.
+func (s *Sink) SetProfileResolver(fn func(peerIP string) string) {
+	if s != nil {
+		s.profileFor.Store(&fn)
+	}
+}
+
 func (s *Sink) Emit(e Event) {
 	if s == nil || s.closed.Load() {
 		return
 	}
 	if e.Ts.IsZero() {
 		e.Ts = time.Now().UTC()
+	}
+	if e.Profile == "" && e.AgentIP != "" {
+		if fn := s.profileFor.Load(); fn != nil {
+			e.Profile = (*fn)(e.AgentIP)
+		}
 	}
 	defer func() {
 		// Tiny race: closed.Load returned false but Close raced past
@@ -3102,9 +3127,9 @@ func (s *Sink) drain() {
 				  ms, action, reason, req_sha, resp_sha,
 				  req_body, resp_body, req_body_state, resp_body_state, req_transformed,
 				  req_headers, resp_headers, extra,
-				  endpoint, rule, credential,
+				  endpoint, rule, credential, profile,
 				  approver, approver_type, approver_by)
-				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+				VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
 			`, e.ID, e.Ts.UnixNano(), e.Mode, e.Family, e.AgentIP,
 				e.Host, e.Method, e.Path, e.Status,
 				e.In, e.Out, e.Ms, e.Action, e.Reason,
@@ -3112,7 +3137,7 @@ func (s *Sink) drain() {
 				e.ReqBody, e.RespBody, e.ReqBodyState, e.RespBodyState, e.ReqTransformed,
 				string(rqhJSON), string(rshJSON),
 				string(extraJSON),
-				e.Endpoint, e.Rule, e.Credential,
+				e.Endpoint, e.Rule, e.Credential, sql.NullString{String: e.Profile, Valid: e.Profile != ""},
 				e.Approver, e.ApproverType, e.ApproverBy)
 		}
 
