@@ -136,10 +136,18 @@ func TestRoleGateDeniesMembersOperatorRoutes(t *testing.T) {
 	refusedByRoleGate := func(rw *httptest.ResponseRecorder) bool {
 		return rw.Code == http.StatusForbidden && strings.Contains(rw.Body.String(), "requires the admin role")
 	}
-	for _, path := range []string{"/api/state", "/api/users", "/api/audit", "/api/actions/123", "/api/config", "/oauth/callback"} {
+	for _, path := range []string{"/api/state", "/api/users", "/api/audit", "/api/config", "/oauth/callback"} {
 		if rw := serveAs(t, h, member, http.MethodGet, path, ""); !refusedByRoleGate(rw) {
 			t.Errorf("member GET %s = %d %q, want the role gate's 403", path, rw.Code, rw.Body.String())
 		}
+	}
+	// Actions are open to members, scoped by the handler: one outside
+	// their profiles is a 404, never a 403 that would confirm it exists.
+	if rw := serveAs(t, h, member, http.MethodGet, "/api/actions/123", ""); rw.Code != http.StatusNotFound {
+		t.Errorf("member GET /api/actions/123 = %d, want 404", rw.Code)
+	}
+	if rw := serveAs(t, h, member, http.MethodPost, "/api/actions/rule-preview", `{"action_id":"123"}`); !refusedByRoleGate(rw) {
+		t.Errorf("member POST /api/actions/rule-preview = %d, want the role gate's 403", rw.Code)
 	}
 	if rw := serveAs(t, h, member, http.MethodPost, "/api/credentials/set", `{"id":"x","slots":{}}`); !refusedByRoleGate(rw) {
 		t.Errorf("member POST /api/credentials/set = %d %q, want the role gate's 403", rw.Code, rw.Body.String())

@@ -233,9 +233,15 @@ func (w *webMux) handler() http.Handler {
 // operator route stays admin-only until it is scoped to the member's
 // own profiles (doc/multi-user-dashboard.md).
 var memberRoutes = map[string]bool{
-	"/api/me":          true,
-	"/api/me/password": true,
-	"/__logout":        true,
+	"/api/me":              true,
+	"/api/me/password":     true,
+	"/__logout":            true,
+	"/api/my/actions":      true,
+	"/api/my/rules":        true,
+	"/api/my/rules/update": true,
+	"/api/my/rules/delete": true,
+	"/api/rules/preview":   true,
+	"/api/rules/create":    true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -246,7 +252,7 @@ func (w *webMux) roleGate(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
 		p, ok := principalFromContext(r.Context())
-		if !ok || principalRole(p) == dashboardRoleAdmin || memberRoutes[path] ||
+		if !ok || principalRole(p) == dashboardRoleAdmin || w.isMemberRoute(path) ||
 			!needsOperatorGate(w.authRequirementForPath(path)) || !w.isOperatorSurface(path) {
 			next.ServeHTTP(rw, r)
 			return
@@ -318,6 +324,12 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodGet, Path: "/api/me", Auth: authDashboard, Handler: w.apiMe},
 		{Method: http.MethodPost, Path: "/api/me/password", Auth: authDashboard, Handler: w.apiMePassword},
 		{Method: http.MethodGet, Path: "/api/audit", Auth: authDashboard, Handler: w.apiAudit},
+		{Method: http.MethodGet, Path: "/api/my/actions", Auth: authDashboard, Handler: w.apiMyActions},
+		{Method: http.MethodGet, Path: "/api/my/rules", Auth: authDashboard, Handler: w.apiMyRules},
+		{Method: http.MethodPost, Path: "/api/my/rules/update", Auth: authDashboard, Handler: w.apiMyRulesUpdate},
+		{Method: http.MethodPost, Path: "/api/my/rules/delete", Auth: authDashboard, Handler: w.apiMyRulesDelete},
+		{Method: http.MethodPost, Path: "/api/rules/preview", Auth: authDashboard, Handler: w.apiRulePreview},
+		{Method: http.MethodPost, Path: "/api/rules/create", Auth: authDashboard, Handler: w.apiRuleCreate},
 		{Method: http.MethodPost, Path: "/api/onboard/start", Auth: authPublic, Handler: w.apiOnboardStart},
 		{Method: http.MethodPost, Path: "/api/onboard/poll", Auth: authPublic, Handler: w.apiOnboardPoll},
 		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.apiOnboardApprove},
@@ -2134,8 +2146,15 @@ func (w *webMux) apiActionByID(
 		http.Error(rw, "missing id", 400)
 		return
 	}
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), 500)
+		return
+	}
 	e, err := w.loadAction(actionID)
-	if errors.Is(err, sql.ErrNoRows) {
+	// A member asking for another profile's action gets the same 404 as
+	// for one that does not exist.
+	if errors.Is(err, sql.ErrNoRows) || (err == nil && !v.canSee(e)) {
 		http.Error(rw, "not found", 404)
 		return
 	}
