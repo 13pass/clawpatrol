@@ -61,6 +61,8 @@ var (
 type dashboardUser struct {
 	Username  string        `json:"username"`
 	Role      dashboardRole `json:"role"`
+	Profiles  []string      `json:"profiles"`
+	Approver  string        `json:"approver"`
 	CreatedNs int64         `json:"created_ns"`
 	UpdatedNs int64         `json:"updated_ns"`
 }
@@ -133,6 +135,9 @@ func deleteDashboardUser(db *sql.DB, username string) error {
 		return fmt.Errorf("no db")
 	}
 	if _, err := db.Exec(`DELETE FROM dashboard_users WHERE username = ?`, username); err != nil {
+		return err
+	}
+	if _, err := db.Exec(`DELETE FROM dashboard_user_profiles WHERE username = ?`, username); err != nil {
 		return err
 	}
 	return revokeAllDashboardSessionsFor(db, username)
@@ -267,7 +272,7 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 		return nil, fmt.Errorf("no db")
 	}
 	rows, err := db.Query(
-		`SELECT username, role, created_ns, updated_ns FROM dashboard_users ORDER BY username`,
+		`SELECT username, role, approver, created_ns, updated_ns FROM dashboard_users ORDER BY username`,
 	)
 	if err != nil {
 		return nil, err
@@ -277,13 +282,110 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	for rows.Next() {
 		var u dashboardUser
 		var role string
-		if err := rows.Scan(&u.Username, &role, &u.CreatedNs, &u.UpdatedNs); err != nil {
+		if err := rows.Scan(&u.Username, &role, &u.Approver, &u.CreatedNs, &u.UpdatedNs); err != nil {
 			return nil, err
 		}
 		u.Role = normalizeDashboardRole(u.Username, role)
 		out = append(out, u)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	for i := range out {
+		if out[i].Profiles, err = listDashboardUserProfiles(db, out[i].Username); err != nil {
+			return nil, err
+		}
+	}
+	return out, nil
+}
+
+// listDashboardUserProfiles returns the profiles username owns, sorted.
+func listDashboardUserProfiles(db *sql.DB, username string) ([]string, error) {
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
+	rows, err := db.Query(
+		`SELECT profile FROM dashboard_user_profiles WHERE username = ? ORDER BY profile`,
+		username,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []string{}
+	for rows.Next() {
+		var p string
+		if err := rows.Scan(&p); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
 	return out, rows.Err()
+}
+
+// setDashboardUserProfiles replaces the profiles username owns.
+func setDashboardUserProfiles(db *sql.DB, username string, profiles []string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var exists int
+	if err := tx.QueryRow(`SELECT COUNT(*) FROM dashboard_users WHERE username = ?`, username).Scan(&exists); err != nil {
+		return err
+	}
+	if exists == 0 {
+		return errDashboardUserNotFound
+	}
+	if _, err := tx.Exec(`DELETE FROM dashboard_user_profiles WHERE username = ?`, username); err != nil {
+		return err
+	}
+	for _, p := range profiles {
+		if _, err := tx.Exec(
+			`INSERT OR IGNORE INTO dashboard_user_profiles (username, profile) VALUES (?, ?)`,
+			username, p,
+		); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// setDashboardUserApprover sets the approver username's "require
+// approval" rules route to; "" means the dashboard only.
+func setDashboardUserApprover(db *sql.DB, username, approver string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	res, err := db.Exec(
+		`UPDATE dashboard_users SET approver = ?, updated_ns = ? WHERE username = ?`,
+		approver, time.Now().UnixNano(), username,
+	)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return errDashboardUserNotFound
+	}
+	return nil
+}
+
+// lookupDashboardUserApprover returns the approver set for username.
+func lookupDashboardUserApprover(db *sql.DB, username string) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("no db")
+	}
+	var approver string
+	err := db.QueryRow(`SELECT approver FROM dashboard_users WHERE username = ?`, username).Scan(&approver)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errDashboardUserNotFound
+	}
+	return approver, err
 }
 
 var (

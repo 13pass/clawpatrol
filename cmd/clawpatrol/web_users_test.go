@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/denoland/clawpatrol/internal/config"
 )
 
 const (
@@ -147,7 +149,7 @@ func TestRoleGateDeniesMembersOperatorRoutes(t *testing.T) {
 	if rw.Code != http.StatusOK {
 		t.Fatalf("member GET /api/me = %d, want 200", rw.Code)
 	}
-	var me map[string]string
+	var me map[string]any
 	if err := json.Unmarshal(rw.Body.Bytes(), &me); err != nil {
 		t.Fatal(err)
 	}
@@ -387,5 +389,98 @@ func TestPruneDashboardAudit(t *testing.T) {
 	}
 	if records, _ := listDashboardAudit(w.g.db, 0, 0); len(records) != 1 {
 		t.Fatalf("%d records left, want 1", len(records))
+	}
+}
+
+const usersPolicyHCL = `gateway {
+  state_dir  = "/opt/clawpatrol"
+  public_url = "https://gw.example.test"
+  wireguard { subnet_cidr = "10.55.0.0/24" }
+}
+endpoint "https" "gitlab" { hosts = ["gitlab.com"] }
+credential "bearer_token" "gl" { endpoint = https.gitlab }
+credential "slack_tokens" "ops-slack" {}
+profile "team-a" { credentials = [bearer_token.gl] }
+profile "team-b" { credentials = [bearer_token.gl] }
+approver "human_approver" "team-a-review" {
+  channel    = "#team-a"
+  credential = slack_tokens.ops-slack
+}
+approver "llm_approver" "judge" {
+  model      = "claude-haiku-4-5-20251001"
+  credential = bearer_token.gl
+}
+`
+
+func withUsersPolicy(t *testing.T, w *webMux) {
+	t.Helper()
+	gw, diags := config.LoadBytes([]byte(usersPolicyHCL), "users.hcl")
+	if diags.HasErrors() {
+		t.Fatalf("load: %v", diags)
+	}
+	cp, err := config.Compile(gw)
+	if err != nil {
+		t.Fatalf("compile: %v", err)
+	}
+	w.g.cfg.Store(gw)
+	w.g.policy.Store(cp)
+}
+
+func TestUserProfileAndApproverAssignment(t *testing.T) {
+	w := newUsersTestMux(t)
+	withUsersPolicy(t, w)
+	h := w.handler()
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+
+	for _, tc := range []struct {
+		name, body string
+		want       int
+	}{
+		{"assign", `{"username":"alice","profiles":["team-a"],"approver":"team-a-review"}`, http.StatusOK},
+		{"undeclared profile", `{"username":"alice","profiles":["team-z"]}`, http.StatusBadRequest},
+		{"llm approver", `{"username":"alice","approver":"judge"}`, http.StatusBadRequest},
+		{"unknown user", `{"username":"nobody","profiles":["team-a"]}`, http.StatusNotFound},
+	} {
+		if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", tc.body); rw.Code != tc.want {
+			t.Errorf("%s: status = %d, want %d (%s)", tc.name, rw.Code, tc.want, rw.Body.String())
+		}
+	}
+
+	rw := serveAs(t, h, root, http.MethodGet, "/api/users", "")
+	var list struct {
+		Users          []dashboardUser `json:"users"`
+		Profiles       []string        `json:"profiles"`
+		HumanApprovers []string        `json:"human_approvers"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &list); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(list.Profiles, ",") != "team-a,team-b" || strings.Join(list.HumanApprovers, ",") != "team-a-review" {
+		t.Fatalf("declared lists = %v / %v", list.Profiles, list.HumanApprovers)
+	}
+	for _, u := range list.Users {
+		if u.Username == "alice" && (strings.Join(u.Profiles, ",") != "team-a" || u.Approver != "team-a-review") {
+			t.Fatalf("alice = %+v", u)
+		}
+	}
+
+	member := sessionCookieFor(t, w, "alice")
+	rw = serveAs(t, h, member, http.MethodGet, "/api/me", "")
+	var me struct {
+		Profiles []string `json:"profiles"`
+		Approver string   `json:"approver"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &me); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(me.Profiles, ",") != "team-a" || me.Approver != "team-a-review" {
+		t.Fatalf("/api/me = %+v", me)
+	}
+
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/delete", `{"username":"alice"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	if profiles, _ := listDashboardUserProfiles(w.g.db, "alice"); len(profiles) != 0 {
+		t.Fatalf("profiles of a deleted user survive: %v", profiles)
 	}
 }

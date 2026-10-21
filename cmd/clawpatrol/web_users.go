@@ -3,10 +3,18 @@ package main
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strconv"
+
+	"github.com/denoland/clawpatrol/internal/config"
 )
+
+// humanApproverType is the approver plugin a user's "require approval"
+// rules may route to.
+const humanApproverType = "human_approver"
 
 // auditUsernameMaxLen bounds attacker-chosen usernames from failed
 // logins before they reach the audit table.
@@ -43,7 +51,60 @@ func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(rw, map[string]any{"users": users})
+	policy := w.g.Policy()
+	writeJSON(rw, map[string]any{
+		"users":           users,
+		"profiles":        declaredProfiles(policy),
+		"human_approvers": declaredHumanApprovers(policy),
+	})
+}
+
+func declaredProfiles(policy *config.CompiledPolicy) []string {
+	out := []string{}
+	if policy == nil {
+		return out
+	}
+	for name := range policy.Profiles {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func declaredHumanApprovers(policy *config.CompiledPolicy) []string {
+	out := []string{}
+	if policy == nil {
+		return out
+	}
+	for name, ent := range policy.Approvers {
+		if ent != nil && ent.Symbol != nil && ent.Symbol.Type == humanApproverType {
+			out = append(out, name)
+		}
+	}
+	sort.Strings(out)
+	return out
+}
+
+// validateUserAssignment checks profiles and approver against the
+// running config.
+func validateUserAssignment(policy *config.CompiledPolicy, profiles *[]string, approver *string) error {
+	if profiles != nil {
+		for _, p := range *profiles {
+			if policy == nil || policy.Profiles[p] == nil {
+				return fmt.Errorf("profile %q is not declared in the config", p)
+			}
+		}
+	}
+	if approver != nil && *approver != "" {
+		ent := (*config.Entity)(nil)
+		if policy != nil {
+			ent = policy.Approvers[*approver]
+		}
+		if ent == nil || ent.Symbol == nil || ent.Symbol.Type != humanApproverType {
+			return fmt.Errorf("%q is not a human_approver declared in the config", *approver)
+		}
+	}
+	return nil
 }
 
 func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
@@ -102,14 +163,20 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		Username string        `json:"username"`
 		Role     dashboardRole `json:"role"`
 		Password string        `json:"password"`
+		Profiles *[]string     `json:"profiles"`
+		Approver *string       `json:"approver"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
 	setAuditTarget(r, auditUsername(body.Username))
-	if body.Role == "" && body.Password == "" {
-		http.Error(rw, "nothing to update: set role and/or password", http.StatusBadRequest)
+	if body.Role == "" && body.Password == "" && body.Profiles == nil && body.Approver == nil {
+		http.Error(rw, "nothing to update: set role, password, profiles and/or approver", http.StatusBadRequest)
+		return
+	}
+	if err := validateUserAssignment(w.g.Policy(), body.Profiles, body.Approver); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
 	if _, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
@@ -163,6 +230,24 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		}
 		log.Printf("dashboard auth: user %q role set to %s", body.Username, body.Role)
 	}
+	if body.Profiles != nil {
+		if err := setDashboardUserProfiles(w.g.db, body.Username, *body.Profiles); errors.Is(err, errDashboardUserNotFound) {
+			http.Error(rw, err.Error(), http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
+	if body.Approver != nil {
+		if err := setDashboardUserApprover(w.g.db, body.Username, *body.Approver); errors.Is(err, errDashboardUserNotFound) {
+			http.Error(rw, err.Error(), http.StatusNotFound)
+			return
+		} else if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	}
 	w.bustStateCache()
 	writeJSON(rw, map[string]any{"ok": true})
 }
@@ -214,11 +299,27 @@ func (w *webMux) apiMe(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "no authenticated principal", http.StatusUnauthorized)
 		return
 	}
-	writeJSON(rw, map[string]any{
+	out := map[string]any{
 		"username":  p.Owner,
 		"role":      principalRole(p),
 		"auth_kind": p.Kind,
-	})
+		"profiles":  []string{},
+		"approver":  "",
+	}
+	if p.Kind == principalDashboardPassword {
+		profiles, err := listDashboardUserProfiles(w.g.db, p.Owner)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		approver, err := lookupDashboardUserApprover(w.g.db, p.Owner)
+		if err != nil && !errors.Is(err, errDashboardUserNotFound) {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out["profiles"], out["approver"] = profiles, approver
+	}
+	writeJSON(rw, out)
 }
 
 // apiMePassword lets a password user rotate their own password. The
