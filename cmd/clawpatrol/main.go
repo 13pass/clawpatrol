@@ -38,6 +38,7 @@ import (
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 	"github.com/denoland/clawpatrol/internal/sandbox"
 	"github.com/google/uuid"
+	"github.com/hashicorp/hcl/v2"
 	"tailscale.com/client/local"
 )
 
@@ -204,6 +205,18 @@ func newReqID() string {
 // process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
 	gw, diags := config.Load(path)
+	return compileLoadedConfig(gw, diags)
+}
+
+// loadConfigOverlay is loadConfig for a config directory with some
+// files' contents replaced in memory (nil removes a file). Used to
+// validate a candidate change before writing it.
+func loadConfigOverlay(dir string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	gw, diags := config.LoadDirOverlay(dir, overrides)
+	return compileLoadedConfig(gw, diags)
+}
+
+func compileLoadedConfig(gw *config.Gateway, diags hcl.Diagnostics) (*config.Gateway, *config.CompiledPolicy, error) {
 	if diags.HasErrors() {
 		return nil, nil, fmt.Errorf("%s", diags.Error())
 	}
@@ -843,7 +856,8 @@ func defaultProfileName(p *config.Policy) string {
 	return ""
 }
 
-// watchConfig polls the config file's mtime every 3s. On change it
+// watchConfig polls the config's fingerprint (every file's mtime and
+// size, for a directory) every 3s. On change it
 // re-decodes the HCL and atomically swaps in the new rules + admin_email
 // + integrations list. Listen ports / CA dir / OAuth dir / Tailscale
 // block changes still require a restart (logged but not applied).
@@ -872,18 +886,17 @@ func (g *Gateway) watchPluginUpdates() {
 }
 
 func (g *Gateway) watchConfig(path string) {
-	st, err := os.Stat(path)
+	last, err := configFingerprint(path)
 	if err != nil {
 		return
 	}
-	last := st.ModTime()
 	for {
 		time.Sleep(3 * time.Second)
-		st, err := os.Stat(path)
-		if err != nil || !st.ModTime().After(last) {
+		current, err := configFingerprint(path)
+		if err != nil || current == last {
 			continue
 		}
-		last = st.ModTime()
+		last = current
 		g.configMu.Lock()
 		err = g.reloadConfigFromFileLocked(path)
 		g.configMu.Unlock()

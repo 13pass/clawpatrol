@@ -335,12 +335,23 @@ export async function putRulesJSON(json: string): Promise<{ ok: boolean; count: 
   return r.json();
 }
 
-// HCL editor. /api/config returns the full gateway.hcl as raw text.
+// HCL viewer. /api/config returns one config file as raw text: the
+// config file itself, or in directory mode the file named by `file`.
 
-export async function getConfigHCL(): Promise<string> {
-  const r = await api("/api/config");
+export async function getConfigHCL(file?: string): Promise<string> {
+  const r = await api(file ? `/api/config?file=${encodeURIComponent(file)}` : "/api/config");
   if (!r.ok) throw new Error(await r.text());
   return r.text();
+}
+
+export type ConfigFileInfo = { name: string; revision: string; size: number };
+
+// getConfigFiles lists the files the config loads from, in load order;
+// `directory` is false when the config is a single file.
+export async function getConfigFiles(): Promise<{ directory: boolean; files: ConfigFileInfo[] }> {
+  const r = await api("/api/config/files");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 
 export async function getDeviceRulesHCL(ip: string): Promise<string> {
@@ -712,6 +723,9 @@ export type RulePreview = {
   endpoint_name?: string;
   hcl: string;
   config_revision?: string;
+  // config_file is the file an apply appends to; its revision is
+  // config_revision.
+  config_file?: string;
   dashboard_config_writes: boolean;
   warnings?: string[];
 };
@@ -733,13 +747,15 @@ export async function previewRuleFromAction(id: string): Promise<RulePreview> {
 export async function applyGeneratedRule(
   baseRevision: string,
   appendHCL: string,
-): Promise<{ ok: boolean; revision: string }> {
+  file?: string,
+): Promise<{ ok: boolean; file: string; revision: string }> {
   const r = await api("/api/config/apply", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({
       base_revision: baseRevision,
       append_hcl: appendHCL,
+      file,
     }),
   });
   if (!r.ok) throw new Error(await r.text());
