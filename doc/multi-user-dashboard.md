@@ -81,7 +81,7 @@ are global per kind across a directory config).
 
 ## Phases
 
-### Phase 1 — identity, roles, audit
+### Phase 1 — identity, roles, audit (done)
 
 - Migration: `dashboard_users.role` (`admin` | `member`, root forced
   to `admin`) and a `dashboard_audit` table.
@@ -111,18 +111,23 @@ are global per kind across a directory config).
 - UI: username field on the login page; Users admin page and
   change-password on the Account page.
 
-### Phase 2 — directory-mode config writes
+### Phase 2 — directory-mode config writes (done)
 
-- `GET /api/config` lists the files of a directory config;
-  per-file read.
-- File-scoped replace with a per-file revision (today any write
-  invalidates every other writer's whole-file revision).
-- Validation loads the whole directory with the candidate file
-  substituted, then atomic rename + reload.
-- `watchConfig` tracks the newest mtime across the directory's files.
-- Plugin lockfile path resolved inside the config directory.
+Built on its own branch off `main` (`feat/config-dir-writes`) so it
+can go upstream alone; details in `doc/multi-file-config.md`.
 
-These are generic fixes, suitable for upstream on their own.
+- `GET /api/config/files` lists the files with a revision each;
+  `GET /api/config?file=` reads one.
+- `/api/config/apply` targets one file (default `90-dashboard.hcl`
+  in directory mode) with a per-file revision, and merges generated
+  profile credential lists into the file declaring the profile.
+- Validation loads the directory with the changed files swapped in
+  memory (`config.LoadDirOverlay`), so includes still resolve; then
+  each file is renamed into place and the config reloads.
+- The watcher fingerprints every file, catching in-place edits.
+- The plugin lockfile stays in the parent directory: its name ends
+  in `.hcl`, so inside the config directory it would be loaded as
+  config.
 
 ### Phase 3 — rules from requests
 
