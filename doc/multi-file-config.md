@@ -93,10 +93,12 @@ Dashboard writes work per file:
 - The candidate is validated in place with `LoadDirOverlay(dir,
   overrides)` — the directory as it is, with the changed files'
   contents swapped in memory — so `<<file:NAME>>` includes still
-  resolve. Each changed file is then written to a dotfile temp (the
-  loader skips dotfiles) and renamed over its target, the file
-  carrying new declarations first. A file the dashboard creates gets
-  the directory's mode without its exec bits.
+  resolve. Every changed file is then staged as a dotfile temp (the
+  loader skips dotfiles) before any is renamed over its target, the
+  file carrying new declarations first. If a rename fails, the files
+  already replaced get their original content back and files the
+  change created are removed. A file the dashboard creates gets the
+  directory's mode without its exec bits.
 
 The plugin lockfile stays in the config directory's parent
 (`LockfilePathFor`): its name ends in `.hcl`, so inside the

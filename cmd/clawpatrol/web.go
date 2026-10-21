@@ -1586,22 +1586,22 @@ func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 	snippet := body.AppendHCL
 	var profileChanges []configChange
 	if configIsDir(w.g.cfgPath) {
-		files, err := configFiles(w.g.cfgPath)
+		names, err := config.DirFileNames(w.g.cfgPath)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		for _, f := range files {
-			if f.Name == target {
+		for _, name := range names {
+			if name == target {
 				continue
 			}
-			content, err := os.ReadFile(filepath.Join(w.g.cfgPath, f.Name))
+			content, err := os.ReadFile(filepath.Join(w.g.cfgPath, name))
 			if err != nil {
 				http.Error(rw, err.Error(), http.StatusInternalServerError)
 				return
 			}
 			if merged, rest, ok := mergeGeneratedProfileCredentials(content, []byte(snippet)); ok {
-				profileChanges = append(profileChanges, configChange{Name: f.Name, Content: merged})
+				profileChanges = append(profileChanges, configChange{Name: name, Content: merged})
 				snippet = string(rest)
 			}
 		}

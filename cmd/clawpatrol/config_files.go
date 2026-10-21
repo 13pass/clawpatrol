@@ -98,9 +98,10 @@ func readConfigFileOrEmpty(path string) ([]byte, error) {
 }
 
 // writeConfigFilesLocked validates the config with changes applied,
-// writes each changed file atomically in order, and reloads. Nothing
-// is written when validation fails. g.configMu must be held. Callers
-// order changes so a file declaring an entity lands before a file
+// replaces each changed file in order, and reloads. Nothing is
+// written when validation fails, and a failed replacement restores
+// the files already replaced. g.configMu must be held. Callers order
+// changes so a file declaring an entity lands before a file
 // referencing it.
 func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
 	if !configIsDir(g.cfgPath) {
@@ -120,22 +121,83 @@ func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
 	if _, _, err := loadConfigOverlay(g.cfgPath, overrides); err != nil {
 		return &configInvalidError{err}
 	}
-	dirSt, err := os.Stat(g.cfgPath)
+	if err := replaceConfigFiles(g.cfgPath, changes); err != nil {
+		return err
+	}
+	return g.reloadConfigFromFileLocked(g.cfgPath)
+}
+
+type stagedConfigFile struct {
+	name, path, tmp string
+	original        []byte
+	existed         bool
+	mode            fs.FileMode
+}
+
+// replaceConfigFiles writes every change to a temp file first, then
+// renames them into place. If a rename fails, the files already
+// replaced get their original content back and files it created are
+// removed, so the directory never holds a half-applied change.
+func replaceConfigFiles(dir string, changes []configChange) error {
+	dirSt, err := os.Stat(dir)
 	if err != nil {
 		return err
 	}
 	newFileMode := dirSt.Mode().Perm() &^ newConfigFileExecBits
-	for _, c := range changes {
-		path := filepath.Join(g.cfgPath, c.Name)
-		mode := newFileMode
-		if st, err := os.Stat(path); err == nil {
-			mode = st.Mode().Perm()
+
+	staged := make([]stagedConfigFile, 0, len(changes))
+	defer func() {
+		for _, s := range staged {
+			_ = os.Remove(s.tmp)
 		}
-		if err := writeFileAtomic(path, c.Content, mode); err != nil {
-			return fmt.Errorf("write %s: %w", c.Name, err)
+	}()
+	for _, c := range changes {
+		s := stagedConfigFile{name: c.Name, path: filepath.Join(dir, c.Name), mode: newFileMode}
+		if st, err := os.Stat(s.path); err == nil {
+			s.mode = st.Mode().Perm()
+		}
+		s.original, err = os.ReadFile(s.path)
+		switch {
+		case err == nil:
+			s.existed = true
+		case !errors.Is(err, fs.ErrNotExist):
+			return fmt.Errorf("read %s: %w", c.Name, err)
+		}
+		if s.tmp, err = writeTempConfig(dir, c.Content); err != nil {
+			return fmt.Errorf("stage %s: %w", c.Name, err)
+		}
+		staged = append(staged, s)
+		if err := os.Chmod(s.tmp, s.mode); err != nil {
+			return fmt.Errorf("stage %s: %w", c.Name, err)
 		}
 	}
-	return g.reloadConfigFromFileLocked(g.cfgPath)
+
+	for i, s := range staged {
+		if err := os.Rename(s.tmp, s.path); err != nil {
+			err = fmt.Errorf("replace %s: %w", s.name, err)
+			if rerr := restoreConfigFiles(staged[:i]); rerr != nil {
+				return errors.Join(err, rerr)
+			}
+			return err
+		}
+	}
+	return nil
+}
+
+func restoreConfigFiles(replaced []stagedConfigFile) error {
+	var errs []error
+	for _, s := range replaced {
+		if !s.existed {
+			if err := os.Remove(s.path); err != nil {
+				errs = append(errs, fmt.Errorf("restore %s: %w", s.name, err))
+			}
+			continue
+		}
+		if err := writeFileAtomic(s.path, s.original, s.mode); err != nil {
+			errs = append(errs, fmt.Errorf("restore %s: %w", s.name, err))
+		}
+	}
+	return errors.Join(errs...)
 }
 
 // writeSingleConfigFile validates content as the whole config, then

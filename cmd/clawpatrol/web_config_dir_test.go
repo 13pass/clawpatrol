@@ -275,3 +275,37 @@ func TestConfigFingerprintSeesInPlaceEditsInDirectory(t *testing.T) {
 		t.Fatal("fingerprint unchanged after an in-place edit")
 	}
 }
+
+func TestReplaceConfigFilesRestoresOnFailedRename(t *testing.T) {
+	w := configDirTestMux(t)
+	dir := w.g.cfgPath
+	original := readCfgFile(t, w, "10-github.hcl")
+	// A directory named like a config file: the loader skips it, so the
+	// candidate validates, but renaming a file over it fails.
+	if err := os.Mkdir(filepath.Join(dir, "30-blocked.hcl"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	err := replaceConfigFiles(dir, []configChange{
+		{Name: "10-github.hcl", Content: []byte(original + "# changed\n")},
+		{Name: "15-new.hcl", Content: []byte("# new\n")},
+		{Name: "30-blocked.hcl", Content: []byte("# blocked\n")},
+	})
+	if err == nil {
+		t.Fatal("replaceConfigFiles succeeded over a directory")
+	}
+	if got := readCfgFile(t, w, "10-github.hcl"); got != original {
+		t.Errorf("10-github.hcl not restored: %q", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "15-new.hcl")); !os.IsNotExist(err) {
+		t.Errorf("15-new.hcl created by the failed change was not removed (stat err %v)", err)
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), ".clawpatrol-config-") {
+			t.Errorf("temp file left behind: %s", e.Name())
+		}
+	}
+}
