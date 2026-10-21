@@ -87,6 +87,35 @@ func resolveConfigFile(cfgPath, name string) (string, string, error) {
 	return name, filepath.Join(cfgPath, name), nil
 }
 
+// planConfigAppend returns the changes that append snippet to target
+// (whose content is current). In directory mode, generated `profile`
+// credential lists are first folded into the files declaring those
+// profiles. The target comes first: it carries any new declarations
+// the profile files then reference.
+func planConfigAppend(cfgPath, target string, current []byte, snippet string) ([]configChange, error) {
+	var profileChanges []configChange
+	if configIsDir(cfgPath) {
+		names, err := config.DirFileNames(cfgPath)
+		if err != nil {
+			return nil, err
+		}
+		for _, name := range names {
+			if name == target {
+				continue
+			}
+			content, err := os.ReadFile(filepath.Join(cfgPath, name))
+			if err != nil {
+				return nil, err
+			}
+			if merged, rest, ok := mergeGeneratedProfileCredentials(content, []byte(snippet)); ok {
+				profileChanges = append(profileChanges, configChange{Name: name, Content: merged})
+				snippet = string(rest)
+			}
+		}
+	}
+	return append([]configChange{{Name: target, Content: appendConfigSnippet(current, snippet)}}, profileChanges...), nil
+}
+
 // readConfigFileOrEmpty reads a config file; one that does not exist
 // yet reads as empty, so it has the revision of empty content.
 func readConfigFileOrEmpty(path string) ([]byte, error) {

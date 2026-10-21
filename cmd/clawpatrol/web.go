@@ -1583,33 +1583,12 @@ func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snippet := body.AppendHCL
-	var profileChanges []configChange
-	if configIsDir(w.g.cfgPath) {
-		names, err := config.DirFileNames(w.g.cfgPath)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		for _, name := range names {
-			if name == target {
-				continue
-			}
-			content, err := os.ReadFile(filepath.Join(w.g.cfgPath, name))
-			if err != nil {
-				http.Error(rw, err.Error(), http.StatusInternalServerError)
-				return
-			}
-			if merged, rest, ok := mergeGeneratedProfileCredentials(content, []byte(snippet)); ok {
-				profileChanges = append(profileChanges, configChange{Name: name, Content: merged})
-				snippet = string(rest)
-			}
-		}
+	changes, err := planConfigAppend(w.g.cfgPath, target, current, body.AppendHCL)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
 	}
-	candidate := appendConfigSnippet(current, snippet)
-	// The target carries any new declarations, so it lands before the
-	// profile files that reference them.
-	changes := append([]configChange{{Name: target, Content: candidate}}, profileChanges...)
+	candidate := changes[0].Content
 	if err := w.g.writeConfigFilesLocked(changes); err != nil {
 		var invalid *configInvalidError
 		if errors.As(err, &invalid) {
