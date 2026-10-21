@@ -243,15 +243,24 @@ func (w *webMux) apiMePassword(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setAuditTarget(r, p.Owner)
+	limits := w.g.loginLimits()
+	buckets := loginBuckets(p.Owner, true, r.RemoteAddr)
+	if wait := limits.blocked(buckets); wait > 0 {
+		rw.Header().Set("Retry-After", strconv.Itoa(loginRetryAfterSeconds(wait)))
+		http.Error(rw, "too many failed password checks — try again later", http.StatusTooManyRequests)
+		return
+	}
 	ok, _, err := checkDashboardPassword(w.g.db, p.Owner, body.Current)
 	if err != nil {
 		http.Error(rw, "dashboard auth check failed", http.StatusServiceUnavailable)
 		return
 	}
 	if !ok {
+		limits.recordFailure(buckets)
 		http.Error(rw, "current password is wrong", http.StatusForbidden)
 		return
 	}
+	limits.recordSuccess(p.Owner)
 	if len(body.New) < dashboardMinPasswordLen {
 		http.Error(rw, "password must be at least "+strconv.Itoa(dashboardMinPasswordLen)+" characters", http.StatusBadRequest)
 		return

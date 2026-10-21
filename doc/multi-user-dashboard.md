@@ -106,6 +106,8 @@ are global per kind across a directory config).
 - Self-service: `GET /api/me`, `POST /api/me/password` (requires the
   current password; rotating revokes all sessions, then re-mints the
   caller's).
+- Login rate limiting: failures per username (unknown names share
+  one bucket) and per client address; see the security model.
 - Audit middleware: every state-changing request to an operator route
   records time, username, auth kind, method, path, status and remote
   address; handlers may attach a target (e.g. the username created).
@@ -186,7 +188,7 @@ user-profile administration, filtered credential cards.
 
 ### Later
 
-Entra ID / OIDC login, TOTP, login rate limiting, Git export of user
+Entra ID / OIDC login, TOTP, Git export of user
 files, a form to declare new credentials and endpoints.
 
 ## Risks

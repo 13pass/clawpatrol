@@ -400,6 +400,11 @@ type Gateway struct {
 	// set is bounded by the number of declared credentials.
 	credSaveLocks sync.Map
 
+	// loginLimit counts failed dashboard logins (see login_limit.go).
+	// Created on first use; tests may preset it.
+	loginLimitOnce sync.Once
+	loginLimit     *loginLimiter
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises

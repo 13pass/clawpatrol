@@ -555,7 +555,19 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 		if username == "" {
 			username = dashboardRootUsername
 		}
-		ok, exists, err := checkDashboardPassword(w.g.db, username, password)
+		_, exists, err := lookupDashboardUser(w.g.db, username)
+		if err != nil {
+			http.Error(rw, "dashboard auth lookup failed", http.StatusServiceUnavailable)
+			return
+		}
+		limits := w.g.loginLimits()
+		buckets := loginBuckets(username, exists, r.RemoteAddr)
+		if wait := limits.blocked(buckets); wait > 0 {
+			rw.Header().Set("Retry-After", strconv.Itoa(loginRetryAfterSeconds(wait)))
+			renderLoginFor(rw, next, r.PostFormValue("username"), "too many failed attempts — try again later", false, http.StatusTooManyRequests)
+			return
+		}
+		ok, _, err := checkDashboardPassword(w.g.db, username, password)
 		if err != nil {
 			http.Error(rw, "dashboard auth check failed", http.StatusServiceUnavailable)
 			return
@@ -564,10 +576,14 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 			burnPasswordCheck(password)
 		}
 		if !ok {
+			for _, b := range limits.recordFailure(buckets) {
+				log.Printf("dashboard auth: %s blocked for %s after repeated failed logins", b, loginBlockDuration)
+			}
 			w.recordAudit(r, auditUsername(username), string(principalDashboardPassword), "login", http.StatusUnauthorized)
 			renderLoginFor(rw, next, r.PostFormValue("username"), "wrong username or password", false, http.StatusUnauthorized)
 			return
 		}
+		limits.recordSuccess(username)
 		if err := w.mintAndSetSessionCookie(rw, username); err != nil {
 			http.Error(rw, "could not mint session", http.StatusInternalServerError)
 			return

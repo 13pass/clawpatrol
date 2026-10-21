@@ -346,8 +346,26 @@ Some limits keep one admin from taking over another account:
 
 The login form takes a username; leaving it empty means `root`. An
 unknown username costs the same bcrypt work and gets the same
-"wrong username or password" error as a wrong password. There is no
-rate limit on login attempts yet.
+"wrong username or password" error as a wrong password.
+
+Failed logins are rate limited in memory, per gateway process:
+
+- 10 failures for one username within 15 minutes block that
+  username for 15 minutes, whatever address the attempts came from.
+  All unknown usernames share a single such bucket, so spraying names
+  costs no memory and locks out no real account.
+- 30 failures from one client address within 15 minutes block that
+  address. Forwarded headers are not trusted, so behind a reverse
+  proxy every client shares the proxy's address and this acts as a
+  gateway-wide limit.
+
+A blocked attempt is answered `429` with `Retry-After` before any
+password check, so it costs no bcrypt work. A successful login clears
+its username's count, not its address's. The current-password check
+of a password change counts against the same username bucket. The
+trade-off is that an attacker can keep a known username locked out;
+`root` can always be recovered from the CLI, and restarting the
+gateway clears every count.
 
 Every state-changing dashboard request, including one refused for
 lack of the admin role, and every login attempt is recorded in the
