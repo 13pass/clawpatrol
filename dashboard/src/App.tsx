@@ -14,7 +14,15 @@ import { PageTitle } from "./components/PageTitle";
 import { PluginsPage } from "./components/PluginsPage";
 import { RequestDetailPage } from "./components/RequestDetailPage";
 import { SettingsPage } from "./components/SettingsPage";
-import { getState, type Agent, type Integration, type UpdateBanner, type Whoami } from "./lib/api";
+import { UsersPage } from "./components/UsersPage";
+import {
+  getMe,
+  getState,
+  type Agent,
+  type Integration,
+  type UpdateBanner,
+  type Whoami,
+} from "./lib/api";
 
 type Route =
   | { name: "main" }
@@ -25,6 +33,7 @@ type Route =
   | { name: "request"; id: string }
   | { name: "settings" }
   | { name: "plugins" }
+  | { name: "users" }
   | { name: "account" };
 
 function parseRoute(): Route {
@@ -42,6 +51,7 @@ function parseRoute(): Route {
   if (h === "#/plugins") return { name: "plugins" };
   if (h === "#/devices") return { name: "devices" };
   if (h === "#/account") return { name: "account" };
+  if (h === "#/users") return { name: "users" };
   if (h === "#/analytics") return { name: "analytics" };
   const a = h.match(/^#\/analytics\/([^/]+)$/);
   if (a) return { name: "analytics", ip: decodeURIComponent(a[1]) };
@@ -80,7 +90,12 @@ export default function App() {
       setUpdate(s.update ?? null);
       if (s.config_file) setConfigFile(s.config_file);
     } catch {
-      /* swallow */
+      // Members are refused /api/state; /api/me still identifies them.
+      try {
+        setWhoami(await getMe());
+      } catch {
+        /* swallow */
+      }
     }
   }
 
@@ -95,11 +110,19 @@ export default function App() {
     setRoute(parseRoute());
   }
 
+  // Members only have their account until the gateway's APIs are
+  // scoped to their own profiles; every other route lands there.
+  const isMember = whoami?.role === "member";
+
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
       <UpdateNotice update={update} />
-      <Header whoami={whoami} currentRoute={route.name} />
-      {route.name === "main" ? (
+      <Header whoami={whoami} currentRoute={isMember ? "account" : route.name} />
+      {isMember || route.name === "account" ? (
+        <AccountPage whoami={whoami} />
+      ) : route.name === "users" ? (
+        <UsersPage whoami={whoami} />
+      ) : route.name === "main" ? (
         <Main>
           <PageTitle trail={[{ label: "Live overview" }]} />
           <HomeAgents
@@ -131,8 +154,6 @@ export default function App() {
         />
       ) : route.name === "plugins" ? (
         <PluginsPage />
-      ) : route.name === "account" ? (
-        <AccountPage whoami={whoami} />
       ) : (
         <DevicePage
           ip={route.ip}

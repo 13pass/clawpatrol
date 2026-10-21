@@ -2,24 +2,16 @@ import type { ReactNode } from "react";
 import type { Whoami } from "../lib/api";
 
 // Global header — rendered above every route. Logo links home; the
-// nav cluster on the right is four circular icon buttons for the
-// dashboard's top-level sections (devices, analytics, settings,
-// account). Identity + log-out moved to the account page.
-//
-// `whoami` is still accepted (currently unused) so consumers don't
-// need to thread route-specific data through; future header
-// affordances (e.g. an unread indicator on the account button) can
-// read it without a signature change.
-export function Header({
-  whoami: _whoami,
-  currentRoute,
-}: {
-  whoami: Whoami | null;
-  currentRoute?: string;
-}) {
+// nav cluster on the right is circular icon buttons for the
+// dashboard's top-level sections (devices, analytics, plugins,
+// settings, users, account). Identity + log-out moved to the account
+// page. Members only get the account button: every other section is
+// refused to them by the gateway.
+export function Header({ whoami, currentRoute }: { whoami: Whoami | null; currentRoute?: string }) {
   // Single-device pages are part of the Devices section, so the nav
   // button stays lit when drilling into a device.
   const devicesActive = currentRoute === "devices" || currentRoute === "device";
+  const isMember = whoami?.role === "member";
   return (
     <header className="border-b-1.5 border-b-canvas-muted">
       <div className="mx-auto w-full max-w-7xl px-4 sm:px-6 py-3 flex items-center gap-4">
@@ -36,18 +28,25 @@ export function Header({
           />
         </a>
         <nav className="ml-auto flex items-center gap-1">
-          <NavLink href="#/devices" label="Devices" active={devicesActive}>
-            <DesktopNavIcon />
-          </NavLink>
-          <NavLink href="#/analytics" label="Analytics" active={currentRoute === "analytics"}>
-            <Icon paths={["M3 3v18h18", "m7 16 4-8 4 4 4-6"]} />
-          </NavLink>
-          <NavLink href="#/plugins" label="Plugins" active={currentRoute === "plugins"}>
-            <PluginsIcon />
-          </NavLink>
-          <NavLink href="#/settings" label="Settings" active={currentRoute === "settings"}>
-            <SettingsIcon />
-          </NavLink>
+          {!isMember && (
+            <>
+              <NavLink href="#/devices" label="Devices" active={devicesActive}>
+                <DesktopNavIcon />
+              </NavLink>
+              <NavLink href="#/analytics" label="Analytics" active={currentRoute === "analytics"}>
+                <Icon paths={["M3 3v18h18", "m7 16 4-8 4 4 4-6"]} />
+              </NavLink>
+              <NavLink href="#/plugins" label="Plugins" active={currentRoute === "plugins"}>
+                <PluginsIcon />
+              </NavLink>
+              <NavLink href="#/settings" label="Settings" active={currentRoute === "settings"}>
+                <SettingsIcon />
+              </NavLink>
+              <NavLink href="#/users" label="Users" active={currentRoute === "users"}>
+                <UsersIcon />
+              </NavLink>
+            </>
+          )}
           <NavLink href="#/account" label="Account" active={currentRoute === "account"}>
             <AccountIcon />
           </NavLink>
@@ -166,6 +165,29 @@ function AccountIcon() {
     >
       <circle cx="12" cy="8" r="4" />
       <path d="M4 21v-1a8 8 0 0 1 16 0v1" />
+    </svg>
+  );
+}
+
+// UsersIcon is a stroked two-people glyph matching the outline style
+// of the single-person account icon.
+function UsersIcon() {
+  return (
+    <svg
+      width="18"
+      height="18"
+      viewBox="0 0 24 24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="2"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      aria-hidden="true"
+    >
+      <circle cx="9" cy="8" r="3.5" />
+      <path d="M2 20v-1a7 7 0 0 1 14 0v1" />
+      <path d="M16 4.6a3.5 3.5 0 0 1 0 6.8" />
+      <path d="M19 13.5a7 7 0 0 1 3 5.5v1" />
     </svg>
   );
 }

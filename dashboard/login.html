@@ -176,9 +176,25 @@
       <p class="err">{{.Error}}</p>
       {{end}}
       <label for="username">Username</label>
-      <input id="username" type="text" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" placeholder="root" value="{{.Username}}" autofocus />
+      <input
+        id="username"
+        type="text"
+        name="username"
+        autocomplete="username"
+        autocapitalize="none"
+        spellcheck="false"
+        placeholder="root"
+        value="{{.Username}}"
+        autofocus
+      />
       <label for="password">Password</label>
-      <input id="password" type="password" name="password" autocomplete="current-password" required />
+      <input
+        id="password"
+        type="password"
+        name="password"
+        autocomplete="current-password"
+        required
+      />
       <button type="submit">Unlock</button>
       {{end}}
     </form>

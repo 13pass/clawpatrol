@@ -434,20 +434,115 @@ export async function decideHITL(id: string, allow: boolean): Promise<HITLResolv
 }
 
 // AuthMethod describes which gate path attributed the request:
-//   - "password": the cp_session cookie was valid; user = "root".
+//   - "password": the cp_session cookie was valid; user = the
+//     dashboard account that logged in.
 //   - "tailscale": the request landed via tsnet and the whois login
 //     matched the dashboard_operators allowlist; user = that login.
 //   - "" (empty): unauthenticated — only seen briefly between login
 //     redirects, the SPA shouldn't render in this state.
 export type AuthMethod = "password" | "tailscale" | "";
 
+// DashboardRole gates what the dashboard offers. Members are refused
+// every operator API except their own account until those APIs are
+// scoped to the member's profiles (doc/multi-user-dashboard.md).
+export type DashboardRole = "admin" | "member";
+
 export type Whoami = {
   user: string;
   device: string;
   host: string;
   auth_method: AuthMethod;
+  role?: DashboardRole;
   public_url?: string;
 };
+
+type MeResp = {
+  username: string;
+  role: DashboardRole;
+  auth_kind: "dashboard_password" | "tailnet";
+};
+
+// getMe is the one identity call a member may make; the SPA falls
+// back to it when /api/state is refused.
+export async function getMe(): Promise<Whoami> {
+  const r = await fetch("/api/me", { credentials: "same-origin" });
+  if (!r.ok) throw new Error(await r.text());
+  const me = (await r.json()) as MeResp;
+  return {
+    user: me.username,
+    device: "",
+    host: "",
+    auth_method: me.auth_kind === "dashboard_password" ? "password" : "tailscale",
+    role: me.role,
+  };
+}
+
+export async function changeOwnPassword(current: string, next: string): Promise<void> {
+  const r = await api("/api/me/password", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ current, new: next }),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export type DashboardUser = {
+  username: string;
+  role: DashboardRole;
+  created_ns: number;
+  updated_ns: number;
+};
+
+export async function listUsers(): Promise<DashboardUser[]> {
+  const r = await api("/api/users");
+  if (!r.ok) throw new Error(await r.text());
+  return ((await r.json()) as { users: DashboardUser[] }).users;
+}
+
+async function postUsers(path: string, body: object): Promise<void> {
+  const r = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export function createUser(username: string, password: string, role: DashboardRole) {
+  return postUsers("/api/users/create", { username, password, role });
+}
+
+// updateUser changes the role and/or resets the password; omitted
+// fields are left as they are.
+export function updateUser(username: string, change: { role?: DashboardRole; password?: string }) {
+  return postUsers("/api/users/update", { username, ...change });
+}
+
+export function deleteUser(username: string) {
+  return postUsers("/api/users/delete", { username });
+}
+
+export type AuditRecord = {
+  id: number;
+  ts_ns: number;
+  username: string;
+  auth_kind: string;
+  method: string;
+  path: string;
+  target?: string;
+  status: number;
+  remote_addr?: string;
+};
+
+// getAudit pages newest first; pass the smallest id seen as `before`
+// to load the next page.
+export async function getAudit(before?: number, limit = 100): Promise<AuditRecord[]> {
+  const q = new URLSearchParams({ limit: String(limit) });
+  if (before) q.set("before", String(before));
+  const r = await api(`/api/audit?${q}`);
+  if (!r.ok) throw new Error(await r.text());
+  return ((await r.json()) as { records: AuditRecord[] }).records;
+}
 
 export async function logout(): Promise<void> {
   const r = await fetch("/__logout", { method: "POST", credentials: "same-origin" });
