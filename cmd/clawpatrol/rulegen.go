@@ -24,6 +24,7 @@ type GeneratedRule struct {
 	EndpointName          string   `json:"endpoint_name,omitempty"`
 	HCL                   string   `json:"hcl"`
 	ConfigRevision        string   `json:"config_revision,omitempty"`
+	ConfigFile            string   `json:"config_file,omitempty"`
 	DashboardConfigWrites bool     `json:"dashboard_config_writes"`
 	Warnings              []string `json:"warnings,omitempty"`
 }

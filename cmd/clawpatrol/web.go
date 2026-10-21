@@ -247,6 +247,7 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/plugins/approve", Auth: authDashboard, Handler: w.apiPluginApprove},
 		{Method: http.MethodGet, Path: "/api/rules", Auth: authDashboard, Handler: w.apiRules},
 		{Method: http.MethodGet, Path: "/api/config", Auth: authDashboard, Handler: w.apiConfig},
+		{Method: http.MethodGet, Path: "/api/config/files", Auth: authDashboard, Handler: w.apiConfigFiles},
 		{Method: http.MethodPost, Path: "/api/config/apply", Auth: authDashboard, Handler: w.apiConfigApply},
 		{Method: http.MethodGet, Path: "/api/hitl/pending", Auth: authDashboard, Handler: w.apiHITLPending},
 		{Method: http.MethodPost, Path: "/api/hitl/decide", Auth: authDashboard, Handler: w.apiHITLDecide},
@@ -1471,16 +1472,29 @@ func lookupOAuthFlow(policy *config.CompiledPolicy, name string) *config.OAuthIn
 	return fp.OAuthFlow()
 }
 
-// apiConfig serves the entire gateway.hcl for the global settings
-// editor. GET returns the file as-is (preserves operator comments).
-// The gateway is read-only-config — writes happen out-of-band, via
-// SSH push from the operator's config repo, not the dashboard.
+// apiConfig serves one config file as-is (preserving operator
+// comments) for the settings viewer: the config file itself, or in
+// directory mode the file named by ?file= (see /api/config/files).
 func (w *webMux) apiConfig(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != "GET" {
 		http.Error(rw, "GET", http.StatusMethodNotAllowed)
 		return
 	}
-	b, err := os.ReadFile(w.g.cfgPath)
+	requested := r.URL.Query().Get("file")
+	if requested == "" && configIsDir(w.g.cfgPath) {
+		http.Error(rw, "the config is a directory: list its files at /api/config/files and pass ?file=", http.StatusBadRequest)
+		return
+	}
+	_, path, err := resolveConfigFile(w.g.cfgPath, requested)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	b, err := os.ReadFile(path)
+	if errors.Is(err, fs.ErrNotExist) {
+		http.Error(rw, "no such config file", http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(rw, err.Error(), 500)
 		return
@@ -1492,6 +1506,29 @@ func (w *webMux) apiConfig(rw http.ResponseWriter, r *http.Request) {
 	_, _ = rw.Write(b)
 }
 
+// apiConfigFiles lists the files the config loads from, with the
+// revision /api/config/apply expects as base_revision for each.
+func (w *webMux) apiConfigFiles(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != "GET" {
+		http.Error(rw, "GET", http.StatusMethodNotAllowed)
+		return
+	}
+	files, err := configFiles(w.g.cfgPath)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, map[string]any{
+		"directory": configIsDir(w.g.cfgPath),
+		"files":     files,
+	})
+}
+
+// apiConfigApply appends an HCL snippet to one config file. In
+// directory mode the file defaults to dashboardConfigFile, and any
+// generated `profile` credential lists are merged into whichever file
+// declares that profile. base_revision is the target file's revision;
+// a file that does not exist yet has the revision of empty content.
 func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != "POST" {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
@@ -1500,6 +1537,7 @@ func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
 		BaseRevision string `json:"base_revision"`
 		AppendHCL    string `json:"append_hcl"`
+		File         string `json:"file"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -1525,7 +1563,12 @@ func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	current, err := os.ReadFile(w.g.cfgPath)
+	target, targetPath, err := resolveConfigFile(w.g.cfgPath, body.File)
+	if err != nil {
+		writeJSONError(rw, http.StatusBadRequest, map[string]any{"error": err.Error()})
+		return
+	}
+	current, err := readConfigFileOrEmpty(targetPath)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
@@ -1534,50 +1577,53 @@ func (w *webMux) apiConfigApply(rw http.ResponseWriter, r *http.Request) {
 	if body.BaseRevision != "" && body.BaseRevision != currentRevision {
 		writeJSONError(rw, http.StatusConflict, map[string]any{
 			"error":            "config changed",
+			"file":             target,
 			"current_revision": currentRevision,
 		})
 		return
 	}
-	candidate := appendConfigSnippet(current, body.AppendHCL)
-	dir := filepath.Dir(w.g.cfgPath)
-	tmp, err := os.CreateTemp(dir, ".clawpatrol-config-*.hcl")
-	if err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+
+	snippet := body.AppendHCL
+	var profileChanges []configChange
+	if configIsDir(w.g.cfgPath) {
+		files, err := configFiles(w.g.cfgPath)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		for _, f := range files {
+			if f.Name == target {
+				continue
+			}
+			content, err := os.ReadFile(filepath.Join(w.g.cfgPath, f.Name))
+			if err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			}
+			if merged, rest, ok := mergeGeneratedProfileCredentials(content, []byte(snippet)); ok {
+				profileChanges = append(profileChanges, configChange{Name: f.Name, Content: merged})
+				snippet = string(rest)
+			}
+		}
 	}
-	tmpPath := tmp.Name()
-	defer func() { _ = os.Remove(tmpPath) }()
-	if _, err := tmp.Write(candidate); err != nil {
-		_ = tmp.Close()
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := tmp.Close(); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if _, _, err := loadConfig(tmpPath); err != nil {
-		writeJSONError(rw, http.StatusBadRequest, map[string]any{
-			"error": err.Error(),
-		})
-		return
-	}
-	// Preserve the original file's permissions across the atomic
-	// rename — os.CreateTemp gives us 0600 by default, which would
-	// silently downgrade a group-readable deploy file.
-	if st, err := os.Stat(w.g.cfgPath); err == nil {
-		_ = os.Chmod(tmpPath, st.Mode().Perm())
-	}
-	if err := os.Rename(tmpPath, w.g.cfgPath); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	}
-	if err := w.g.reloadConfigFromFileLocked(w.g.cfgPath); err != nil {
+	candidate := appendConfigSnippet(current, snippet)
+	// The target carries any new declarations, so it lands before the
+	// profile files that reference them.
+	changes := append([]configChange{{Name: target, Content: candidate}}, profileChanges...)
+	if err := w.g.writeConfigFilesLocked(changes); err != nil {
+		var invalid *configInvalidError
+		if errors.As(err, &invalid) {
+			writeJSONError(rw, http.StatusBadRequest, map[string]any{
+				"error": err.Error(),
+			})
+			return
+		}
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
 	writeJSON(rw, map[string]any{
 		"ok":       true,
+		"file":     target,
 		"revision": revisionForBytes(candidate),
 	})
 }
@@ -1897,8 +1943,11 @@ func (w *webMux) apiActionRulePreview(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if b, err := os.ReadFile(w.g.cfgPath); err == nil {
-		rule.ConfigRevision = revisionForBytes(b)
+	if name, path, err := resolveConfigFile(w.g.cfgPath, ""); err == nil {
+		if b, err := readConfigFileOrEmpty(path); err == nil {
+			rule.ConfigFile = name
+			rule.ConfigRevision = revisionForBytes(b)
+		}
 	}
 	rule.DashboardConfigWrites = w.g.cfg.Load().DashboardConfigWrites()
 	writeJSON(rw, rule)

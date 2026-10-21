@@ -327,7 +327,7 @@ function RulePreviewModal({ ev, onClose }: { ev: EventRecord; onClose: () => voi
     setErr(null);
     setMsg(null);
     try {
-      await applyGeneratedRule(preview.config_revision, hcl);
+      await applyGeneratedRule(preview.config_revision, hcl, preview.config_file);
       setApplied(true);
     } catch (e) {
       const text = (e as Error).message || "apply failed";

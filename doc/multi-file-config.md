@@ -70,6 +70,38 @@ rejected at load time (a dashboard config writer must not be able
 to read arbitrary files through the include syntax); symlinks
 inside the directory are followed.
 
+## Reloads and dashboard writes
+
+The config watcher fingerprints every file the loader reads (name,
+mtime, size), so adding, removing, or editing a file in place
+triggers a reload. A directory's own mtime is not enough: an
+in-place edit leaves it unchanged.
+
+Dashboard writes work per file:
+
+- `GET /api/config/files` lists the files in load order, each with
+  its revision (SHA-256 of its content). `GET /api/config?file=NAME`
+  reads one; without `file`, a directory config answers 400.
+- `POST /api/config/apply` takes an optional `file`. In directory
+  mode it defaults to `90-dashboard.hcl`, created on first use.
+  `base_revision` is that file's revision; a file that does not
+  exist yet has the revision of empty content. A write to one file
+  never conflicts with another file's revision.
+- Generated `profile "<p>" { credentials = [...] }` blocks are merged
+  into the file that declares profile `<p>`, not appended to the
+  target, which would declare the profile twice.
+- The candidate is validated in place with `LoadDirOverlay(dir,
+  overrides)` — the directory as it is, with the changed files'
+  contents swapped in memory — so `<<file:NAME>>` includes still
+  resolve. Each changed file is then written to a dotfile temp (the
+  loader skips dotfiles) and renamed over its target, the file
+  carrying new declarations first. A file the dashboard creates gets
+  the directory's mode without its exec bits.
+
+The plugin lockfile stays in the config directory's parent
+(`LockfilePathFor`): its name ends in `.hcl`, so inside the
+directory the loader would read it as config.
+
 ## What's intentionally out of scope (v1)
 
 - **Override files.** Terraform has special handling for
@@ -112,8 +144,14 @@ and no plugin author has to do anything different.
 - Entry point: `Load(path)` in `internal/config/config.go`.
   Stats the path; dispatches to `LoadDir` or single-file
   `LoadBytes`.
-- Directory walk + merge: `LoadDir(dir)` in the same file.
+- Directory walk + merge: `LoadDir(dir)` in the same file, a thin
+  wrapper over `LoadDirOverlay(dir, overrides)`. `DirFileNames`
+  exposes the discovery rules to callers that list or watch files.
+- Dashboard file listing, resolution, validation and atomic writes:
+  `cmd/clawpatrol/config_files.go`.
 - Shared decode pipeline: `loadFiles(files, configDir, diags)` —
   the post-merge work (gohcl decode, plugin spawn, pass-1, pass-2,
   file-include expansion) is identical to the single-file path.
-- Tests: `internal/config/directory_test.go`.
+- Tests: `internal/config/directory_test.go`,
+  `internal/config/overlay_test.go`,
+  `cmd/clawpatrol/web_config_dir_test.go`.

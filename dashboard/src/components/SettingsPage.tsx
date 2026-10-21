@@ -1,10 +1,10 @@
-// Settings page. Credentials declared in gateway.hcl render at the
-// top; the gateway.hcl viewer below shows the running config in
-// read-only mode. The gateway no longer accepts dashboard-driven
-// config edits — operators push HCL via SSH from a separate repo.
+// Settings page. Credentials declared in the config render at the
+// top; the viewer below shows the running config in read-only mode —
+// one file at a time when the config is a directory. Operators push
+// HCL edits from a separate repo.
 
 import { useEffect, useState } from "react";
-import { getConfigHCL, type Integration } from "../lib/api";
+import { getConfigFiles, getConfigHCL, type Integration } from "../lib/api";
 import { CredentialsTypeGrid } from "./CredentialsTypeGrid";
 import { HCLEditor } from "./HCLEditor";
 import { Main } from "./Main";
@@ -45,23 +45,54 @@ export function SettingsPage({
 function ConfigSection() {
   const [text, setText] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const [files, setFiles] = useState<string[]>([]);
+  const [isDirectory, setIsDirectory] = useState(false);
+  const [selected, setSelected] = useState("");
 
   useEffect(() => {
-    getConfigHCL()
-      .then(setText)
+    getConfigFiles()
+      .then((c) => {
+        setIsDirectory(c.directory);
+        setFiles(c.files.map((f) => f.name));
+        setSelected(c.files[0]?.name ?? "");
+      })
       .catch((e: Error) => setErr(String(e.message ?? e)));
   }, []);
+
+  useEffect(() => {
+    if (!selected) return;
+    getConfigHCL(isDirectory ? selected : undefined)
+      .then((t) => {
+        setText(t);
+        setErr(null);
+      })
+      .catch((e: Error) => setErr(String(e.message ?? e)));
+  }, [selected, isDirectory]);
 
   return (
     <section className="space-y-3">
       <div className="bg-canvas border-1.5 border-navy overflow-hidden">
         <div className="flex items-center px-4 py-3 bg-navy-100 border-b border-navy">
           <h2 className="font-mono text-xs uppercase tracking-wider text-navy font-bold">
-            Configuration · gateway.hcl
+            Configuration · {selected || "gateway.hcl"}
             <span className="ml-2 normal-case tracking-normal font-normal text-navy/70">
               · read-only (push edits via your config repo)
             </span>
           </h2>
+          {isDirectory && files.length > 1 && (
+            <select
+              value={selected}
+              onChange={(e) => setSelected(e.target.value)}
+              aria-label="Config file"
+              className="ml-auto border border-canvas-dark rounded px-2 py-1 text-xs font-mono bg-canvas focus:outline-none focus:border-text"
+            >
+              {files.map((f) => (
+                <option key={f} value={f}>
+                  {f}
+                </option>
+              ))}
+            </select>
+          )}
         </div>
         <div className="overflow-auto">
           <HCLEditor value={text} onChange={() => {}} minHeight={420} readOnly />

@@ -940,7 +940,42 @@ func LoadBytes(src []byte, filename string) (*Gateway, hcl.Diagnostics) {
 // practice that's the same path since all merged files share a parent,
 // but it's worth flagging if we ever extend multi-file to subdirectories.
 func LoadDir(dir string) (*Gateway, hcl.Diagnostics) {
+	return LoadDirOverlay(dir, nil)
+}
+
+// DirFileNames returns the config files LoadDir reads from dir, in
+// load order: direct-child `*.hcl` files that are not dotfiles,
+// sorted by name.
+func DirFileNames(dir string) ([]string, error) {
 	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var names []string
+	for _, e := range entries {
+		if !e.IsDir() && IsDirConfigFileName(e.Name()) {
+			names = append(names, e.Name())
+		}
+	}
+	sort.Strings(names)
+	return names, nil
+}
+
+// IsDirConfigFileName reports whether a directory entry named name is
+// one LoadDir reads: a bare `*.hcl` name that is not a dotfile.
+func IsDirConfigFileName(name string) bool {
+	return !strings.HasPrefix(name, ".") && strings.HasSuffix(name, ".hcl") &&
+		!strings.ContainsAny(name, `/\`)
+}
+
+// LoadDirOverlay is LoadDir with some files' contents taken from
+// overrides instead of disk: a non-nil value replaces (or adds) the
+// file of that name, a nil value removes it. Everything else —
+// discovery, merge, and `<<file:NAME>>` resolution against dir —
+// is LoadDir's, so a candidate change can be validated in place
+// before it is written.
+func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	onDisk, err := DirFileNames(dir)
 	if err != nil {
 		return nil, hcl.Diagnostics{{
 			Severity: hcl.DiagError,
@@ -948,19 +983,25 @@ func LoadDir(dir string) (*Gateway, hcl.Diagnostics) {
 			Detail:   err.Error(),
 		}}
 	}
+	present := map[string]bool{}
+	for _, n := range onDisk {
+		present[n] = true
+	}
+	for n, src := range overrides {
+		if !IsDirConfigFileName(n) {
+			return nil, hcl.Diagnostics{{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid config file name",
+				Detail:   fmt.Sprintf("%q is not a `*.hcl` file name the directory loader reads.", n),
+			}}
+		}
+		present[n] = src != nil
+	}
 	var names []string
-	for _, e := range entries {
-		if e.IsDir() {
-			continue
+	for n, ok := range present {
+		if ok {
+			names = append(names, n)
 		}
-		n := e.Name()
-		if strings.HasPrefix(n, ".") {
-			continue
-		}
-		if !strings.HasSuffix(n, ".hcl") {
-			continue
-		}
-		names = append(names, n)
 	}
 	sort.Strings(names)
 	if len(names) == 0 {
@@ -976,14 +1017,17 @@ func LoadDir(dir string) (*Gateway, hcl.Diagnostics) {
 	files := make([]*hcl.File, 0, len(names))
 	for _, name := range names {
 		path := filepath.Join(dir, name)
-		src, err := os.ReadFile(path)
-		if err != nil {
-			diags = append(diags, &hcl.Diagnostic{
-				Severity: hcl.DiagError,
-				Summary:  "Cannot read config file",
-				Detail:   fmt.Sprintf("%s: %v", path, err),
-			})
-			continue
+		src, overridden := overrides[name]
+		if !overridden {
+			src, err = os.ReadFile(path)
+			if err != nil {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Cannot read config file",
+					Detail:   fmt.Sprintf("%s: %v", path, err),
+				})
+				continue
+			}
 		}
 		file, parseDiags := parser.ParseHCL(src, path)
 		diags = append(diags, parseDiags...)
