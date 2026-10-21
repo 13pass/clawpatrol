@@ -114,6 +114,7 @@ type principal struct {
 	User   string
 	Device string
 	Host   string
+	Role   dashboardRole
 }
 
 type principalContextKey struct{}
@@ -133,8 +134,8 @@ func principalFromContext(ctx context.Context) (principal, bool) {
 	return p, true
 }
 
-func (w *webMux) dashboardPasswordPrincipal() principal {
-	return principal{Kind: principalDashboardPassword, Owner: dashboardRootUsername}
+func dashboardPasswordPrincipal(username string, role dashboardRole) principal {
+	return principal{Kind: principalDashboardPassword, Owner: username, Role: role}
 }
 
 func routeAuthIndex(routes []webRoute) map[string]authRequirement {
@@ -225,7 +226,42 @@ func (w *webMux) handler() http.Handler {
 	// which authenticates from the peer address, and that is exactly
 	// the path a cross-site request takes once SameSite=Lax withholds
 	// the cp_session cookie.
-	return w.csrfProtect(w.dashboardAuthGate(w.tailnetGate(mux)))
+	return w.csrfProtect(w.dashboardAuthGate(w.tailnetGate(w.roleGate(w.auditLog(mux)))))
+}
+
+// memberRoutes are the operator routes a member may call. Every other
+// operator route stays admin-only until it is scoped to the member's
+// own profiles (doc/multi-user-dashboard.md).
+var memberRoutes = map[string]bool{
+	"/api/me":          true,
+	"/api/me/password": true,
+	"/__logout":        true,
+}
+
+// roleGate refuses members every operator route not in memberRoutes.
+// Members may still load the dashboard's static files. Principals
+// without a role (tailnet operators, pre-role sessions) are admins.
+func (w *webMux) roleGate(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(rw http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		p, ok := principalFromContext(r.Context())
+		if !ok || p.Role != dashboardRoleMember || memberRoutes[path] ||
+			!needsOperatorGate(w.authRequirementForPath(path)) || !w.isOperatorSurface(path) {
+			next.ServeHTTP(rw, r)
+			return
+		}
+		http.Error(rw, "this action requires the admin role", http.StatusForbidden)
+	})
+}
+
+// isOperatorSurface reports whether path is an API or a registered
+// route rather than a static dashboard file.
+func (w *webMux) isOperatorSurface(path string) bool {
+	if strings.HasPrefix(path, "/api/") {
+		return true
+	}
+	_, registered := w.routeAuth[path]
+	return registered
 }
 
 func (w *webMux) routes() []webRoute {
@@ -266,6 +302,13 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodGet, Path: "/api/actions/", Auth: authDashboard, Handler: w.apiActionByID},
 		{Method: http.MethodGet, Path: "/api/analytics", Auth: authDashboard, Handler: w.apiAnalytics},
 		{Method: http.MethodGet, Path: "/api/facets", Auth: authDashboard, Handler: w.apiFacets},
+		{Method: http.MethodGet, Path: "/api/users", Auth: authDashboard, Handler: w.apiUsers},
+		{Method: http.MethodPost, Path: "/api/users/create", Auth: authDashboard, Handler: w.apiUsersCreate},
+		{Method: http.MethodPost, Path: "/api/users/update", Auth: authDashboard, Handler: w.apiUsersUpdate},
+		{Method: http.MethodPost, Path: "/api/users/delete", Auth: authDashboard, Handler: w.apiUsersDelete},
+		{Method: http.MethodGet, Path: "/api/me", Auth: authDashboard, Handler: w.apiMe},
+		{Method: http.MethodPost, Path: "/api/me/password", Auth: authDashboard, Handler: w.apiMePassword},
+		{Method: http.MethodGet, Path: "/api/audit", Auth: authDashboard, Handler: w.apiAudit},
 		{Method: http.MethodPost, Path: "/api/onboard/start", Auth: authPublic, Handler: w.apiOnboardStart},
 		{Method: http.MethodPost, Path: "/api/onboard/poll", Auth: authPublic, Handler: w.apiOnboardPoll},
 		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.apiOnboardApprove},
@@ -377,10 +420,19 @@ func (w *webMux) dashboardAuthGate(next http.Handler) http.Handler {
 
 		// Session-cookie path: look up the cookie's token-hash in
 		// the dashboard_sessions table. Hit → inject the password
-		// principal so tailnetGate downstream short-circuits.
+		// principal so tailnetGate downstream short-circuits. The
+		// role is read on every request, so a role change applies
+		// to live sessions at once.
 		if username := w.lookupSessionFromRequest(r); username != "" {
-			next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), w.dashboardPasswordPrincipal())))
-			return
+			role, exists, err := lookupDashboardUserRole(w.g.db, username)
+			if err != nil {
+				http.Error(rw, "dashboard auth lookup failed", http.StatusServiceUnavailable)
+				return
+			}
+			if exists {
+				next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), dashboardPasswordPrincipal(username, role))))
+				return
+			}
 		}
 
 		// Tailnet allowlist path: defer to tailnetGate so it can
@@ -448,8 +500,11 @@ func safeDashboardLoginNext(next string) string {
 //   - first-run (GET): render the "set password" form (two fields).
 //     POST: validate password == confirm, length >= 12, upsert root,
 //     mint a session, set cookie, redirect.
-//   - steady-state (GET): render the "enter password" form.
-//     POST: bcrypt-verify, mint a session, set cookie, redirect.
+//   - steady-state (GET): render the "username + password" form.
+//     POST: bcrypt-verify, mint a session, set cookie, redirect. An
+//     empty username means root, so password-only callers keep
+//     working. Unknown usernames cost the same bcrypt work and get
+//     the same error as a wrong password.
 func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 	next := safeDashboardLoginNext(r.URL.Query().Get("next"))
 	_, rootExists, err := lookupDashboardUser(w.g.db, dashboardRootUsername)
@@ -487,19 +542,28 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 			http.Redirect(rw, r, next, http.StatusFound)
 			return
 		}
-		ok, _, err := checkDashboardPassword(w.g.db, dashboardRootUsername, password)
+		username := strings.TrimSpace(r.PostFormValue("username"))
+		if username == "" {
+			username = dashboardRootUsername
+		}
+		ok, exists, err := checkDashboardPassword(w.g.db, username, password)
 		if err != nil {
 			http.Error(rw, "dashboard auth check failed", http.StatusServiceUnavailable)
 			return
 		}
+		if !exists {
+			burnPasswordCheck(password)
+		}
 		if !ok {
-			renderLogin(rw, next, "wrong password", false, http.StatusUnauthorized)
+			w.recordAudit(r, auditUsername(username), string(principalDashboardPassword), "login", http.StatusUnauthorized)
+			renderLoginFor(rw, next, r.PostFormValue("username"), "wrong username or password", false, http.StatusUnauthorized)
 			return
 		}
-		if err := w.mintAndSetSessionCookie(rw, dashboardRootUsername); err != nil {
+		if err := w.mintAndSetSessionCookie(rw, username); err != nil {
 			http.Error(rw, "could not mint session", http.StatusInternalServerError)
 			return
 		}
+		w.recordAudit(r, username, string(principalDashboardPassword), "login", http.StatusFound)
 		http.Redirect(rw, r, next, http.StatusFound)
 		return
 	}
@@ -563,13 +627,18 @@ func (w *webMux) mintAndSetSessionCookie(rw http.ResponseWriter, username string
 }
 
 func renderLogin(rw http.ResponseWriter, next, errMsg string, firstRun bool, status int) {
+	renderLoginFor(rw, next, "", errMsg, firstRun, status)
+}
+
+func renderLoginFor(rw http.ResponseWriter, next, username, errMsg string, firstRun bool, status int) {
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.WriteHeader(status)
 	_ = loginTpl.Execute(rw, struct {
 		Next     string
+		Username string
 		Error    string
 		FirstRun bool
-	}{next, errMsg, firstRun})
+	}{next, username, errMsg, firstRun})
 }
 
 // tailnetGate runs downstream of dashboardAuthGate. Three jobs:
@@ -651,7 +720,7 @@ func (w *webMux) tailnetGate(next http.Handler) http.Handler {
 				return
 			}
 		}
-		principal := principal{Kind: principalTailnet, Owner: login, User: login, Device: device, Host: displayHost}
+		principal := principal{Kind: principalTailnet, Owner: login, User: login, Device: device, Host: displayHost, Role: dashboardRoleAdmin}
 		next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), principal)))
 	})
 }
@@ -1110,10 +1179,12 @@ func (w *webMux) whoamiData(r *http.Request) map[string]string {
 		"auth_method": "",
 		"public_url":  pu,
 	}
+	out["role"] = ""
 	if p, ok := principalFromContext(r.Context()); ok {
 		out["user"] = p.Owner
 		out["device"] = p.Device
 		out["host"] = p.Host
+		out["role"] = string(principalRole(p))
 		switch p.Kind {
 		case principalDashboardPassword:
 			out["auth_method"] = "password"

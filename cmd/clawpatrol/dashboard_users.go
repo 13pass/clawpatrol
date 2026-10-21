@@ -4,6 +4,8 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"regexp"
+	"sync"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -14,9 +16,40 @@ import (
 const dashboardUsersBcryptCost = 12
 
 // dashboardRootUsername is the username of the bootstrap operator row.
-// Future user-management features may add more rows; the gate today
-// only consults this single row.
+// Its existence is the first-run condition, so it can be neither
+// deleted from the dashboard nor demoted.
 const dashboardRootUsername = "root"
+
+type dashboardRole string
+
+const (
+	dashboardRoleAdmin  dashboardRole = "admin"
+	dashboardRoleMember dashboardRole = "member"
+)
+
+func validDashboardRole(role dashboardRole) bool {
+	return role == dashboardRoleAdmin || role == dashboardRoleMember
+}
+
+// dashboardUsernameRe keeps usernames usable as the `<user>-` prefix of
+// HCL block names a user's config file declares.
+var dashboardUsernameRe = regexp.MustCompile(`^[a-z][a-z0-9-]{1,31}$`)
+
+func validDashboardUsername(username string) bool {
+	return dashboardUsernameRe.MatchString(username)
+}
+
+var (
+	errDashboardUserExists   = errors.New("dashboard user already exists")
+	errDashboardUserNotFound = errors.New("dashboard user not found")
+)
+
+type dashboardUser struct {
+	Username  string        `json:"username"`
+	Role      dashboardRole `json:"role"`
+	CreatedNs int64         `json:"created_ns"`
+	UpdatedNs int64         `json:"updated_ns"`
+}
 
 // lookupDashboardUser returns the stored bcrypt hash for the given
 // username. The bool is false when no row exists; the caller is
@@ -54,14 +87,18 @@ func setDashboardUser(db *sql.DB, username, password string) error {
 	if err != nil {
 		return fmt.Errorf("hash password: %w", err)
 	}
+	newRowRole := dashboardRoleMember
+	if username == dashboardRootUsername {
+		newRowRole = dashboardRoleAdmin
+	}
 	now := time.Now().UnixNano()
 	_, err = db.Exec(
-		`INSERT INTO dashboard_users (username, password_hash, created_ns, updated_ns)
-		 VALUES (?, ?, ?, ?)
+		`INSERT INTO dashboard_users (username, password_hash, role, created_ns, updated_ns)
+		 VALUES (?, ?, ?, ?, ?)
 		 ON CONFLICT(username) DO UPDATE SET
 		   password_hash = excluded.password_hash,
 		   updated_ns    = excluded.updated_ns`,
-		username, string(hash), now, now,
+		username, string(hash), string(newRowRole), now, now,
 	)
 	if err != nil {
 		return err
@@ -102,4 +139,119 @@ func checkDashboardPassword(db *sql.DB, username, password string) (bool, bool, 
 		return false, true, err
 	}
 	return true, true, nil
+}
+
+// createDashboardUser inserts a new operator account. Unlike
+// setDashboardUser it never overwrites an existing row.
+func createDashboardUser(db *sql.DB, username, password string, role dashboardRole) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	if password == "" {
+		return fmt.Errorf("password must not be empty")
+	}
+	hash, err := bcrypt.GenerateFromPassword([]byte(password), dashboardUsersBcryptCost)
+	if err != nil {
+		return fmt.Errorf("hash password: %w", err)
+	}
+	now := time.Now().UnixNano()
+	res, err := db.Exec(
+		`INSERT INTO dashboard_users (username, password_hash, role, created_ns, updated_ns)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(username) DO NOTHING`,
+		username, string(hash), string(role), now, now,
+	)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return errDashboardUserExists
+	}
+	return nil
+}
+
+// lookupDashboardUserRole returns the role of username. Root is always
+// an admin, whatever its row says.
+func lookupDashboardUserRole(db *sql.DB, username string) (dashboardRole, bool, error) {
+	if db == nil {
+		return "", false, fmt.Errorf("no db")
+	}
+	var role string
+	err := db.QueryRow(
+		`SELECT role FROM dashboard_users WHERE username = ?`,
+		username,
+	).Scan(&role)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	if username == dashboardRootUsername {
+		return dashboardRoleAdmin, true, nil
+	}
+	return dashboardRole(role), true, nil
+}
+
+func setDashboardUserRole(db *sql.DB, username string, role dashboardRole) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	res, err := db.Exec(
+		`UPDATE dashboard_users SET role = ?, updated_ns = ? WHERE username = ?`,
+		string(role), time.Now().UnixNano(), username,
+	)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return errDashboardUserNotFound
+	}
+	return nil
+}
+
+func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
+	if db == nil {
+		return nil, fmt.Errorf("no db")
+	}
+	rows, err := db.Query(
+		`SELECT username, role, created_ns, updated_ns FROM dashboard_users ORDER BY username`,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []dashboardUser{}
+	for rows.Next() {
+		var u dashboardUser
+		var role string
+		if err := rows.Scan(&u.Username, &role, &u.CreatedNs, &u.UpdatedNs); err != nil {
+			return nil, err
+		}
+		u.Role = dashboardRole(role)
+		if u.Username == dashboardRootUsername {
+			u.Role = dashboardRoleAdmin
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
+}
+
+var (
+	timingDummyHashOnce sync.Once
+	timingDummyHash     []byte
+)
+
+// burnPasswordCheck spends the same bcrypt work as a real password
+// check, so a login for an unknown username can't be told apart from
+// a wrong password by its response time.
+func burnPasswordCheck(password string) {
+	timingDummyHashOnce.Do(func() {
+		timingDummyHash, _ = bcrypt.GenerateFromPassword([]byte("timing-equalizer"), dashboardUsersBcryptCost)
+	})
+	_ = bcrypt.CompareHashAndPassword(timingDummyHash, []byte(password))
 }

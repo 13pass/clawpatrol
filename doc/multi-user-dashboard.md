@@ -1,0 +1,197 @@
+# Multi-user dashboard — design
+
+Today the dashboard has exactly one operator: every password session
+is `root`, and every authenticated request can read and change the
+whole gateway. This document proposes letting several people log in,
+each managing the credentials and rules of their own profiles, while
+gateway-wide configuration stays with administrators.
+
+The target workflow: a user opens any request one of their agents
+made — allowed or denied — and turns it into a rule with one click:
+**deny**, **pre-approve**, or **require human approval**. The rule is
+authored by a human from a real request, so it applies immediately;
+the audit log records who wrote it.
+
+## TL;DR
+
+- Two roles: `admin` (today's root powers) and `member`. Members are
+  denied every existing API by default; each phase opens scoped
+  endpoints to them explicitly.
+- A user owns one or more **profiles** (the existing tenancy unit).
+  Everything a member sees or changes is reached through their
+  profiles: devices, requests, credentials, rules, pending approvals.
+- Member rules live in a per-user file, `50-user-<name>.hcl`, of a
+  directory-mode config. The server generates the HCL from a request;
+  members never send raw HCL.
+- Every generated rule is pinned with `credential = <the credential
+  the request used>` and held to a priority band below admin
+  guardrails, so it only touches the author's own traffic and can never
+  override an admin deny.
+- A `dashboard_audit` table records who did what for every
+  state-changing dashboard call.
+
+## Current state
+
+Single tenant by design. `migrations/sqlite/0001_initial.sql` says the
+owner concept is "intentionally absent … Profile is the tenancy unit";
+`0011_credentials_global.sql` removed per-profile secrets.
+
+- **Identity.** `dashboardAuthGate` (`cmd/clawpatrol/web.go`) reads the
+  session's username, then discards it and injects
+  `dashboardPasswordPrincipal()`, hardcoded to `root`. `/__login` has
+  no username field. The `dashboard_users` / `dashboard_sessions`
+  tables already carry a username column "for future operators".
+- **Authorization.** None beyond authentication. Every `authDashboard`
+  route accepts any session: credentials, OAuth, devices, profiles,
+  HITL decisions, config, plugins.
+- **Rule generation.** `GenerateRuleFromEvent` (`rulegen.go`) supports
+  only `deny` on an exact method + path. A request with no endpoint
+  generates a new endpoint plus a passthrough credential added to
+  *every* profile.
+- **Config writes.** `/api/config/apply` appends arbitrary
+  client-supplied HCL to a single file; it fails in directory mode
+  (`os.ReadFile` on a directory), and `watchConfig` polls only the
+  path's mtime, which misses in-place edits inside a directory.
+- **Audit.** No record of dashboard actions. HITL decisions store the
+  deciding principal (`actions.approver_by`), which is always `root`
+  for password sessions.
+
+Relevant rule semantics (`site/doc/rules.md`): rules attach to
+endpoints and are shared by every profile reaching that endpoint;
+they are sorted by `priority` (descending), first match wins, and a
+rule's `credential = X` predicate restricts it to requests dispatched
+against credential X.
+
+## Model
+
+| Concept | Owner | Where |
+|---|---|---|
+| Dashboard user, role | admin | `dashboard_users` |
+| User → profiles | admin | `dashboard_user_profiles` (phase 3) |
+| `gateway`, `defaults`, `plugin`, `tunnel`, shared endpoints/approvers, guardrail rules | admin | `00-*.hcl`, Git-managed |
+| Credentials and endpoints of a profile (declaration) | admin | `00-*.hcl` (v1); forms later |
+| Credential secrets (values, OAuth) of an owned profile | member | DB, existing screens, scoped |
+| Rules generated from owned requests | member | `50-user-<name>.hcl`, dashboard-managed |
+| Devices bound to an owned profile | member | `devices`, scoped |
+| Pending approvals of owned profiles | member | HITL pool, scoped |
+
+Usernames are `^[a-z][a-z0-9-]{1,31}$` because they become the
+`<user>-` prefix of every block name the user's file declares (names
+are global per kind across a directory config).
+
+## Phases
+
+### Phase 1 — identity, roles, audit
+
+- Migration: `dashboard_users.role` (`admin` | `member`, root forced
+  to `admin`) and a `dashboard_audit` table.
+- Login takes a username (empty means `root`, so existing scripts and
+  the first-run flow keep working). Unknown usernames cost the same
+  bcrypt work as a wrong password and get the same error.
+- The principal carries the real username and role. Tailnet operators
+  (the `operators` allowlist) are admins.
+- **Deny by default for members**: a role gate after authentication
+  refuses a member any `/api/` route and any registered operator
+  route not on an explicit member allowlist. In this phase the
+  allowlist is only `/api/me`, `/api/me/password` and `/__logout`, so
+  adding a member is safe before any scoping exists.
+- Admin API: `GET /api/users`, `POST /api/users/create`,
+  `POST /api/users/update` (role and/or password),
+  `POST /api/users/delete`. Invariants: `root` cannot be deleted or
+  demoted (the first-run check keys on its row), and an admin cannot
+  change their own role.
+- Self-service: `GET /api/me`, `POST /api/me/password` (requires the
+  current password; rotating revokes all sessions, then re-mints the
+  caller's).
+- Audit middleware: every state-changing request to an operator route
+  records time, username, auth kind, method, path, status and remote
+  address; handlers may attach a target (e.g. the username created).
+  Login successes and failures are recorded too. Bodies are never
+  stored. `GET /api/audit` (admin) pages through it.
+- UI: username field on the login page; Users admin page and
+  change-password on the Account page.
+
+### Phase 2 — directory-mode config writes
+
+- `GET /api/config` lists the files of a directory config;
+  per-file read.
+- File-scoped replace with a per-file revision (today any write
+  invalidates every other writer's whole-file revision).
+- Validation loads the whole directory with the candidate file
+  substituted, then atomic rename + reload.
+- `watchConfig` tracks the newest mtime across the directory's files.
+- Plugin lockfile path resolved inside the config directory.
+
+These are generic fixes, suitable for upstream on their own.
+
+### Phase 3 — rules from requests
+
+- `dashboard_user_profiles(username, profile)`, admin-managed.
+- Rule dialog on the request page: verdict (`deny`, `allow`,
+  `approve = [<user's approver>]`) × scope (exact method + path; any
+  method on the path; path pattern with ID segments generalized; and,
+  with the `{{http.headers.*}}` work, "only this caller" on a
+  caller-ID header).
+- Preview shows the generated HCL and how many recent actions it would
+  have matched, evaluated against the request log.
+- The server generates the rule and writes it to `50-user-<name>.hcl`.
+  Guardrails added unconditionally:
+  - `credential = <credential the request used>` — the rule only
+    matches the author's traffic, even on a shared endpoint;
+  - `priority` clamped to the member band (1–99); admin guardrails
+    use ≥ 100, so an admin deny always wins under first-match;
+  - for a request with no endpoint, only `deny` / `approve`, and the
+    generated endpoint + passthrough credential join the author's
+    profiles only.
+- "My rules": list, disable (`disabled = true`), delete.
+- Each user has a default approver (own Slack / Signal channel, or
+  dashboard-only), set by an admin.
+- The client sends `{action_id, verdict, scope, approver}`; raw-HCL
+  `/api/config/apply` stays admin-only.
+
+### Phase 4 — scope every API
+
+The security-critical phase. Each route gets an ownership check or a
+filter, and a cross-tenant test (user A against user B's resource must
+get 403/404):
+
+- credentials, OAuth (sessions remember who started them), Tailscale
+  credential flows: own profiles' credentials only;
+- devices: list/delete/profile-assign within own profiles; onboarding
+  approval only into an own profile;
+- HITL: pending list and decide filtered by profile — needs the
+  profile on `HITLPending`;
+- `/api/state`, `/api/events`, `/api/actions/`, `/api/analytics`,
+  `/api/rules`: filtered — needs a `profile` column on `actions`;
+- `/api/config`, `/api/plugins*`, `/api/profiles` writes,
+  `/api/config/apply`: admin only.
+
+Deleting a credential from HCL also clears its stored secrets;
+declaring a credential refuses when orphaned secrets with that name
+exist, so a new name never inherits old secret material.
+
+### Phase 5 — frontend
+
+Role-aware navigation, rule dialog, "My rules", users and
+user-profile administration, filtered credential cards.
+
+### Later
+
+Entra ID / OIDC login, TOTP, login rate limiting, Git export of user
+files, a form to declare new credentials and endpoints.
+
+## Risks
+
+- **Fork drift.** Upstream is single-tenant on purpose and moves
+  quickly. Phases 1–2 and the audit log are generic; propose them
+  upstream as separate PRs. Open an upstream issue before phases 3–4.
+- **Global names.** Secret rows, OAuth tokens and the
+  `CLAWPATROL_SECRET_<NAME>` env fallback are keyed by bare name; the
+  `<user>-` prefix and orphan check above are what keep tenants apart.
+- **Shared endpoints.** Without the forced `credential =` predicate a
+  member rule would apply to every profile reaching the endpoint.
+- **Dashboard-managed files.** `50-user-*.hcl` lives on the gateway's
+  persistent volume, not in Git; it must be in the backup set, and
+  the admin deploy must never overwrite it.
+- **Fallback.** If this proves too costly, one gateway per team needs
+  no code.
