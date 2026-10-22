@@ -115,6 +115,9 @@ type principal struct {
 	Device string
 	Host   string
 	Role   dashboardRole
+	// Method is how a cookie session was opened: sessionMethodPassword
+	// or sessionMethodOIDC.
+	Method string
 }
 
 type principalContextKey struct{}
@@ -372,6 +375,11 @@ func (w *webMux) routes() []webRoute {
 		// first-run mode when no root row exists. SameSite=Lax on
 		// the cp_session cookie blocks cross-site CSRF on the POST.
 		{Method: http.MethodGet, Path: "/__login", Auth: authPublic, Handler: w.apiDashboardLogin},
+		// Sign-in through gateway.dashboard_oidc: public by nature, like
+		// /__login; the callback proves itself with the state cookie,
+		// PKCE and the provider's signed ID token.
+		{Method: http.MethodGet, Path: oidcStartPath, Auth: authPublic, Handler: w.apiOIDCStart},
+		{Method: http.MethodGet, Path: oidcCallbackPath, Auth: authPublic, Handler: w.apiOIDCCallback},
 		// /__logout revokes the session row + clears the cookie. The
 		// gate still applies — only an authenticated caller can log
 		// out (tailnet-allowlisted callers get 401 because there's no
@@ -472,8 +480,10 @@ func (w *webMux) dashboardAuthGate(next http.Handler) http.Handler {
 		// principal so tailnetGate downstream short-circuits. The
 		// role is read on every request, so a role change applies
 		// to live sessions at once.
-		if username, role := w.lookupSessionUserFromRequest(r); username != "" && role != "" {
-			next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), dashboardPasswordPrincipal(username, role))))
+		if su := w.lookupSessionUserFromRequest(r); su.Username != "" && su.Role != "" {
+			p := dashboardPasswordPrincipal(su.Username, su.Role)
+			p.Method = su.Method
+			next.ServeHTTP(rw, r.WithContext(contextWithPrincipal(r.Context(), p)))
 			return
 		}
 
@@ -514,22 +524,22 @@ const dashboardLoginPath = "/__login"
 // when missing/expired/error (the gate treats all three as "no
 // session, redirect to login").
 func (w *webMux) lookupSessionFromRequest(r *http.Request) string {
-	username, _ := w.lookupSessionUserFromRequest(r)
-	return username
+	return w.lookupSessionUserFromRequest(r).Username
 }
 
 // lookupSessionUserFromRequest is lookupSessionFromRequest plus the
-// user's role; the role is empty when the user row is gone.
-func (w *webMux) lookupSessionUserFromRequest(r *http.Request) (string, dashboardRole) {
+// user's role and the session's method; the role is empty when the
+// user row is gone.
+func (w *webMux) lookupSessionUserFromRequest(r *http.Request) sessionUser {
 	c, err := r.Cookie(cpSessionCookieName)
 	if err != nil || c.Value == "" {
-		return "", ""
+		return sessionUser{}
 	}
-	username, role, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
+	su, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
 	if err != nil || !ok {
-		return "", ""
+		return sessionUser{}
 	}
-	return username, role
+	return su
 }
 
 func safeDashboardLoginNext(next string) string {
@@ -571,11 +581,11 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 		if !rootExists {
 			confirm := r.PostFormValue("confirm")
 			if len(password) < dashboardMinPasswordLen {
-				renderLogin(rw, next, fmt.Sprintf("password must be at least %d characters", dashboardMinPasswordLen), true, http.StatusBadRequest)
+				w.renderLogin(rw, next, fmt.Sprintf("password must be at least %d characters", dashboardMinPasswordLen), true, http.StatusBadRequest)
 				return
 			}
 			if password != confirm {
-				renderLogin(rw, next, "passwords do not match", true, http.StatusBadRequest)
+				w.renderLogin(rw, next, "passwords do not match", true, http.StatusBadRequest)
 				return
 			}
 			if err := setDashboardUser(w.g.db, dashboardRootUsername, password); err != nil {
@@ -604,7 +614,7 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 		buckets := loginBuckets(username, exists, r.RemoteAddr)
 		if wait := limits.blocked(buckets); wait > 0 {
 			rw.Header().Set("Retry-After", strconv.Itoa(loginRetryAfterSeconds(wait)))
-			renderLoginFor(rw, next, r.PostFormValue("username"), "too many failed attempts — try again later", false, http.StatusTooManyRequests)
+			w.renderLoginFor(rw, next, r.PostFormValue("username"), "too many failed attempts — try again later", false, http.StatusTooManyRequests)
 			return
 		}
 		ok, _, err := checkDashboardPassword(w.g.db, username, password)
@@ -620,7 +630,7 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 				log.Printf("dashboard auth: %s blocked for %s after repeated failed logins", b, loginBlockDuration)
 			}
 			w.recordAudit(r, auditUsername(username), string(principalDashboardPassword), "login", http.StatusUnauthorized)
-			renderLoginFor(rw, next, r.PostFormValue("username"), "wrong username or password", false, http.StatusUnauthorized)
+			w.renderLoginFor(rw, next, r.PostFormValue("username"), "wrong username or password", false, http.StatusUnauthorized)
 			return
 		}
 		limits.recordSuccess(username)
@@ -632,7 +642,7 @@ func (w *webMux) apiDashboardLogin(rw http.ResponseWriter, r *http.Request) {
 		http.Redirect(rw, r, next, http.StatusFound)
 		return
 	}
-	renderLogin(rw, next, "", !rootExists, http.StatusOK)
+	w.renderLogin(rw, next, "", !rootExists, http.StatusOK)
 }
 
 // apiDashboardLogout revokes the cp_session cookie (server- and
@@ -674,8 +684,12 @@ const dashboardMinPasswordLen = 12
 // server-side row enforces — so the browser stops sending it the
 // moment the server stops accepting it.
 func (w *webMux) mintAndSetSessionCookie(rw http.ResponseWriter, username string) error {
+	return w.mintAndSetSessionCookieWithMethod(rw, username, sessionMethodPassword)
+}
+
+func (w *webMux) mintAndSetSessionCookieWithMethod(rw http.ResponseWriter, username, method string) error {
 	ttl := w.dashboardSessionTTL()
-	token, err := createDashboardSession(w.g.db, username, ttl)
+	token, err := createDashboardSessionWithMethod(w.g.db, username, method, ttl)
 	if err != nil {
 		log.Printf("create dashboard session: %v", err)
 		return err
@@ -691,19 +705,26 @@ func (w *webMux) mintAndSetSessionCookie(rw http.ResponseWriter, username string
 	return nil
 }
 
-func renderLogin(rw http.ResponseWriter, next, errMsg string, firstRun bool, status int) {
-	renderLoginFor(rw, next, "", errMsg, firstRun, status)
+func (w *webMux) renderLogin(rw http.ResponseWriter, next, errMsg string, firstRun bool, status int) {
+	w.renderLoginFor(rw, next, "", errMsg, firstRun, status)
 }
 
-func renderLoginFor(rw http.ResponseWriter, next, username, errMsg string, firstRun bool, status int) {
+func (w *webMux) renderLoginFor(rw http.ResponseWriter, next, username, errMsg string, firstRun bool, status int) {
+	var oidcLabel, oidcStart string
+	if b := w.g.cfg.Load().DashboardOIDC(); b != nil {
+		oidcLabel = b.Label()
+		oidcStart = oidcStartPath + "?next=" + url.QueryEscape(next)
+	}
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.WriteHeader(status)
 	_ = loginTpl.Execute(rw, struct {
-		Next     string
-		Username string
-		Error    string
-		FirstRun bool
-	}{next, username, errMsg, firstRun})
+		Next      string
+		Username  string
+		Error     string
+		FirstRun  bool
+		OIDCLabel string
+		OIDCStart string
+	}{next, username, errMsg, firstRun, oidcLabel, oidcStart})
 }
 
 // tailnetGate runs downstream of dashboardAuthGate. Three jobs:
@@ -1253,6 +1274,9 @@ func (w *webMux) whoamiData(r *http.Request, v viewer) map[string]any {
 		switch p.Kind {
 		case principalDashboardPassword:
 			out["auth_method"] = "password"
+			if p.Method == sessionMethodOIDC {
+				out["auth_method"] = sessionMethodOIDC
+			}
 		case principalTailnet:
 			out["auth_method"] = "tailscale"
 		}
@@ -2059,11 +2083,11 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 			return
 		case <-keepalive.C:
 			if p.Kind == principalDashboardPassword {
-				username, role := w.lookupSessionUserFromRequest(r)
-				if username == "" || role == "" {
+				su := w.lookupSessionUserFromRequest(r)
+				if su.Username == "" || su.Role == "" {
 					return
 				}
-				p.Role = role
+				p.Role = su.Role
 				if v, err = w.viewerForPrincipal(p); err != nil {
 					return
 				}

@@ -363,17 +363,17 @@ func TestMemberPasswordResetNeverRecreatesDeletedUser(t *testing.T) {
 func TestSessionLookupCarriesRole(t *testing.T) {
 	w := newUsersTestMux(t)
 	c := sessionCookieFor(t, w, "alice")
-	user, role, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
-	if err != nil || !ok || user != "alice" || role != dashboardRoleMember {
-		t.Fatalf("lookupDashboardSessionUser = %q %q %v %v", user, role, ok, err)
+	su, ok, err := lookupDashboardSessionUser(w.g.db, c.Value)
+	if err != nil || !ok || su.Username != "alice" || su.Role != dashboardRoleMember || su.Method != sessionMethodPassword {
+		t.Fatalf("lookupDashboardSessionUser = %+v %v %v", su, ok, err)
 	}
 	// A session whose user row is gone (deleted without revocation)
 	// carries no role, and the gate treats it as no session.
 	if _, err := w.g.db.Exec(`DELETE FROM dashboard_users WHERE username = 'alice'`); err != nil {
 		t.Fatal(err)
 	}
-	if _, role, ok, _ := lookupDashboardSessionUser(w.g.db, c.Value); !ok || role != "" {
-		t.Fatalf("orphaned session: role = %q ok = %v, want empty role", role, ok)
+	if su, ok, _ := lookupDashboardSessionUser(w.g.db, c.Value); !ok || su.Role != "" {
+		t.Fatalf("orphaned session: role = %q ok = %v, want empty role", su.Role, ok)
 	}
 	if rw := serveAs(t, w.handler(), c, http.MethodGet, "/api/me", ""); rw.Code != http.StatusUnauthorized {
 		t.Fatalf("orphaned session GET /api/me = %d, want 401", rw.Code)

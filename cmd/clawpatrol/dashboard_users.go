@@ -59,12 +59,17 @@ var (
 )
 
 type dashboardUser struct {
-	Username  string        `json:"username"`
-	Role      dashboardRole `json:"role"`
-	Profiles  []string      `json:"profiles"`
-	Approver  string        `json:"approver"`
-	CreatedNs int64         `json:"created_ns"`
-	UpdatedNs int64         `json:"updated_ns"`
+	Username string        `json:"username"`
+	Role     dashboardRole `json:"role"`
+	Profiles []string      `json:"profiles"`
+	Approver string        `json:"approver"`
+	// OIDCUsername is the provider account an admin linked; OIDCLinked
+	// is whether its first sign-in has bound the permanent subject.
+	OIDCUsername string `json:"oidc_username"`
+	OIDCLinked   bool   `json:"oidc_linked"`
+	HasPassword  bool   `json:"has_password"`
+	CreatedNs    int64  `json:"created_ns"`
+	UpdatedNs    int64  `json:"updated_ns"`
 }
 
 // lookupDashboardUser returns the stored bcrypt hash for the given
@@ -151,6 +156,11 @@ func checkDashboardPassword(db *sql.DB, username, password string) (bool, bool, 
 	if err != nil || !ok {
 		return false, ok, err
 	}
+	if hash == "" {
+		// No password: the account signs in through its provider only.
+		burnPasswordCheck(password)
+		return false, true, nil
+	}
 	if err := bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)); err != nil {
 		if errors.Is(err, bcrypt.ErrMismatchedHashAndPassword) {
 			return false, true, nil
@@ -163,22 +173,44 @@ func checkDashboardPassword(db *sql.DB, username, password string) (bool, bool, 
 // createDashboardUser inserts a new operator account. Unlike
 // setDashboardUser it never overwrites an existing row.
 func createDashboardUser(db *sql.DB, username, password string, role dashboardRole) error {
-	if db == nil {
-		return fmt.Errorf("no db")
-	}
 	if password == "" {
 		return fmt.Errorf("password must not be empty")
 	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), dashboardUsersBcryptCost)
-	if err != nil {
-		return fmt.Errorf("hash password: %w", err)
+	return createLinkedDashboardUser(db, username, password, role, "")
+}
+
+// createLinkedDashboardUser inserts a new account linked to a sign-in
+// provider username. password may be empty: the account then has no
+// password and signs in only through the provider.
+func createLinkedDashboardUser(db *sql.DB, username, password string, role dashboardRole, oidcUsername string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	if password == "" && oidcUsername == "" {
+		return fmt.Errorf("a user needs a password or a linked sign-in account")
+	}
+	if oidcUsername != "" {
+		var taken int
+		if err := db.QueryRow(`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?)`, oidcUsername).Scan(&taken); err != nil {
+			return err
+		} else if taken > 0 {
+			return errOIDCUsernameTaken
+		}
+	}
+	hash := ""
+	if password != "" {
+		h, err := bcrypt.GenerateFromPassword([]byte(password), dashboardUsersBcryptCost)
+		if err != nil {
+			return fmt.Errorf("hash password: %w", err)
+		}
+		hash = string(h)
 	}
 	now := time.Now().UnixNano()
 	res, err := db.Exec(
-		`INSERT INTO dashboard_users (username, password_hash, role, created_ns, updated_ns)
-		 VALUES (?, ?, ?, ?, ?)
+		`INSERT INTO dashboard_users (username, password_hash, role, oidc_username, created_ns, updated_ns)
+		 VALUES (?, ?, ?, ?, ?, ?)
 		 ON CONFLICT(username) DO NOTHING`,
-		username, string(hash), string(role), now, now,
+		username, hash, string(role), oidcUsername, now, now,
 	)
 	if err != nil {
 		return err
@@ -272,7 +304,8 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 		return nil, fmt.Errorf("no db")
 	}
 	rows, err := db.Query(
-		`SELECT username, role, approver, created_ns, updated_ns FROM dashboard_users ORDER BY username`,
+		`SELECT username, role, approver, oidc_username, oidc_subject != '', password_hash != '', created_ns, updated_ns
+		 FROM dashboard_users ORDER BY username`,
 	)
 	if err != nil {
 		return nil, err
@@ -282,7 +315,7 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	for rows.Next() {
 		var u dashboardUser
 		var role string
-		if err := rows.Scan(&u.Username, &role, &u.Approver, &u.CreatedNs, &u.UpdatedNs); err != nil {
+		if err := rows.Scan(&u.Username, &role, &u.Approver, &u.OIDCUsername, &u.OIDCLinked, &u.HasPassword, &u.CreatedNs, &u.UpdatedNs); err != nil {
 			return nil, err
 		}
 		u.Role = normalizeDashboardRole(u.Username, role)
@@ -401,4 +434,117 @@ func burnPasswordCheck(password string) {
 		timingDummyHash, _ = bcrypt.GenerateFromPassword([]byte("timing-equalizer"), dashboardUsersBcryptCost)
 	})
 	_ = bcrypt.CompareHashAndPassword(timingDummyHash, []byte(password))
+}
+
+var (
+	// oidcUsernameRe accepts GitLab-style usernames.
+	oidcUsernameRe = regexp.MustCompile(`^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,254}$`)
+
+	errOIDCUsernameTaken = errors.New("another dashboard user is already linked to that account")
+	errOIDCUnlinked      = errors.New("no dashboard user is linked to that account")
+)
+
+func validOIDCUsername(name string) bool {
+	return oidcUsernameRe.MatchString(name)
+}
+
+// setDashboardUserOIDCUsername links username to a provider account
+// ("" unlinks). Changing the link drops the bound subject: the next
+// sign-in as the new account binds it afresh. Provider usernames
+// compare case-insensitively, as GitLab's do.
+func setDashboardUserOIDCUsername(db *sql.DB, username, oidcUsername string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if oidcUsername != "" {
+		var taken int
+		if err := tx.QueryRow(
+			`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND username != ?`,
+			oidcUsername, username,
+		).Scan(&taken); err != nil {
+			return err
+		}
+		if taken > 0 {
+			return errOIDCUsernameTaken
+		}
+	}
+	res, err := tx.Exec(
+		`UPDATE dashboard_users
+		 SET oidc_subject = CASE WHEN lower(oidc_username) = lower(?) THEN oidc_subject ELSE '' END,
+		     oidc_username = ?, updated_ns = ?
+		 WHERE username = ?`,
+		oidcUsername, oidcUsername, time.Now().UnixNano(), username,
+	)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return errDashboardUserNotFound
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	// A different account now signs in as this user: end the sessions
+	// the previous one opened.
+	return revokeAllDashboardSessionsFor(db, username)
+}
+
+// dashboardUserForOIDC resolves a provider sign-in to the dashboard
+// user it is for. A bound subject decides; otherwise the one user
+// linked to the provider username whose subject is still unbound gets
+// this subject bound, once. A username already bound to another
+// subject never matches: the provider account was replaced.
+func dashboardUserForOIDC(db *sql.DB, subject, oidcUsername string) (string, error) {
+	if db == nil {
+		return "", fmt.Errorf("no db")
+	}
+	var username string
+	err := db.QueryRow(`SELECT username FROM dashboard_users WHERE oidc_subject = ?`, subject).Scan(&username)
+	if err == nil {
+		return username, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	if oidcUsername == "" {
+		return "", errOIDCUnlinked
+	}
+	rows, err := db.Query(
+		`SELECT username FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND oidc_subject = ''`,
+		oidcUsername,
+	)
+	if err != nil {
+		return "", err
+	}
+	var candidates []string
+	for rows.Next() {
+		var u string
+		if err := rows.Scan(&u); err != nil {
+			_ = rows.Close()
+			return "", err
+		}
+		candidates = append(candidates, u)
+	}
+	_ = rows.Close()
+	if len(candidates) != 1 {
+		return "", errOIDCUnlinked
+	}
+	res, err := db.Exec(
+		`UPDATE dashboard_users SET oidc_subject = ?, updated_ns = ? WHERE username = ? AND oidc_subject = ''`,
+		subject, time.Now().UnixNano(), candidates[0],
+	)
+	if err != nil {
+		return "", err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", errOIDCUnlinked
+	}
+	return candidates[0], nil
 }

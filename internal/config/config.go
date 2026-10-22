@@ -3,6 +3,7 @@ package config
 import (
 	"fmt"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -252,6 +253,65 @@ type GatewaySettings struct {
 	// Tailscale control plane (OAuth key minting, exit-node routing).
 	// Both transports may be enabled simultaneously.
 	Tailscale *TailscaleBlock `hcl:"tailscale,block"`
+
+	// DashboardOIDC, if present, adds "Sign in with …" to the
+	// dashboard login page through an OpenID Connect provider such as
+	// GitLab.com. Signing in only reaches a dashboard user an admin
+	// linked to that provider account. Requires public_url.
+	DashboardOIDC *DashboardOIDCBlock `hcl:"dashboard_oidc,block"`
+}
+
+// DashboardOIDCBlock is the body of the `dashboard_oidc { ... }`
+// sub-block inside `gateway { ... }`.
+type DashboardOIDCBlock struct {
+	// Issuer is the provider's issuer URL; its OpenID configuration is
+	// discovered under /.well-known/openid-configuration. Default
+	// "https://gitlab.com".
+	Issuer string `hcl:"issuer,optional"`
+
+	// ClientID is the provider application's ID. Required.
+	ClientID string `hcl:"client_id"`
+
+	// ClientSecret is the application's secret. Write it as
+	// "{{secret:NAME}}" to read it from the gateway's environment
+	// variable NAME rather than keep it in the file.
+	ClientSecret string `hcl:"client_secret,optional"`
+
+	// AllowedGroups, if set, refuses anyone who is not a member of one
+	// of these groups (or of a subgroup of one), read from the
+	// provider's `groups` userinfo claim — GitLab paths such as
+	// "unrcs/dco". Checked before any account lookup.
+	AllowedGroups []string `hcl:"allowed_groups,optional"`
+
+	// ButtonLabel is the login button's text. Default "Sign in with
+	// GitLab" for gitlab.com, else "Sign in with SSO".
+	ButtonLabel string `hcl:"button_label,optional"`
+}
+
+// DefaultOIDCIssuer is the issuer of a dashboard_oidc block that names
+// none.
+const DefaultOIDCIssuer = "https://gitlab.com"
+
+// IssuerOrDefault returns the configured issuer, or GitLab.com.
+func (b *DashboardOIDCBlock) IssuerOrDefault() string {
+	if b == nil || strings.TrimSpace(b.Issuer) == "" {
+		return DefaultOIDCIssuer
+	}
+	return strings.TrimRight(strings.TrimSpace(b.Issuer), "/")
+}
+
+// Label returns the login button's text.
+func (b *DashboardOIDCBlock) Label() string {
+	if b == nil {
+		return ""
+	}
+	if b.ButtonLabel != "" {
+		return b.ButtonLabel
+	}
+	if b.IssuerOrDefault() == DefaultOIDCIssuer {
+		return "Sign in with GitLab"
+	}
+	return "Sign in with SSO"
 }
 
 // GenAITelemetryBlock is the body of the `genai_telemetry { ... }`
@@ -555,6 +615,9 @@ func (g *Gateway) SessionKeep() string { return g.settings().SessionKeep }
 
 // ActionsKeep returns the raw global actions-retention string, or empty.
 func (g *Gateway) ActionsKeep() string { return g.settings().ActionsKeep }
+
+// DashboardOIDC returns the dashboard_oidc block, or nil.
+func (g *Gateway) DashboardOIDC() *DashboardOIDCBlock { return g.settings().DashboardOIDC }
 
 // DashboardAuditKeep returns the raw dashboard-audit retention string,
 // or empty.
@@ -1267,6 +1330,7 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 	diags = append(diags, validateRetentionDuration("session_keep", gw.Settings.SessionKeep)...)
 	diags = append(diags, validateRetentionDuration("actions_keep", gw.Settings.ActionsKeep)...)
 	diags = append(diags, validateRetentionDuration("dashboard_audit_keep", gw.Settings.DashboardAuditKeep)...)
+	diags = append(diags, validateDashboardOIDC(gw.Settings)...)
 
 	diags = append(diags, validateLimits(gw.Settings.Limits)...)
 
@@ -1279,6 +1343,41 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 // and mean the same as "0": disable / keep forever. Negative durations
 // are rejected — downstream they would put the sweep cutoff in the
 // future and delete everything, the inverse of a retention floor.
+// validateDashboardOIDC checks the dashboard_oidc block: an https
+// issuer (http only for a loopback provider), a client ID, and the
+// public_url its callback lives under.
+func validateDashboardOIDC(s *GatewaySettings) hcl.Diagnostics {
+	b := s.DashboardOIDC
+	if b == nil {
+		return nil
+	}
+	bad := func(detail string) hcl.Diagnostics {
+		return hcl.Diagnostics{{Severity: hcl.DiagError, Summary: "Invalid dashboard_oidc block", Detail: detail}}
+	}
+	u, err := url.Parse(b.IssuerOrDefault())
+	if err != nil || u.Host == "" {
+		return bad(fmt.Sprintf("issuer %q is not a URL.", b.Issuer))
+	}
+	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+		return bad(fmt.Sprintf("issuer %q must use https.", b.Issuer))
+	}
+	if strings.TrimSpace(b.ClientID) == "" {
+		return bad("client_id is required.")
+	}
+	if s.PublicURL == "" {
+		return bad("dashboard_oidc needs gateway.public_url: the provider redirects back to <public_url>/__login/oidc/callback.")
+	}
+	return nil
+}
+
+func isLoopbackHost(host string) bool {
+	if host == "localhost" {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
+}
+
 func validateRetentionDuration(name, val string) hcl.Diagnostics {
 	v := strings.TrimSpace(val)
 	if v == "" || v == "0" || v == "off" {

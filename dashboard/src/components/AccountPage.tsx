@@ -18,6 +18,7 @@ export function AccountPage({ whoami }: { whoami: Whoami | null }) {
       <section className="bg-canvas border-1.5 border-navy p-4 space-y-4">
         {whoami?.user ? <Identity whoami={whoami} /> : <NotLoggedIn />}
       </section>
+      {/* A single sign-on session changes its password at the provider. */}
       {whoami?.auth_method === "password" && (
         <section className="bg-canvas border-1.5 border-navy p-4">
           <ChangePasswordForm />
@@ -135,7 +136,9 @@ function Identity({ whoami }: { whoami: Whoami }) {
       ? "password"
       : whoami.auth_method === "tailscale"
         ? "tailscale"
-        : null;
+        : whoami.auth_method === "oidc"
+          ? "single sign-on"
+          : null;
   return (
     <div className="flex flex-wrap items-center justify-between gap-3">
       <p className="text-sm text-text">
@@ -170,7 +173,8 @@ function NotLoggedIn() {
 // but disabled with a tooltip explaining why.
 function LogoutControl({ whoami }: { whoami: Whoami }) {
   const method = whoami.auth_method;
-  const enabled = method === "password";
+  // Password and single sign-on sessions share the revocable cookie.
+  const enabled = method === "password" || method === "oidc";
   const title = enabled
     ? "Log out"
     : method === "tailscale"

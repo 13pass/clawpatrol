@@ -141,6 +141,46 @@ clawpatrol gateway --set-dashboard-password '<password>' gateway.hcl
 clawpatrol gateway --reset-dashboard-password gateway.hcl
 ```
 
+### Sign in with GitLab (or another OpenID Connect provider)
+
+Dashboard users can sign in with their GitLab.com account instead of a
+password. Only users an admin has linked get in.
+
+1. Register an application on GitLab.com — under your group's
+   **Settings → Applications** (or **User settings → Applications**):
+   - **Redirect URI**: `<public_url>/__login/oidc/callback`, e.g.
+     `https://gw.example.com/__login/oidc/callback`;
+   - **Confidential**: checked;
+   - **Scopes**: `openid` and `profile`.
+2. Put the application secret in the gateway's environment, e.g.
+   `GITLAB_OIDC_SECRET=…` in the systemd unit's environment file.
+3. Add the block to `gateway {}` (`public_url` is required):
+
+   ```hcl
+   gateway {
+     public_url = "https://gw.example.com"
+     # ...
+     dashboard_oidc {
+       client_id      = "<GitLab application ID>"
+       client_secret  = "{{secret:GITLAB_OIDC_SECRET}}"
+       allowed_groups = ["my-group"]   # optional: members of this group or its subgroups only
+     }
+   }
+   ```
+
+   `issuer` defaults to `https://gitlab.com`; set it for a
+   self-managed GitLab or any other OpenID Connect provider.
+4. On the dashboard's **Users** page, create the user with their
+   GitLab username (the password may then be left empty), or link an
+   existing user with **Link GitLab**.
+
+The login page then shows **Sign in with GitLab**. The first sign-in
+as a linked username binds that GitLab account's permanent id; from
+then on the id decides, so renaming the GitLab account keeps access
+and a recycled username gets none. To point a user at a different
+GitLab account, change the link: that unbinds the old id and ends the
+user's sessions. Keep `root` on a password as the break-glass account.
+
 ### Where to bind the dashboard
 
 `gateway.dashboard_listen` is the dashboard's host-side HTTP bind.

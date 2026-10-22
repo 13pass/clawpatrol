@@ -27,7 +27,17 @@ func hashSessionToken(token string) string {
 // createDashboardSession mints a new session for username, persists
 // it, and returns the raw cookie value. Caller sets that as the
 // cookie value; the DB only holds its SHA-256.
+// How a dashboard session was opened.
+const (
+	sessionMethodPassword = "password"
+	sessionMethodOIDC     = "oidc"
+)
+
 func createDashboardSession(db *sql.DB, username string, ttl time.Duration) (string, error) {
+	return createDashboardSessionWithMethod(db, username, sessionMethodPassword, ttl)
+}
+
+func createDashboardSessionWithMethod(db *sql.DB, username, method string, ttl time.Duration) (string, error) {
 	if db == nil {
 		return "", fmt.Errorf("no db")
 	}
@@ -44,9 +54,9 @@ func createDashboardSession(db *sql.DB, username string, ttl time.Duration) (str
 	token := hex.EncodeToString(buf)
 	now := time.Now()
 	_, err := db.Exec(
-		`INSERT INTO dashboard_sessions (token_hash, username, created_ns, expires_ns, last_seen_ns)
-		 VALUES (?, ?, ?, ?, ?)`,
-		hashSessionToken(token), username, now.UnixNano(), now.Add(ttl).UnixNano(), now.UnixNano(),
+		`INSERT INTO dashboard_sessions (token_hash, username, method, created_ns, expires_ns, last_seen_ns)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		hashSessionToken(token), username, method, now.UnixNano(), now.Add(ttl).UnixNano(), now.UnixNano(),
 	)
 	if err != nil {
 		return "", err
@@ -63,37 +73,44 @@ func createDashboardSession(db *sql.DB, username string, ttl time.Duration) (str
 // when the token is missing or expired; ("", false, err) on DB
 // trouble.
 func lookupDashboardSession(db *sql.DB, token string) (string, bool, error) {
-	username, _, ok, err := lookupDashboardSessionUser(db, token)
-	return username, ok, err
+	su, ok, err := lookupDashboardSessionUser(db, token)
+	return su.Username, ok, err
 }
 
-// lookupDashboardSessionUser is lookupDashboardSession plus the user's
-// role, read in the same query. role is empty when the session's user
+// sessionUser is who a session belongs to: Role is empty when the user
 // row no longer exists.
-func lookupDashboardSessionUser(db *sql.DB, token string) (string, dashboardRole, bool, error) {
+type sessionUser struct {
+	Username string
+	Role     dashboardRole
+	Method   string
+}
+
+// lookupDashboardSessionUser is lookupDashboardSession plus the
+// user's role and the session's method, read in the same query.
+func lookupDashboardSessionUser(db *sql.DB, token string) (sessionUser, bool, error) {
 	if db == nil {
-		return "", "", false, fmt.Errorf("no db")
+		return sessionUser{}, false, fmt.Errorf("no db")
 	}
 	if token == "" {
-		return "", "", false, nil
+		return sessionUser{}, false, nil
 	}
 	hash := hashSessionToken(token)
 	var (
-		username  string
+		su        sessionUser
 		expiresNs int64
 		role      sql.NullString
 	)
 	err := db.QueryRow(
-		`SELECT s.username, s.expires_ns, u.role
+		`SELECT s.username, s.expires_ns, s.method, u.role
 		 FROM dashboard_sessions s LEFT JOIN dashboard_users u ON u.username = s.username
 		 WHERE s.token_hash = ?`,
 		hash,
-	).Scan(&username, &expiresNs, &role)
+	).Scan(&su.Username, &expiresNs, &su.Method, &role)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", false, nil
+		return sessionUser{}, false, nil
 	}
 	if err != nil {
-		return "", "", false, err
+		return sessionUser{}, false, err
 	}
 	now := time.Now()
 	if now.UnixNano() >= expiresNs {
@@ -101,17 +118,16 @@ func lookupDashboardSessionUser(db *sql.DB, token string) (string, dashboardRole
 		// and rules out any later confusion. Errors are non-fatal —
 		// the sweeper will retry.
 		_, _ = db.Exec(`DELETE FROM dashboard_sessions WHERE token_hash = ?`, hash)
-		return "", "", false, nil
+		return sessionUser{}, false, nil
 	}
 	_, _ = db.Exec(
 		`UPDATE dashboard_sessions SET last_seen_ns = ? WHERE token_hash = ?`,
 		now.UnixNano(), hash,
 	)
-	var userRole dashboardRole
 	if role.Valid {
-		userRole = normalizeDashboardRole(username, role.String)
+		su.Role = normalizeDashboardRole(su.Username, role.String)
 	}
-	return username, userRole, true, nil
+	return su, true, nil
 }
 
 // revokeDashboardSession deletes the row matching token. Used by the

@@ -230,9 +230,20 @@ exist, so a new name never inherits old secret material.
 Role-aware navigation, rule dialog, "My rules", users and
 user-profile administration, filtered credential cards.
 
+### Single sign-on (done)
+
+`gateway.dashboard_oidc` adds sign-in through an OpenID Connect
+provider, GitLab.com by default (Entra ID or a self-managed GitLab via
+`issuer`). Accounts are admin-linked: an admin links a dashboard user
+to a provider username, the first sign-in binds the provider's
+permanent subject id, and only a bound subject decides afterwards.
+Optional `allowed_groups` refuses non-members first. Sessions record
+their method (`password` / `oidc`); a linked user may have no
+password. Setup: `site/doc/configure-gateway.md`.
+
 ### Later
 
-Entra ID / OIDC login, TOTP, Git export of user
+TOTP, Git export of user
 files, a form to declare new credentials and endpoints.
 
 ## Risks

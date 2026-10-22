@@ -405,6 +405,12 @@ type Gateway struct {
 	loginLimitOnce sync.Once
 	loginLimit     *loginLimiter
 
+	// oidcState holds dashboard OIDC sign-ins in progress and provider
+	// discovery (see oidc_login.go). Created on first use; tests may
+	// preset it to swap the HTTP client.
+	oidcOnce  sync.Once
+	oidcState *oidcState
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises

@@ -382,6 +382,20 @@ Some limits keep one admin from taking over another account:
 - `root` cannot be deleted or demoted, and nobody can change their
   own role or delete themselves, so an admin can always log in.
 
+Users can also sign in through an OpenID Connect provider —
+GitLab.com by default (`gateway.dashboard_oidc`). The flow is the
+authorization code flow with PKCE; the callback must come back to the
+browser that started it (a state cookie), and the ID token's
+signature, issuer, audience, expiry and nonce are all checked. A
+sign-in reaches only a dashboard user an admin linked to that
+provider account: the first sign-in binds the provider's permanent
+subject id, which decides from then on, so a renamed or recycled
+provider username cannot take an account over. `allowed_groups`
+refuses anyone outside the given groups before any account lookup.
+The provider's own protections — GitLab's enforced two-factor
+authentication — then cover the dashboard. A linked user may have no
+password at all; `root` should keep one as the break-glass account.
+
 The login form takes a username; leaving it empty means `root`. An
 unknown username costs the same bcrypt work and gets the same
 "wrong username or password" error as a wrong password.

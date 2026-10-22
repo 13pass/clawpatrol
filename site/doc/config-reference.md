@@ -55,6 +55,7 @@ The gateway block carries operational settings — listen addresses, the WireGua
 | `genai_telemetry` | `block` | no | GenAITelemetry, if present, enables export of OpenTelemetry GenAI semantic-convention spans (gen_ai.*) for intercepted LLM requests. Requires the OTLP exporter to be configured (OTEL_EXPORTER_OTLP_ENDPOINT); without it there is nothing to export to. The block is opt-in: when absent, no gen_ai.* spans are emitted and there is no added per-request overhead. |
 | `wireguard` | `block` | no | WireGuard, if present, enables the embedded userspace WireGuard server. Required block when running WG-mode deployments. |
 | `tailscale` | `block` | no | Tailscale, if present, enables the embedded tsnet node and the Tailscale control plane (OAuth key minting, exit-node routing). Both transports may be enabled simultaneously. |
+| `dashboard_oidc` | `block` | no | DashboardOIDC, if present, adds "Sign in with …" to the dashboard login page through an OpenID Connect provider such as GitLab.com. Signing in only reaches a dashboard user an admin linked to that provider account. Requires public_url. |
 
 **Nested block `limits {}`:**
 
@@ -118,6 +119,19 @@ inside `gateway { ... }`. Presence of the block enables tsnet.
 | `funnel` | `bool` | no | Enables Tailscale Funnel on :443 so the join bootstrap and credential webhook paths are internet-reachable via the tsnet cert domain. Requires HTTPS enabled for the tailnet; if public_url is unset the gateway derives it from the tsnet cert domain at startup. |
 | `oauth_client_id` | `string` | no | The OAuth client id used to mint per-device tailnet auth keys at approval time. |
 | `oauth_client_secret` | `string` | no | The OAuth client secret paired with OAuthClientID. |
+
+**Nested block `dashboard_oidc {}`:**
+
+The body of the `dashboard_oidc { ... }`
+sub-block inside `gateway { ... }`.
+
+| Attribute | Type | Required | Description |
+|-----------|------|----------|-------------|
+| `issuer` | `string` | no | The provider's issuer URL; its OpenID configuration is discovered under /.well-known/openid-configuration. Default "https://gitlab.com". |
+| `client_id` | `string` | yes | The provider application's ID. Required. |
+| `client_secret` | `string` | no | The application's secret. Write it as "{{secret:NAME}}" to read it from the gateway's environment variable NAME rather than keep it in the file. |
+| `allowed_groups` | `[]string` | no | AllowedGroups, if set, refuses anyone who is not a member of one of these groups (or of a subgroup of one), read from the provider's `groups` userinfo claim — GitLab paths such as "unrcs/dco". Checked before any account lookup. |
+| `button_label` | `string` | no | The login button's text. Default "Sign in with GitLab" for gitlab.com, else "Sign in with SSO". |
 
 ## `profile "<name>" { ... }`
 

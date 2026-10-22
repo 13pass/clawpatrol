@@ -130,6 +130,27 @@
         transition: background-color 0.15s ease;
       }
 
+      a.oidc {
+        display: block;
+        box-sizing: border-box;
+        margin-top: 12px;
+        width: 100%;
+        padding: 8px 16px;
+        background: transparent;
+        color: var(--color-navy-900);
+        border: 2px solid var(--color-navy);
+        font: 14px/1.5 var(--font-sans);
+        font-weight: 600;
+        text-align: center;
+        text-decoration: none;
+        text-transform: uppercase;
+        letter-spacing: 0.05em;
+      }
+
+      a.oidc:hover {
+        background: var(--color-navy-100, #e3e7f0);
+      }
+
       button:hover {
         background: var(--color-rust-300);
       }
@@ -196,7 +217,9 @@
         required
       />
       <button type="submit">Unlock</button>
-      {{end}}
+      {{if .OIDCLabel}}
+      <a class="oidc" href="{{.OIDCStart}}">{{.OIDCLabel}}</a>
+      {{end}} {{end}}
     </form>
   </body>
 </html>
