@@ -2866,8 +2866,10 @@ type Event struct {
 	// evaluated.
 	Credential string `json:"credential,omitempty"`
 
-	// Profile is the profile the requesting peer was bound to, filled
-	// in by Sink.Emit from AgentIP. "" for events with no peer.
+	// Profile is the profile the requesting peer was bound to when the
+	// gateway dispatched the request. Dispatch sites set it; Sink.Emit
+	// resolves it from AgentIP only for events that arrive without one.
+	// "" for events with no peer.
 	Profile string `json:"profile,omitempty"`
 }
 

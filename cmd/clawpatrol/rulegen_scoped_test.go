@@ -208,7 +208,7 @@ func TestScopedRuleRefusals(t *testing.T) {
 func TestPathPattern(t *testing.T) {
 	cases := map[string]string{
 		"/api/v4/projects/123/issues":                         `^/api/v4/projects/[^/]+/issues$`,
-		"/api/v4/projects/unrcs%2Fdco/merge_requests/9":       `^/api/v4/projects/[^/]+/merge_requests/[^/]+$`,
+		"/api/v4/projects/unrcs/dco/merge_requests/9":         `^/api/v4/projects/unrcs/dco/merge_requests/[^/]+$`,
 		"/repos/x/commits/0123456789abcdef0123":               `^/repos/x/commits/[^/]+$`,
 		"/v1/items/3f2b8c1e-1d2a-4b5c-9e8f-0a1b2c3d4e5f.json": `^/v1/items/3f2b8c1e-1d2a-4b5c-9e8f-0a1b2c3d4e5f\.json$`,
 	}
@@ -235,9 +235,81 @@ func TestRuleMatchesEventReplaysRecordedRequests(t *testing.T) {
 		ev   *Event
 		want bool
 	}{"other ids": {other, true}, "team-b": {teamB, false}, "GET": {read, false}} {
-		matched, ok := ruleMatchesEvent(rule, tc.ev)
+		replay, err := newRuleReplay(rule)
+		if err != nil {
+			t.Fatal(err)
+		}
+		matched, ok := replay.matches(tc.ev)
 		if !ok || matched != tc.want {
 			t.Errorf("%s: matched = %v ok = %v, want %v", name, matched, ok, tc.want)
 		}
+	}
+}
+
+func TestMemberPreapprovalNeverUndoesAnAdminDeny(t *testing.T) {
+	dir, _ := scopedRuleTestDir(t)
+	if err := os.WriteFile(filepath.Join(dir, "10-admin.hcl"), []byte(`
+rule "admin-no-note-deletes" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'DELETE'"
+  verdict   = "deny"
+}
+rule "admin-writes-need-approval" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'POST'"
+  approve   = [human_approver.team-a-review]
+}
+`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, cp, err := loadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictAllow, Scope: ruleScopeAnyMethod}, &RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(rule.HCL, "yield_to_deny = true") {
+		t.Fatalf("member pre-approval lacks yield_to_deny:\n%s", rule.HCL)
+	}
+	ep := installRule(t, dir, rule)
+	path := "/api/v4/projects/123/issues/45/notes"
+	if got := matchedRule(ep, httpReq("POST", path, "team-a", nil)); got != rule.RuleName {
+		t.Errorf("POST matched %q, want the pre-approval to skip the approval", got)
+	}
+	if got := matchedRule(ep, httpReq("DELETE", path, "team-a", nil)); got != "admin-no-note-deletes" {
+		t.Errorf("DELETE matched %q, want the admin deny", got)
+	}
+
+	admin, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictAllow}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(admin.HCL, "yield_to_deny") {
+		t.Errorf("an admin allow yields to deny:\n%s", admin.HCL)
+	}
+}
+
+func TestHeaderPinRefusesJoinedOrMaskedValues(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	for name, value := range map[string]string{
+		"X-Trace":  "a, b",
+		"X-Caller": "agent " + credentialSampleRedaction,
+	} {
+		ev := notesEvent()
+		ev.ReqHeaders = map[string]string{name: value}
+		if _, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictDeny, PinHeader: name}, nil); err == nil {
+			t.Errorf("pin on %s = %q accepted", name, value)
+		}
+	}
+}
+
+func TestHostRuleRefusedOnceTheHostHasAnEndpoint(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	ev := &Event{ID: "old", Host: "gitlab.com", Method: "GET", Path: "/", Profile: "team-a"}
+	if _, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictDeny}, &RuleAuthor{Username: "alice"}); err == nil ||
+		!strings.Contains(err.Error(), "now has endpoint") {
+		t.Fatalf("host rule for a claimed host: err = %v", err)
 	}
 }

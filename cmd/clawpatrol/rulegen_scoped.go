@@ -168,6 +168,11 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	if host == "" {
 		return nil, fmt.Errorf("action has no endpoint or host")
 	}
+	for _, profile := range hostRuleProfiles(policy, ev, author) {
+		if ep := runtime.HostEndpoint(policy, profile, host); ep != nil {
+			return nil, fmt.Errorf("%s now has endpoint %q in profile %q; create the rule from a request made since", host, ep.Name, profile)
+		}
+	}
 	endpointName := generatedEndpointName(policy, host)
 	if author != nil {
 		endpointName = uniqueEndpointName(policy, author.Username+"-"+endpointName)
@@ -179,13 +184,11 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 		Family:       "http",
 		NewEndpoint:  true,
 	}
+	rule.ProfileAdditions = hostRuleProfiles(policy, ev, author)
 	if author != nil {
 		rule.Profile = ev.Profile
 		rule.Credential = credName
 		rule.credentialRef = "passthrough." + credName
-		rule.ProfileAdditions = []string{ev.Profile}
-	} else {
-		rule.ProfileAdditions = generatedProfileNames(policy)
 	}
 
 	f := hclwrite.NewEmptyFile()
@@ -204,6 +207,15 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	rule.HCL = string(f.Bytes())
 	rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
 	return rule, nil
+}
+
+// hostRuleProfiles are the profiles a new-host rule's endpoint joins:
+// the request's, for a member; every profile, for an admin.
+func hostRuleProfiles(policy *config.CompiledPolicy, ev *Event, author *RuleAuthor) []string {
+	if author != nil {
+		return []string{ev.Profile}
+	}
+	return generatedProfileNames(policy)
 }
 
 func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string, req RuleRequest, author *RuleAuthor) {
@@ -232,6 +244,11 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 		b.SetAttributeValue("verdict", cty.StringVal("deny"))
 		b.SetAttributeValue("reason", cty.StringVal("Blocked from the dashboard by "+by))
 	case ruleVerdictAllow:
+		// A member's pre-approval may skip an admin's approval, never
+		// undo an admin's deny.
+		if author != nil {
+			b.SetAttributeValue("yield_to_deny", cty.True)
+		}
 		b.SetAttributeValue("verdict", cty.StringVal("allow"))
 		b.SetAttributeValue("reason", cty.StringVal("Pre-approved from the dashboard by "+by))
 	case ruleVerdictApprove:
@@ -352,6 +369,11 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 		if !ok {
 			return "", nil, fmt.Errorf("this request did not carry header %q", name)
 		}
+		// The log joins repeated values with ", " and masks credential
+		// samples, so such a value never equals one live value.
+		if strings.Contains(value, ", ") || strings.Contains(value, credentialSampleRedaction) {
+			return "", nil, fmt.Errorf("header %q was recorded with several or masked values and cannot pin a rule", name)
+		}
 		// Guarded with `in`: a request without the header must fall
 		// through, not error — an unevaluable condition is a deny.
 		parts = append(parts, celString(name)+" in http.headers && http.headers["+celString(name)+"].exists(v, v == "+celString(value)+")")
@@ -360,8 +382,10 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 }
 
 // pathPattern turns a path into an anchored RE2 pattern where segments
-// that look like IDs (numbers, UUIDs, long hex, URL-encoded paths)
-// match any single segment.
+// that look like IDs (numbers, UUIDs, long hex) match any single
+// segment. Paths are recorded decoded, so an encoded path ID such as
+// GitLab's group%2Fproject arrives as literal segments and stays
+// pinned.
 func pathPattern(path string) (string, bool) {
 	segments := strings.Split(path, "/")
 	generalized := false
@@ -380,7 +404,7 @@ func isIDSegment(seg string) bool {
 	switch {
 	case seg == "":
 		return false
-	case digitsRe.MatchString(seg), uuidSegmentRe.MatchString(seg), strings.Contains(seg, "%"):
+	case digitsRe.MatchString(seg), uuidSegmentRe.MatchString(seg):
 		return true
 	case len(seg) >= patternMinHexSegment && hexRe.MatchString(seg):
 		return true
@@ -388,28 +412,43 @@ func isIDSegment(seg string) bool {
 	return false
 }
 
-// ruleMatchesEvent reports whether a generated rule would have matched
-// a recorded request: its pins, then its condition. Families whose
-// recorded events cannot be replayed report ok = false.
-func ruleMatchesEvent(rule *ScopedRule, ev *Event) (matched, ok bool) {
-	if rule.Credential != "" && ev.Credential != rule.Credential {
+// ruleReplay replays recorded requests against a generated rule, with
+// its condition compiled once.
+type ruleReplay struct {
+	rule    *ScopedRule
+	matcher match.Matcher
+}
+
+func newRuleReplay(rule *ScopedRule) (*ruleReplay, error) {
+	rp := &ruleReplay{rule: rule}
+	if rule.Condition != "" {
+		m, err := facet.NewMatcher(rule.Family, rule.Condition)
+		if err != nil {
+			return nil, err
+		}
+		rp.matcher = m
+	}
+	return rp, nil
+}
+
+// matches reports whether the rule would have matched a recorded
+// request: its pins, then its condition. Families whose recorded
+// events cannot be replayed report ok = false.
+func (rp *ruleReplay) matches(ev *Event) (matched, ok bool) {
+	if rp.rule.Credential != "" && ev.Credential != rp.rule.Credential {
 		return false, true
 	}
-	if rule.Profile != "" && ev.Profile != rule.Profile {
+	if rp.rule.Profile != "" && ev.Profile != rp.rule.Profile {
 		return false, true
 	}
-	req, ok := matchRequestFromEvent(rule.Family, ev)
+	req, ok := matchRequestFromEvent(rp.rule.Family, ev)
 	if !ok {
 		return false, false
 	}
-	if rule.Condition == "" {
+	if rp.matcher == nil {
 		return true, true
 	}
-	matcher, err := facet.NewMatcher(rule.Family, rule.Condition)
-	if err != nil {
-		return false, false
-	}
-	return matcher.Match(req).Result == match.Matched, true
+	return rp.matcher.Match(req).Result == match.Matched, true
 }
 
 func matchRequestFromEvent(family string, ev *Event) (*match.Request, bool) {

@@ -303,3 +303,99 @@ func TestMemberRulesRefusedWithoutWritesOrDirectory(t *testing.T) {
 		t.Errorf("member rules file on a single-file config: err = %v", err)
 	}
 }
+
+func TestRuleCreateTwiceIsAConflict(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	req := `{"action_id":"` + env.aliceNotes + `","verdict":"deny"}`
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create", req); rw.Code != http.StatusOK {
+		t.Fatalf("first create = %d %s", rw.Code, rw.Body.String())
+	}
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create", req)
+	if rw.Code != http.StatusConflict || !strings.Contains(rw.Body.String(), "already exists") {
+		t.Fatalf("second create = %d %s, want 409 already exists", rw.Code, rw.Body.String())
+	}
+}
+
+func TestMemberLosesRuleEditsWithTheProfile(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"allow"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/users/update", `{"username":"alice","profiles":[]}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	rw := serveAs(t, env.h, env.alice, http.MethodGet, "/api/my/rules", "")
+	var mine struct {
+		Rules []myRule `json:"rules"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &mine); err != nil || len(mine.Rules) != 1 || mine.Rules[0].Owned {
+		t.Fatalf("my rules after losing the profile = %s", rw.Body.String())
+	}
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/update",
+		`{"name":"`+mine.Rules[0].Name+`","disabled":true}`); rw.Code != http.StatusForbidden {
+		t.Fatalf("edit after losing the profile = %d, want 403", rw.Code)
+	}
+}
+
+func TestDeletedUsersRulesKeepApplyingWithoutAnOwner(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"deny","scope":"pattern"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/users/delete", `{"username":"alice"}`); rw.Code != http.StatusOK {
+		t.Fatalf("delete = %d %s", rw.Code, rw.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(env.w.g.cfgPath, "50-user-alice.hcl")); !os.IsNotExist(err) {
+		t.Fatalf("alice's rules file still owned by the name (stat err %v)", err)
+	}
+	names, _ := filepath.Glob(filepath.Join(env.w.g.cfgPath, "50-former-user-alice-*.hcl"))
+	if len(names) != 1 {
+		t.Fatalf("archived files = %v", names)
+	}
+	// The watcher would reload; do it here to check the archived file
+	// still loads and enforces.
+	env.w.g.configMu.Lock()
+	err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath)
+	env.w.g.configMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := env.w.g.Policy().Endpoints["gitlab"]
+	if r := matchedRule(ep, httpReq("POST", "/api/v4/projects/5/issues/6/notes", "team-a", nil)); !strings.HasPrefix(r, "alice-") {
+		t.Fatalf("archived rule no longer applies (matched %q)", r)
+	}
+
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/users/create",
+		`{"username":"alice","password":"`+usersTestMemberPassword+`"}`); rw.Code != http.StatusCreated {
+		t.Fatalf("re-create alice = %d %s", rw.Code, rw.Body.String())
+	}
+	newAlice := sessionCookieFor(t, env.w, "alice")
+	rw := serveAs(t, env.h, newAlice, http.MethodGet, "/api/my/rules", "")
+	if !strings.Contains(rw.Body.String(), `"rules":[]`) {
+		t.Fatalf("new alice inherited rules: %s", rw.Body.String())
+	}
+
+	// A leftover file under a username blocks creating that user.
+	if err := os.WriteFile(filepath.Join(env.w.g.cfgPath, "50-user-carol.hcl"), []byte("\n"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/users/create",
+		`{"username":"carol","password":"`+usersTestMemberPassword+`"}`); rw.Code != http.StatusConflict {
+		t.Fatalf("create over a leftover rules file = %d, want 409", rw.Code)
+	}
+}
+
+func TestRuleSummariesRespectTheProfilePin(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	for _, s := range env.w.collectRuleSummaries("") {
+		if strings.HasPrefix(s.Name, "alice-") && s.Profile != "team-a" {
+			t.Errorf("alice's team-a rule listed under profile %q", s.Profile)
+		}
+	}
+}

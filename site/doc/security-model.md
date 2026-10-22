@@ -336,10 +336,18 @@ member, and land in that member's own file of a directory config
 (`50-user-<name>.hcl`). Each one is pinned with `profile = …` to the
 request's profile and `credential = …` to its credential, so it can
 only match the member's own traffic even on a shared endpoint or
-credential, and sits at priority 50. Rules are tried highest priority
-first and the first match wins, so an admin rule at priority 100 or
-above always takes precedence; one at the default 0 does not. "Require
-approval" routes to the member's approver, set by an admin.
+credential. A member's deny or require-approval only tightens. A
+member's pre-approval carries `yield_to_deny`: it may skip an admin's
+approval, but whenever the admin rules would deny the request — an
+explicit deny or a catch-all — the deny stands. "Require approval"
+routes to the member's approver, set by an admin.
+
+A member may change only rules pinned to a profile they still own:
+when an admin takes a profile away, the member's rules for it keep
+applying, but only an admin can change them. Deleting a user renames
+their file to `50-former-user-<name>-<time>.hcl`, so their rules keep
+applying without an owner, and a later user of the same name starts
+with none.
 
 The role is read from `clawpatrol.db` on every request, so a role
 change or account deletion applies to sessions already open. It

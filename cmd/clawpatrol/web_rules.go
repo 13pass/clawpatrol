@@ -1,15 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 	"github.com/hashicorp/hcl/v2"
@@ -26,6 +31,14 @@ const (
 	myActionsMaxPage = 200
 	// rulePreviewSample is how many recent requests a preview replays.
 	rulePreviewSample = 200
+	// ruleRequestMaxBytes bounds a rule request body, read in full
+	// before the config lock is taken.
+	ruleRequestMaxBytes = 64 << 10
+	// formerMemberRulesFilePrefix names the rules file of a deleted
+	// user: still loaded, so its rules keep applying, but owned by no
+	// account. An admin edits or removes it like any config file.
+	formerMemberRulesFilePrefix = "50-former-user-"
+	formerMemberRulesTimeFormat = "20060102-150405"
 )
 
 var (
@@ -257,9 +270,20 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 
 // countRecentMatches replays up to rulePreviewSample recent requests
 // the rule could apply to: same endpoint (or, for a new endpoint, same
-// host with no endpoint), and for a member the same profile.
+// host with no endpoint), and for a member the same profile. One query
+// reads only what the replay needs.
 func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int, int, error) {
-	query := `SELECT action_id FROM actions WHERE `
+	replayRule := *rule
+	if rule.NewEndpoint {
+		// Recorded requests predate the generated credential.
+		replayRule.Credential = ""
+	}
+	replay, err := newRuleReplay(&replayRule)
+	if err != nil {
+		return 0, 0, err
+	}
+	query := `SELECT method, path, host, req_headers, extra, credential, profile, agent_ip
+	          FROM actions WHERE `
 	var args []any
 	if rule.NewEndpoint {
 		query += `host = ? AND (endpoint IS NULL OR endpoint = '')`
@@ -278,38 +302,29 @@ func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int,
 	if err != nil {
 		return 0, 0, err
 	}
-	var ids []string
+	defer rows.Close()
+	matched, sampled := 0, 0
 	for rows.Next() {
-		var id sql.NullString
-		if err := rows.Scan(&id); err != nil {
-			_ = rows.Close()
+		var method, path, host, headers, extra, credential, profile, agentIP sql.NullString
+		if err := rows.Scan(&method, &path, &host, &headers, &extra, &credential, &profile, &agentIP); err != nil {
 			return 0, 0, err
 		}
-		ids = append(ids, id.String)
-	}
-	_ = rows.Close()
-	if err := rows.Err(); err != nil {
-		return 0, 0, err
-	}
-	replay := *rule
-	if rule.NewEndpoint {
-		// Recorded requests predate the generated credential.
-		replay.Credential = ""
-	}
-	matched, sampled := 0, 0
-	for _, id := range ids {
-		recorded, err := w.loadAction(id)
-		if err != nil {
-			continue
+		recorded := &Event{
+			Method: method.String, Path: path.String, Host: host.String,
+			Credential: credential.String, Profile: profile.String, AgentIP: agentIP.String,
 		}
-		if m, ok := ruleMatchesEvent(&replay, recorded); ok {
+		unmarshalHeaders(headers.String, &recorded.ReqHeaders)
+		if extra.String != "" {
+			_ = json.Unmarshal([]byte(extra.String), &recorded.Facets)
+		}
+		if m, ok := replay.matches(recorded); ok {
 			sampled++
 			if m {
 				matched++
 			}
 		}
 	}
-	return matched, sampled, nil
+	return matched, sampled, rows.Err()
 }
 
 // apiRuleCreate generates a rule from an action and appends it to the
@@ -319,6 +334,14 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// Read the body before taking the config lock, so a slow client
+	// cannot hold up every other config write.
+	raw, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, ruleRequestMaxBytes))
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	r.Body = io.NopCloser(bytes.NewReader(raw))
 	w.g.configMu.Lock()
 	defer w.g.configMu.Unlock()
 	v, _, rule, ok := w.scopedRuleFor(rw, r)
@@ -326,6 +349,10 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	setAuditTarget(r, rule.RuleName)
+	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil && gw.Policy.Rules[rule.RuleName] != nil {
+		http.Error(rw, "rule "+strconv.Quote(rule.RuleName)+" already exists", http.StatusConflict)
+		return
+	}
 	file, path, err := w.rulesFile(v)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusConflict)
@@ -363,7 +390,10 @@ func (w *webMux) writeRuleChanges(rw http.ResponseWriter, changes []configChange
 }
 
 type myRule struct {
-	Name       string   `json:"name"`
+	Name string `json:"name"`
+	// Owned is false for a rule pinned to a profile the viewer no
+	// longer owns: it still applies, but only an admin may change it.
+	Owned      bool     `json:"owned"`
 	Endpoints  []string `json:"endpoints"`
 	Priority   int      `json:"priority"`
 	Disabled   bool     `json:"disabled"`
@@ -403,7 +433,7 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 				continue
 			}
 			rule := myRule{
-				Name: name, Endpoints: body.Endpoints, Priority: body.Priority, Disabled: body.Disabled,
+				Name: name, Owned: v.ownsRule(body), Endpoints: body.Endpoints, Priority: body.Priority, Disabled: body.Disabled,
 				Condition: body.Condition, Credential: body.Credential, Profile: body.Profile,
 				Verdict: body.Verdict, Reason: body.Reason,
 			}
@@ -491,8 +521,60 @@ func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, n
 		http.Error(rw, "no rule "+strconv.Quote(name())+" in "+file, http.StatusNotFound)
 		return
 	}
+	if !v.admin {
+		var body *rules.Rule
+		if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil {
+			if ent := gw.Policy.Rules[name()]; ent != nil {
+				body, _ = ent.Body.(*rules.Rule)
+			}
+		}
+		if body == nil || !v.ownsRule(body) {
+			http.Error(rw, "this rule is pinned to a profile you no longer own; ask an admin to change it", http.StatusForbidden)
+			return
+		}
+	}
 	edit(f, target)
 	w.writeRuleChanges(rw, []configChange{{Name: file, Content: f.Bytes()}}, map[string]any{"ok": true, "file": file})
+}
+
+// ownsRule reports whether the viewer may change a rule of their file:
+// an admin always; a member only while they own the profile it is
+// pinned to.
+func (v viewer) ownsRule(r *rules.Rule) bool {
+	return v.admin || (r.Profile != "" && v.profiles[r.Profile])
+}
+
+// memberRulesPath is the rules file of username in a directory config,
+// "" for a single-file config.
+func (w *webMux) memberRulesPath(username string) string {
+	if !configIsDir(w.g.cfgPath) {
+		return ""
+	}
+	return filepath.Join(w.g.cfgPath, memberRulesFilePrefix+username+".hcl")
+}
+
+// archiveMemberRules renames a deleted user's rules file so its rules
+// keep applying but belong to no account — a later user of the same
+// name must not inherit them. The content is unchanged, so the config
+// stays valid.
+func (w *webMux) archiveMemberRules(username string) error {
+	path := w.memberRulesPath(username)
+	if path == "" {
+		return nil
+	}
+	w.g.configMu.Lock()
+	defer w.g.configMu.Unlock()
+	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	archived := formerMemberRulesFilePrefix + username + "-" + time.Now().UTC().Format(formerMemberRulesTimeFormat) + ".hcl"
+	if err := os.Rename(path, filepath.Join(w.g.cfgPath, archived)); err != nil {
+		return err
+	}
+	log.Printf("dashboard auth: rules of deleted user %q kept as %s", username, archived)
+	return nil
 }
 
 // memberActionPrefix is the one path prefix members may use: the

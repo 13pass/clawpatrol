@@ -79,6 +79,11 @@ export function RulesPage() {
                 <Td>
                   <span className="font-mono font-bold">{r.name}</span>
                   {r.disabled && <span className="ml-2 text-text-muted">(disabled)</span>}
+                  {!r.owned && (
+                    <div className="text-text-muted font-normal">
+                      Its profile is no longer yours; an admin can change it.
+                    </div>
+                  )}
                 </Td>
                 <Td>
                   <span className="font-mono">{r.endpoints.join(", ")}</span>
@@ -95,6 +100,7 @@ export function RulesPage() {
                     <Button
                       size="xs"
                       variant="outline"
+                      disabled={!r.owned}
                       onClick={() => run(() => setMyRuleDisabled(r.name, !r.disabled))}
                     >
                       {r.disabled ? "Enable" : "Disable"}
@@ -102,6 +108,7 @@ export function RulesPage() {
                     <Button
                       size="xs"
                       variant="outline"
+                      disabled={!r.owned}
                       onClick={() => {
                         if (window.confirm(`Delete rule ${r.name}?`)) {
                           run(() => deleteMyRule(r.name));

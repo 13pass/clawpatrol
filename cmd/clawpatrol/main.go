@@ -2196,7 +2196,7 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 				return
 			}
 			g.sink.Emit(Event{
-				Mode: "pg", Family: ep.Family, Host: eventHost, AgentIP: agentPip,
+				Mode: "pg", Family: ep.Family, Host: eventHost, AgentIP: agentPip, Profile: profile,
 				Method: ev.Verb, Path: ev.Summary,
 				Action: ev.Action, Reason: ev.Reason,
 				Facets:   ev.Facets,
@@ -2367,7 +2367,7 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 				return
 			}
 			g.sink.Emit(Event{
-				Mode: mode, Family: ep.Family, Host: eventHost, AgentIP: agentPip,
+				Mode: mode, Family: ep.Family, Host: eventHost, AgentIP: agentPip, Profile: profile,
 				ID: ev.ID, Phase: ev.Phase, Status: ev.Status,
 				Method: ev.Verb, Path: ev.Summary,
 				Action: ev.Action, Reason: ev.Reason,
@@ -2836,6 +2836,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			Host:   host,
 			Method: req.Method, Path: req.URL.Path,
 			AgentIP:    agentAddr,
+			Profile:    profile,
 			Endpoint:   ep.Name,
 			Credential: mreq.Credential,
 		}

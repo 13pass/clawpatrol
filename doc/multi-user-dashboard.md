@@ -155,9 +155,16 @@ Routes: `POST /api/rules/preview`, `POST /api/rules/create` (admins:
 `90-dashboard.hcl`, unpinned, priority 100), `GET /api/my/rules`,
 `POST /api/my/rules/update` (disable / enable), `POST
 /api/my/rules/delete`. Admins assign profiles and the approver on the
-Users page. A member `allow` at priority 50 overrides an admin rule at
-the default priority 0: admin rules that members must not override
-belong at 100 or above.
+Users page.
+
+A review of phase 3 changed one design point: member rules sit at
+priority 50, above admin rules at the default 0, so a plain member
+`allow` would have undone admin denies — catch-alls included. Member
+pre-approvals now carry `yield_to_deny` (a rule attribute the engine
+honours in `MatchRequest`): they skip admin approvals but never an
+admin deny. Rule edits need the member to still own the rule's
+profile, and a deleted user's file is renamed to
+`50-former-user-<name>-<time>.hcl` so it keeps applying, unowned.
 
 - `dashboard_user_profiles(username, profile)`, admin-managed.
 - Rule dialog on the request page: verdict (`deny`, `allow`,

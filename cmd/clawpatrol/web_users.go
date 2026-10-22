@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 
@@ -136,6 +138,14 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 	if len(body.Password) < dashboardMinPasswordLen {
 		http.Error(rw, "password must be at least "+strconv.Itoa(dashboardMinPasswordLen)+" characters", http.StatusBadRequest)
 		return
+	}
+	// A leftover rules file under this name would hand its rules to the
+	// new account.
+	if path := w.memberRulesPath(body.Username); path != "" {
+		if _, err := os.Stat(path); err == nil {
+			http.Error(rw, "a rules file for this username already exists ("+filepath.Base(path)+"); rename or remove it first", http.StatusConflict)
+			return
+		}
 	}
 	if err := createDashboardUser(w.g.db, body.Username, body.Password, body.Role); err != nil {
 		if errors.Is(err, errDashboardUserExists) {
@@ -278,6 +288,10 @@ func (w *webMux) apiUsersDelete(rw http.ResponseWriter, r *http.Request) {
 		return
 	} else if !exists {
 		http.Error(rw, errDashboardUserNotFound.Error(), http.StatusNotFound)
+		return
+	}
+	if err := w.archiveMemberRules(body.Username); err != nil {
+		http.Error(rw, "could not set the user's rules aside: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := deleteDashboardUser(w.g.db, body.Username); err != nil {

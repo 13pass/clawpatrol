@@ -1264,6 +1264,11 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 		}
 		for epName, ep := range prof.Endpoints {
 			for _, r := range ep.Rules {
+				// A profile-pinned rule never applies to another
+				// profile sharing the endpoint.
+				if r.Profile != "" && r.Profile != profileName {
+					continue
+				}
 				out = append(out, RuleSummary{
 					Name:       r.Name,
 					Family:     ep.Family,

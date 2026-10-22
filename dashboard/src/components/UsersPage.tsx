@@ -380,6 +380,16 @@ function ProfileChecklist({
   owned: string[];
   onChange: (profiles: string[]) => void;
 }) {
+  // Ticks are tracked here, not read back from `owned`, which only
+  // refreshes after the update round-trip: two quick ticks must each
+  // send the full current list.
+  const [checked, setChecked] = useState(owned);
+  useEffect(() => setChecked(owned), [owned]);
+  const toggle = (p: string, on: boolean) => {
+    const next = on ? [...checked, p] : checked.filter((x) => x !== p);
+    setChecked(next);
+    onChange(next);
+  };
   const all = [...new Set([...declared, ...owned])].sort();
   if (all.length === 0) return <span className="text-text-muted">none declared</span>;
   return (
@@ -388,11 +398,9 @@ function ProfileChecklist({
         <label key={p} className="flex items-center gap-1 font-mono">
           <input
             type="checkbox"
-            checked={owned.includes(p)}
+            checked={checked.includes(p)}
             aria-label={`${username} owns profile ${p}`}
-            onChange={(e) =>
-              onChange(e.target.checked ? [...owned, p] : owned.filter((x) => x !== p))
-            }
+            onChange={(e) => toggle(p, e.target.checked)}
           />
           <span className={declared.includes(p) ? "" : "line-through text-text-muted"}>{p}</span>
         </label>

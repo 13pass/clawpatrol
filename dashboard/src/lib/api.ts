@@ -627,6 +627,9 @@ export async function getMyActions(before?: number): Promise<MyActionRow[]> {
 
 export type MyRule = {
   name: string;
+  // owned is false for a rule pinned to a profile the viewer no
+  // longer owns: it still applies, but only an admin may change it.
+  owned: boolean;
   endpoints: string[];
   priority: number;
   disabled: boolean;
