@@ -64,11 +64,9 @@ type dashboardUser struct {
 	Role     dashboardRole `json:"role"`
 	Profiles []string      `json:"profiles"`
 	Approver string        `json:"approver"`
-	// OIDCUsername is the provider account an admin linked; OIDCLinked
-	// is whether its first sign-in has bound the permanent subject.
-	OIDCUsername string `json:"oidc_username"`
-	OIDCLinked   bool   `json:"oidc_linked"`
-	HasPassword  bool   `json:"has_password"`
+	// OIDC lists the provider accounts an admin linked.
+	OIDC        []oidcLink `json:"oidc"`
+	HasPassword bool       `json:"has_password"`
 	CreatedNs    int64  `json:"created_ns"`
 	UpdatedNs    int64  `json:"updated_ns"`
 }
@@ -146,6 +144,9 @@ func deleteDashboardUser(db *sql.DB, username string) error {
 	if _, err := db.Exec(`DELETE FROM dashboard_user_profiles WHERE username = ?`, username); err != nil {
 		return err
 	}
+	if _, err := db.Exec(`DELETE FROM dashboard_user_oidc WHERE username = ?`, username); err != nil {
+		return err
+	}
 	return revokeAllDashboardSessionsFor(db, username)
 }
 
@@ -177,23 +178,31 @@ func createDashboardUser(db *sql.DB, username, password string, role dashboardRo
 	if password == "" {
 		return fmt.Errorf("password must not be empty")
 	}
-	return createLinkedDashboardUser(db, username, password, role, "")
+	return createLinkedDashboardUser(db, username, password, role, nil)
 }
 
-// createLinkedDashboardUser inserts a new account linked to a sign-in
-// provider username. password may be empty: the account then has no
-// password and signs in only through the provider.
-func createLinkedDashboardUser(db *sql.DB, username, password string, role dashboardRole, oidcUsername string) error {
+// createLinkedDashboardUser inserts a new account linked to provider
+// accounts (links: provider name → account). password may be empty
+// when there is a link: the account then signs in only through a
+// provider.
+func createLinkedDashboardUser(db *sql.DB, username, password string, role dashboardRole, links map[string]string) error {
 	if db == nil {
 		return fmt.Errorf("no db")
 	}
-	if password == "" && oidcUsername == "" {
-		return fmt.Errorf("a user needs a password or a linked sign-in account")
+	linked := false
+	for provider, account := range links {
+		if account == "" {
+			continue
+		}
+		linked = true
+		if taken, err := oidcAccountTaken(db, provider, account, username); err != nil {
+			return err
+		} else if taken {
+			return errOIDCUsernameTaken
+		}
 	}
-	if taken, err := oidcUsernameTaken(db, oidcUsername, username); err != nil {
-		return err
-	} else if taken {
-		return errOIDCUsernameTaken
+	if password == "" && !linked {
+		return fmt.Errorf("a user needs a password or a linked sign-in account")
 	}
 	hash := ""
 	if password != "" {
@@ -204,15 +213,17 @@ func createLinkedDashboardUser(db *sql.DB, username, password string, role dashb
 		hash = string(h)
 	}
 	now := time.Now().UnixNano()
-	res, err := db.Exec(
-		`INSERT INTO dashboard_users (username, password_hash, role, oidc_username, created_ns, updated_ns)
-		 VALUES (?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(username) DO NOTHING`,
-		username, hash, string(role), oidcUsername, now, now,
-	)
-	if isUniqueViolation(err) {
-		return errOIDCUsernameTaken
+	tx, err := db.Begin()
+	if err != nil {
+		return err
 	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.Exec(
+		`INSERT INTO dashboard_users (username, password_hash, role, created_ns, updated_ns)
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(username) DO NOTHING`,
+		username, hash, string(role), now, now,
+	)
 	if err != nil {
 		return err
 	}
@@ -221,7 +232,20 @@ func createLinkedDashboardUser(db *sql.DB, username, password string, role dashb
 	} else if n == 0 {
 		return errDashboardUserExists
 	}
-	return nil
+	for provider, account := range links {
+		if account == "" {
+			continue
+		}
+		if _, err := tx.Exec(
+			`INSERT INTO dashboard_user_oidc (provider, username, account) VALUES (?, ?, ?)`,
+			provider, username, account,
+		); isUniqueViolation(err) {
+			return errOIDCUsernameTaken
+		} else if err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // lookupDashboardUserRole returns the role of username. Root is always
@@ -305,7 +329,7 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 		return nil, fmt.Errorf("no db")
 	}
 	rows, err := db.Query(
-		`SELECT username, role, approver, oidc_username, oidc_subject != '', password_hash != '', created_ns, updated_ns
+		`SELECT username, role, approver, password_hash != '', created_ns, updated_ns
 		 FROM dashboard_users ORDER BY username`,
 	)
 	if err != nil {
@@ -316,7 +340,7 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	for rows.Next() {
 		var u dashboardUser
 		var role string
-		if err := rows.Scan(&u.Username, &role, &u.Approver, &u.OIDCUsername, &u.OIDCLinked, &u.HasPassword, &u.CreatedNs, &u.UpdatedNs); err != nil {
+		if err := rows.Scan(&u.Username, &role, &u.Approver, &u.HasPassword, &u.CreatedNs, &u.UpdatedNs); err != nil {
 			return nil, err
 		}
 		u.Role = normalizeDashboardRole(u.Username, role)
@@ -327,6 +351,9 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	}
 	for i := range out {
 		if out[i].Profiles, err = listDashboardUserProfiles(db, out[i].Username); err != nil {
+			return nil, err
+		}
+		if out[i].OIDC, err = listDashboardUserOIDC(db, out[i].Username); err != nil {
 			return nil, err
 		}
 	}
@@ -438,27 +465,56 @@ func burnPasswordCheck(password string) {
 }
 
 var (
-	// oidcUsernameRe accepts GitLab-style usernames.
-	oidcUsernameRe = regexp.MustCompile(`^[A-Za-z0-9_.][A-Za-z0-9_.-]{0,254}$`)
+	// oidcAccountRe accepts provider account names: GitLab usernames,
+	// and email-shaped names (Entra ID UPNs, Google emails).
+	oidcAccountRe = regexp.MustCompile(`^[A-Za-z0-9_.@+'-]{1,254}$`)
 
 	errOIDCUsernameTaken = errors.New("another dashboard user is already linked to that account")
 	errOIDCUnlinked      = errors.New("no dashboard user is linked to that account")
 )
 
-func validOIDCUsername(name string) bool {
-	return oidcUsernameRe.MatchString(name)
+func validOIDCAccount(name string) bool {
+	return oidcAccountRe.MatchString(name)
 }
 
-// oidcUsernameTaken reports whether a user other than except is
-// already linked to the provider username.
-func oidcUsernameTaken(db *sql.DB, oidcUsername, except string) (bool, error) {
-	if oidcUsername == "" {
+// oidcLink is one provider account linked to a dashboard user; Linked
+// is whether its first sign-in has bound the permanent subject.
+type oidcLink struct {
+	Provider string `json:"provider"`
+	Account  string `json:"account"`
+	Linked   bool   `json:"linked"`
+}
+
+func listDashboardUserOIDC(db *sql.DB, username string) ([]oidcLink, error) {
+	rows, err := db.Query(
+		`SELECT provider, account, subject != '' FROM dashboard_user_oidc WHERE username = ? ORDER BY provider`,
+		username,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []oidcLink{}
+	for rows.Next() {
+		var l oidcLink
+		if err := rows.Scan(&l.Provider, &l.Account, &l.Linked); err != nil {
+			return nil, err
+		}
+		out = append(out, l)
+	}
+	return out, rows.Err()
+}
+
+// oidcAccountTaken reports whether a user other than except is linked
+// to the account at provider.
+func oidcAccountTaken(db *sql.DB, provider, account, except string) (bool, error) {
+	if account == "" {
 		return false, nil
 	}
 	var n int
 	err := db.QueryRow(
-		`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND username != ?`,
-		oidcUsername, except,
+		`SELECT COUNT(*) FROM dashboard_user_oidc WHERE provider = ? AND lower(account) = lower(?) AND username != ?`,
+		provider, account, except,
 	).Scan(&n)
 	return n > 0, err
 }
@@ -468,36 +524,42 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-// setDashboardUserOIDCUsername links username to a provider account
-// ("" unlinks) and reports whether the link changed. A change drops
-// the bound subject — the next sign-in as the new account binds it
-// afresh — and ends the user's sessions, since a different account
-// may now sign in as them. Provider usernames compare
-// case-insensitively, as GitLab's do.
-func setDashboardUserOIDCUsername(db *sql.DB, username, oidcUsername string) (bool, error) {
+// setDashboardUserOIDC links username to an account at provider (""
+// unlinks) and reports whether the link changed. A change drops the
+// bound subject — the next sign-in as the new account binds it afresh
+// — and ends the user's sessions, since a different account may now
+// sign in as them. Accounts compare case-insensitively.
+func setDashboardUserOIDC(db *sql.DB, username, provider, account string) (bool, error) {
 	if db == nil {
 		return false, fmt.Errorf("no db")
 	}
-	var current string
-	err := db.QueryRow(`SELECT oidc_username FROM dashboard_users WHERE username = ?`, username).Scan(&current)
-	if errors.Is(err, sql.ErrNoRows) {
+	if _, exists, err := lookupDashboardUserRole(db, username); err != nil {
+		return false, err
+	} else if !exists {
 		return false, errDashboardUserNotFound
 	}
-	if err != nil {
+	var current string
+	err := db.QueryRow(`SELECT account FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username).Scan(&current)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return false, err
 	}
-	if strings.EqualFold(current, oidcUsername) {
+	if strings.EqualFold(current, account) {
 		return false, nil
 	}
-	if taken, err := oidcUsernameTaken(db, oidcUsername, username); err != nil {
+	if taken, err := oidcAccountTaken(db, provider, account, username); err != nil {
 		return false, err
 	} else if taken {
 		return false, errOIDCUsernameTaken
 	}
-	_, err = db.Exec(
-		`UPDATE dashboard_users SET oidc_username = ?, oidc_subject = '', updated_ns = ? WHERE username = ?`,
-		oidcUsername, time.Now().UnixNano(), username,
-	)
+	if account == "" {
+		_, err = db.Exec(`DELETE FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username)
+	} else {
+		_, err = db.Exec(
+			`INSERT INTO dashboard_user_oidc (provider, username, account) VALUES (?, ?, ?)
+			 ON CONFLICT(provider, username) DO UPDATE SET account = excluded.account, subject = ''`,
+			provider, username, account,
+		)
+	}
 	if isUniqueViolation(err) {
 		return false, errOIDCUsernameTaken
 	}
@@ -507,55 +569,50 @@ func setDashboardUserOIDCUsername(db *sql.DB, username, oidcUsername string) (bo
 	return true, revokeAllDashboardSessionsFor(db, username)
 }
 
-// dashboardUserForOIDC resolves a provider sign-in to the dashboard
+// dashboardUserForOIDC resolves a sign-in at provider to the dashboard
 // user it is for. A bound subject decides; otherwise the one user
-// linked to the provider username whose subject is still unbound gets
-// this subject bound, once. A username already bound to another
-// subject never matches: the provider account was replaced.
-func dashboardUserForOIDC(db *sql.DB, subject, oidcUsername string) (string, error) {
+// linked to the account whose subject is still unbound gets this
+// subject bound, once. An account already bound to another subject
+// never matches: the provider account was replaced.
+func dashboardUserForOIDC(db *sql.DB, provider, subject, account string) (string, error) {
 	if db == nil {
 		return "", fmt.Errorf("no db")
 	}
 	var username string
-	err := db.QueryRow(`SELECT username FROM dashboard_users WHERE oidc_subject = ?`, subject).Scan(&username)
+	err := db.QueryRow(
+		`SELECT username FROM dashboard_user_oidc WHERE provider = ? AND subject = ?`, provider, subject,
+	).Scan(&username)
 	if err == nil {
 		return username, nil
 	}
 	if !errors.Is(err, sql.ErrNoRows) {
 		return "", err
 	}
-	if oidcUsername == "" {
+	if account == "" {
 		return "", errOIDCUnlinked
 	}
-	rows, err := db.Query(
-		`SELECT username FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND oidc_subject = ''`,
-		oidcUsername,
-	)
+	err = db.QueryRow(
+		`SELECT username FROM dashboard_user_oidc WHERE provider = ? AND lower(account) = lower(?) AND subject = ''`,
+		provider, account,
+	).Scan(&username)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", errOIDCUnlinked
+	}
 	if err != nil {
 		return "", err
 	}
-	var candidates []string
-	for rows.Next() {
-		var u string
-		if err := rows.Scan(&u); err != nil {
-			_ = rows.Close()
-			return "", err
-		}
-		candidates = append(candidates, u)
-	}
-	_ = rows.Close()
-	if len(candidates) != 1 {
+	res, err := db.Exec(
+		`UPDATE dashboard_user_oidc SET subject = ? WHERE provider = ? AND username = ? AND subject = ''`,
+		subject, provider, username,
+	)
+	if isUniqueViolation(err) {
 		return "", errOIDCUnlinked
 	}
-	res, err := db.Exec(
-		`UPDATE dashboard_users SET oidc_subject = ?, updated_ns = ? WHERE username = ? AND oidc_subject = ''`,
-		subject, time.Now().UnixNano(), candidates[0],
-	)
 	if err != nil {
 		return "", err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return "", errOIDCUnlinked
 	}
-	return candidates[0], nil
+	return username, nil
 }

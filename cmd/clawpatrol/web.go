@@ -153,6 +153,9 @@ func (w *webMux) authRequirementForPath(path string) authRequirement {
 	if strings.HasPrefix(path, credentialWebhookPrefix) || strings.HasPrefix(path, hitlOperationStatusPrefix) {
 		return authSelfAuthenticating
 	}
+	if strings.HasPrefix(path, oidcPathPrefix) {
+		return authPublic
+	}
 	if w.routeAuth != nil {
 		if req, ok := w.routeAuth[path]; ok {
 			return req
@@ -378,8 +381,7 @@ func (w *webMux) routes() []webRoute {
 		// Sign-in through gateway.dashboard_oidc: public by nature, like
 		// /__login; the callback proves itself with the state cookie,
 		// PKCE and the provider's signed ID token.
-		{Method: http.MethodGet, Path: oidcStartPath, Auth: authPublic, Handler: w.apiOIDCStart},
-		{Method: http.MethodGet, Path: oidcCallbackPath, Auth: authPublic, Handler: w.apiOIDCCallback},
+		{Method: http.MethodGet, Path: oidcPathPrefix, Auth: authPublic, Handler: w.apiOIDC},
 		// /__logout revokes the session row + clears the cookie. The
 		// gate still applies — only an authenticated caller can log
 		// out (tailnet-allowlisted callers get 401 because there's no
@@ -710,21 +712,20 @@ func (w *webMux) renderLogin(rw http.ResponseWriter, next, errMsg string, firstR
 }
 
 func (w *webMux) renderLoginFor(rw http.ResponseWriter, next, username, errMsg string, firstRun bool, status int) {
-	var oidcLabel, oidcStart string
-	if b := w.g.cfg.Load().DashboardOIDC(); b != nil {
-		oidcLabel = b.Label()
-		oidcStart = oidcStartPath + "?next=" + url.QueryEscape(next)
+	type oidcButton struct{ Label, URL string }
+	var buttons []oidcButton
+	for _, b := range w.g.cfg.Load().DashboardOIDCProviders() {
+		buttons = append(buttons, oidcButton{b.Label(), oidcStartPath(b.Name) + "?next=" + url.QueryEscape(next)})
 	}
 	rw.Header().Set("Content-Type", "text/html; charset=utf-8")
 	rw.WriteHeader(status)
 	_ = loginTpl.Execute(rw, struct {
-		Next      string
-		Username  string
-		Error     string
-		FirstRun  bool
-		OIDCLabel string
-		OIDCStart string
-	}{next, username, errMsg, firstRun, oidcLabel, oidcStart})
+		Next     string
+		Username string
+		Error    string
+		FirstRun bool
+		OIDC     []oidcButton
+	}{next, username, errMsg, firstRun, buttons})
 }
 
 // tailnetGate runs downstream of dashboardAuthGate. Three jobs:

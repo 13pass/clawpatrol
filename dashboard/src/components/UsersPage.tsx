@@ -34,7 +34,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
   const [declared, setDeclared] = useState<Declared>({
     profiles: [],
     approvers: [],
-    oidcProvider: null,
+    oidcProviders: [],
   });
   const [err, setErr] = useState("");
 
@@ -45,7 +45,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
       setDeclared({
         profiles: list.profiles,
         approvers: list.human_approvers,
-        oidcProvider: list.oidc?.provider ?? null,
+        oidcProviders: list.oidc.map((p) => ({ name: p.name, displayName: p.display_name })),
       });
       setErr("");
     } catch (e) {
@@ -61,7 +61,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
     <Main>
       <PageTitle trail={[{ label: "Users" }]} />
       <Section title="Add a user">
-        <CreateUserForm onCreated={refresh} oidcProvider={declared.oidcProvider} />
+        <CreateUserForm onCreated={refresh} oidcProviders={declared.oidcProviders} />
       </Section>
       <Section title="Users">
         {err && <div className="text-xs text-danger-500 px-4 py-2">{err}</div>}
@@ -79,9 +79,10 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
   );
 }
 
-// Declared is what the config offers for assignment, and the single
-// sign-on provider's name when gateway.dashboard_oidc is set.
-type Declared = { profiles: string[]; approvers: string[]; oidcProvider: string | null };
+// Declared is what the config offers for assignment, and the sign-in
+// providers (gateway.dashboard_oidc blocks).
+type OIDCProvider = { name: string; displayName: string };
+type Declared = { profiles: string[]; approvers: string[]; oidcProviders: OIDCProvider[] };
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -96,14 +97,15 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function CreateUserForm({
   onCreated,
-  oidcProvider,
+  oidcProviders,
 }: {
   onCreated: () => void;
-  oidcProvider: string | null;
+  oidcProviders: OIDCProvider[];
 }) {
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
-  const [oidcUsername, setOIDCUsername] = useState("");
+  const [links, setLinks] = useState<Record<string, string>>({});
+  const linked = Object.values(links).some((a) => a.trim() !== "");
   const [role, setRole] = useState<DashboardRole>("member");
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
@@ -112,10 +114,10 @@ function CreateUserForm({
     e.preventDefault();
     setSaving(true);
     try {
-      await createUser(username, password, role, oidcUsername);
+      await createUser(username, password, role, links);
       setUsername("");
       setPassword("");
-      setOIDCUsername("");
+      setLinks({});
       setRole("member");
       setErr("");
       onCreated();
@@ -139,23 +141,23 @@ function CreateUserForm({
           className={INPUT_CLASS}
         />
       </Field>
-      {oidcProvider && (
-        <Field label={`${oidcProvider} username`}>
+      {oidcProviders.map((p) => (
+        <Field key={p.name} label={`${p.displayName} account`}>
           <input
-            value={oidcUsername}
-            onChange={(e) => setOIDCUsername(e.target.value)}
-            placeholder="@username"
+            value={links[p.name] ?? ""}
+            onChange={(e) => setLinks({ ...links, [p.name]: e.target.value })}
+            placeholder="username or email"
             autoComplete="off"
             className={INPUT_CLASS}
           />
         </Field>
-      )}
-      <Field label={oidcUsername ? "Password (optional)" : "Initial password"}>
+      ))}
+      <Field label={linked ? "Password (optional)" : "Initial password"}>
         <input
           type="password"
           value={password}
           onChange={(e) => setPassword(e.target.value)}
-          required={!oidcUsername}
+          required={!linked}
           minLength={MIN_PASSWORD_LEN}
           autoComplete="new-password"
           className={INPUT_CLASS}
@@ -327,7 +329,7 @@ function UserRow({
         )}
       </Td>
       <Td>
-        <SignInCell user={user} provider={declared.oidcProvider} onChanged={onChanged} />
+        <SignInCell user={user} providers={declared.oidcProviders} onChanged={onChanged} />
       </Td>
       <Td>
         <span className="font-mono">{fmtDateTime(user.created_ns / NS_PER_MS)}</span>
@@ -400,22 +402,49 @@ function UserRow({
 }
 
 // SignInCell shows how a user signs in, and lets an admin link or
-// unlink their single sign-on account.
+// unlink their account at each sign-in provider.
 function SignInCell({
   user,
-  provider,
+  providers,
   onChanged,
 }: {
   user: DashboardUser;
-  provider: string | null;
+  providers: OIDCProvider[];
+  onChanged: () => void;
+}) {
+  return (
+    <div className="space-y-1">
+      {user.has_password && <div className="text-text-muted">password</div>}
+      {providers.map((p) => (
+        <ProviderLink
+          key={p.name}
+          user={user}
+          provider={p}
+          link={user.oidc.find((l) => l.provider === p.name)}
+          onChanged={onChanged}
+        />
+      ))}
+    </div>
+  );
+}
+
+function ProviderLink({
+  user,
+  provider,
+  link,
+  onChanged,
+}: {
+  user: DashboardUser;
+  provider: OIDCProvider;
+  link?: { account: string; linked: boolean };
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState(false);
-  const [value, setValue] = useState(user.oidc_username);
+  const [value, setValue] = useState(link?.account ?? "");
   const [err, setErr] = useState("");
-  async function save(next: string) {
+  async function save() {
     try {
-      await updateUser(user.username, { oidc_username: next });
+      await updateUser(user.username, { oidc: { [provider.name]: value } });
       setEditing(false);
       setErr("");
       onChanged();
@@ -423,43 +452,32 @@ function SignInCell({
       setErr(String(e instanceof Error ? e.message : e));
     }
   }
-  const methods = [user.has_password ? "password" : ""].filter(Boolean);
   return (
-    <div className="space-y-1">
-      {user.oidc_username && (
-        <div>
-          <span className="font-mono">@{user.oidc_username}</span>{" "}
+    <div>
+      <span className="text-text-muted">{provider.displayName}:</span>{" "}
+      {link ? (
+        <>
+          <span className="font-mono">{link.account}</span>{" "}
           <span className="text-text-muted">
-            {user.oidc_linked ? "linked" : "waiting for first sign-in"}
+            ({link.linked ? "linked" : "waiting for first sign-in"})
           </span>
-        </div>
-      )}
-      {methods.length > 0 && <div className="text-text-muted">{methods.join(", ")}</div>}
-      {provider && !editing && (
-        <Button
-          size="xs"
-          variant="outline"
-          onClick={() => {
-            setValue(user.oidc_username);
-            setEditing(true);
-          }}
-        >
-          {user.oidc_username ? `Change ${provider} link` : `Link ${provider}`}
-        </Button>
-      )}
-      {provider && editing && (
+        </>
+      ) : (
+        <span className="text-text-subtle">—</span>
+      )}{" "}
+      {editing ? (
         <form
-          className="flex items-center gap-2"
+          className="flex items-center gap-2 mt-1"
           onSubmit={(e) => {
             e.preventDefault();
-            save(value);
+            save();
           }}
         >
           <input
             value={value}
             onChange={(e) => setValue(e.target.value)}
-            placeholder="@username, empty to unlink"
-            aria-label={`${provider} username for ${user.username}`}
+            placeholder="account, empty to unlink"
+            aria-label={`${provider.displayName} account for ${user.username}`}
             className={INPUT_CLASS}
           />
           <Button type="submit" size="xs">
@@ -469,6 +487,17 @@ function SignInCell({
             Cancel
           </Button>
         </form>
+      ) : (
+        <Button
+          size="xs"
+          variant="outline"
+          onClick={() => {
+            setValue(link?.account ?? "");
+            setEditing(true);
+          }}
+        >
+          {link ? "Change" : "Link"}
+        </Button>
       )}
       {err && <div className="text-xs text-danger-500">{err}</div>}
     </div>

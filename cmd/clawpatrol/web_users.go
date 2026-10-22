@@ -15,7 +15,22 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
-var errSSONotConfigured = errors.New("single sign-on is not configured (gateway.dashboard_oidc); a linked account could never sign in")
+// normalizeOIDCLinks checks links (provider name → account) against
+// the configured providers, and trims a leading "@" from accounts.
+func (w *webMux) normalizeOIDCLinks(links map[string]string) (map[string]string, error) {
+	out := make(map[string]string, len(links))
+	for provider, account := range links {
+		if w.g.cfg.Load().DashboardOIDCProvider(provider) == nil {
+			return nil, fmt.Errorf("no sign-in provider %q is configured (gateway.dashboard_oidc); a linked account could never sign in", provider)
+		}
+		account = strings.TrimPrefix(strings.TrimSpace(account), "@")
+		if account != "" && !validOIDCAccount(account) {
+			return nil, fmt.Errorf("%q is not a valid account name", account)
+		}
+		out[provider] = account
+	}
+	return out, nil
+}
 
 // humanApproverType is the approver plugin a user's "require approval"
 // rules may route to.
@@ -57,9 +72,9 @@ func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	policy := w.g.Policy()
-	var oidc any
-	if b := w.g.cfg.Load().DashboardOIDC(); b != nil {
-		oidc = map[string]string{"issuer": b.IssuerOrDefault(), "label": b.Label(), "provider": b.ProviderName()}
+	oidc := []map[string]string{}
+	for _, b := range w.g.cfg.Load().DashboardOIDCProviders() {
+		oidc = append(oidc, map[string]string{"name": b.Name, "display_name": b.ProviderName(), "label": b.Label()})
 	}
 	writeJSON(rw, map[string]any{
 		"users":           users,
@@ -123,10 +138,11 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		Username     string        `json:"username"`
-		Password     string        `json:"password"`
-		Role         dashboardRole `json:"role"`
-		OIDCUsername string        `json:"oidc_username"`
+		Username string        `json:"username"`
+		Password string        `json:"password"`
+		Role     dashboardRole `json:"role"`
+		// OIDC links provider names to accounts there.
+		OIDC map[string]string `json:"oidc"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -136,14 +152,14 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 	if body.Role == "" {
 		body.Role = dashboardRoleMember
 	}
-	body.OIDCUsername = strings.TrimPrefix(strings.TrimSpace(body.OIDCUsername), "@")
-	if body.OIDCUsername != "" && w.g.cfg.Load().DashboardOIDC() == nil {
-		http.Error(rw, errSSONotConfigured.Error(), http.StatusBadRequest)
+	links, err := w.normalizeOIDCLinks(body.OIDC)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if body.OIDCUsername != "" && !validOIDCUsername(body.OIDCUsername) {
-		http.Error(rw, "that is not a valid sign-in account username", http.StatusBadRequest)
-		return
+	linked := false
+	for _, account := range links {
+		linked = linked || account != ""
 	}
 	if !validDashboardUsername(body.Username) {
 		http.Error(rw, "username must match "+dashboardUsernameRe.String(), http.StatusBadRequest)
@@ -154,7 +170,7 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// A user linked to a sign-in account may have no password.
-	if (body.Password != "" || body.OIDCUsername == "") && len(body.Password) < dashboardMinPasswordLen {
+	if (body.Password != "" || !linked) && len(body.Password) < dashboardMinPasswordLen {
 		http.Error(rw, "password must be at least "+strconv.Itoa(dashboardMinPasswordLen)+" characters", http.StatusBadRequest)
 		return
 	}
@@ -166,7 +182,7 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := createLinkedDashboardUser(w.g.db, body.Username, body.Password, body.Role, body.OIDCUsername); err != nil {
+	if err := createLinkedDashboardUser(w.g.db, body.Username, body.Password, body.Role, links); err != nil {
 		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
 			http.Error(rw, err.Error(), http.StatusConflict)
 			return
@@ -194,46 +210,44 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		Password string        `json:"password"`
 		Profiles *[]string     `json:"profiles"`
 		Approver *string       `json:"approver"`
-		// OIDCUsername links the user to a sign-in account; "" unlinks.
-		OIDCUsername *string `json:"oidc_username"`
+		// OIDC sets the account linked at each named provider; ""
+		// unlinks. Providers left out are unchanged.
+		OIDC map[string]string `json:"oidc"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
 	setAuditTarget(r, auditUsername(body.Username))
-	if body.Role == "" && body.Password == "" && body.Profiles == nil && body.Approver == nil && body.OIDCUsername == nil {
-		http.Error(rw, "nothing to update: set role, password, profiles, approver and/or oidc_username", http.StatusBadRequest)
+	if body.Role == "" && body.Password == "" && body.Profiles == nil && body.Approver == nil && body.OIDC == nil {
+		http.Error(rw, "nothing to update: set role, password, profiles, approver and/or oidc", http.StatusBadRequest)
 		return
 	}
 	caller, _ := principalFromContext(r.Context())
-	if body.OIDCUsername != nil {
-		v := strings.TrimPrefix(strings.TrimSpace(*body.OIDCUsername), "@")
-		if v != "" && w.g.cfg.Load().DashboardOIDC() == nil {
-			http.Error(rw, errSSONotConfigured.Error(), http.StatusBadRequest)
-			return
-		}
-		if v != "" && !validOIDCUsername(v) {
-			http.Error(rw, "that is not a valid sign-in account username", http.StatusBadRequest)
-			return
-		}
+	links, err := w.normalizeOIDCLinks(body.OIDC)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(links) > 0 {
 		// Linking an account decides who may sign in as the user: one
 		// admin must not be able to take over another's (or root's).
 		if role, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		} else if exists && role == dashboardRoleAdmin && caller.Owner != body.Username {
-			http.Error(rw, "an admin's sign-in account can only be linked by that admin", http.StatusForbidden)
+			http.Error(rw, "an admin's sign-in accounts can only be linked by that admin", http.StatusForbidden)
 			return
 		}
-		if taken, err := oidcUsernameTaken(w.g.db, v, body.Username); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		} else if taken {
-			http.Error(rw, errOIDCUsernameTaken.Error(), http.StatusConflict)
-			return
+		for provider, account := range links {
+			if taken, err := oidcAccountTaken(w.g.db, provider, account, body.Username); err != nil {
+				http.Error(rw, err.Error(), http.StatusInternalServerError)
+				return
+			} else if taken {
+				http.Error(rw, errOIDCUsernameTaken.Error(), http.StatusConflict)
+				return
+			}
 		}
-		body.OIDCUsername = &v
 	}
 	if err := validateUserAssignment(w.g.Policy(), body.Profiles, body.Approver); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -299,8 +313,9 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.OIDCUsername != nil {
-		changed, err := setDashboardUserOIDCUsername(w.g.db, body.Username, *body.OIDCUsername)
+	relinked := false
+	for provider, account := range links {
+		changed, err := setDashboardUserOIDC(w.g.db, body.Username, provider, account)
 		switch {
 		case errors.Is(err, errDashboardUserNotFound):
 			http.Error(rw, err.Error(), http.StatusNotFound)
@@ -313,7 +328,12 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if changed {
-			log.Printf("dashboard auth: user %q linked to sign-in account %q", body.Username, *body.OIDCUsername)
+			log.Printf("dashboard auth: user %q linked at %s to %q", body.Username, provider, account)
+			relinked = true
+		}
+	}
+	{
+		if relinked {
 			// Relinking ends the user's sessions; one changing their own
 			// link stays signed in.
 			if caller.Owner == body.Username && caller.Kind == principalDashboardPassword {

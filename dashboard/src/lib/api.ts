@@ -487,10 +487,9 @@ export type DashboardUser = {
   role: DashboardRole;
   profiles: string[];
   approver: string;
-  // oidc_username: the sign-in account (e.g. GitLab) an admin linked;
-  // oidc_linked: whether its first sign-in has bound it for good.
-  oidc_username: string;
-  oidc_linked: boolean;
+  // oidc: the accounts an admin linked at each sign-in provider;
+  // linked is whether the first sign-in has bound it for good.
+  oidc: { provider: string; account: string; linked: boolean }[];
   has_password: boolean;
   created_ns: number;
   updated_ns: number;
@@ -502,8 +501,8 @@ export async function listUsers(): Promise<{
   users: DashboardUser[];
   profiles: string[];
   human_approvers: string[];
-  // oidc is set when gateway.dashboard_oidc offers single sign-on.
-  oidc: { issuer: string; label: string; provider: string } | null;
+  // oidc lists the sign-in providers (gateway.dashboard_oidc blocks).
+  oidc: { name: string; display_name: string; label: string }[];
 }> {
   const r = await api("/api/users");
   if (!r.ok) throw new Error(await r.text());
@@ -519,15 +518,16 @@ async function postUsers(path: string, body: object): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
-// createUser adds an account; with an oidc_username the password may
-// be empty, and the user signs in through the linked account only.
+// createUser adds an account; with an account linked at a provider
+// (oidc: provider name → account) the password may be empty, and the
+// user signs in through the provider only.
 export function createUser(
   username: string,
   password: string,
   role: DashboardRole,
-  oidcUsername = "",
+  oidc: Record<string, string> = {},
 ) {
-  return postUsers("/api/users/create", { username, password, role, oidc_username: oidcUsername });
+  return postUsers("/api/users/create", { username, password, role, oidc });
 }
 
 // updateUser changes the role, resets a member's password, or sets the
@@ -539,7 +539,8 @@ export function updateUser(
     password?: string;
     profiles?: string[];
     approver?: string;
-    oidc_username?: string;
+    // oidc sets the account at each named provider; "" unlinks.
+    oidc?: Record<string, string>;
   },
 ) {
   return postUsers("/api/users/update", { username, ...change });

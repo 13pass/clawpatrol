@@ -217,8 +217,8 @@
         required
       />
       <button type="submit">Unlock</button>
-      {{if .OIDCLabel}}
-      <a class="oidc" href="{{.OIDCStart}}">{{.OIDCLabel}}</a>
+      {{range .OIDC}}
+      <a class="oidc" href="{{.URL}}">{{.Label}}</a>
       {{end}} {{end}}
     </form>
   </body>

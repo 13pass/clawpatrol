@@ -23,16 +23,20 @@ const (
 	oidcTestKeyID    = "k1"
 	oidcTestCode     = "good-code"
 	oidcTestAccess   = "access-token"
+	oidcTestHost     = "gw.example.test"
 )
 
 // fakeOIDC is a minimal OpenID provider. Tests change its fields to
 // make it answer wrongly in one way at a time.
 type fakeOIDC struct {
-	srv  *httptest.Server
-	key  *rsa.PrivateKey
-	mu   sync.Mutex
-	sub  string
-	user string
+	srv *httptest.Server
+	key *rsa.PrivateKey
+	mu  sync.Mutex
+	sub string
+	// idClaims and userinfoClaims are the extra claims each source
+	// carries (username, email, groups, …).
+	idClaims       map[string]any
+	userinfoClaims map[string]any
 	// nonce is what the next ID token carries; "" echoes the sign-in's.
 	nonce    string
 	lastSeen string
@@ -42,7 +46,6 @@ type fakeOIDC struct {
 	slash   bool
 	expires time.Duration
 	signKey *rsa.PrivateKey
-	groups  []string
 }
 
 func newFakeOIDC(t *testing.T) *fakeOIDC {
@@ -51,15 +54,15 @@ func newFakeOIDC(t *testing.T) *fakeOIDC {
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &fakeOIDC{key: key, sub: "4242", user: "alice-gl", audience: oidcTestClientID, expires: time.Hour}
+	f := &fakeOIDC{
+		key: key, sub: "4242", audience: oidcTestClientID, expires: time.Hour,
+		idClaims:       map[string]any{"preferred_username": "alice-gl"},
+		userinfoClaims: map[string]any{},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(rw http.ResponseWriter, r *http.Request) {
-		issuer := f.srv.URL
-		if f.slash {
-			issuer += "/"
-		}
 		_ = json.NewEncoder(rw).Encode(map[string]string{
-			"issuer":                 issuer,
+			"issuer":                 f.ownIssuer(),
 			"authorization_endpoint": f.srv.URL + "/authorize",
 			"token_endpoint":         f.srv.URL + "/token",
 			"userinfo_endpoint":      f.srv.URL + "/userinfo",
@@ -90,11 +93,22 @@ func newFakeOIDC(t *testing.T) *fakeOIDC {
 		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
-		_ = json.NewEncoder(rw).Encode(map[string]any{"sub": f.sub, "groups": f.groups})
+		out := map[string]any{"sub": f.sub}
+		for k, v := range f.userinfoClaims {
+			out[k] = v
+		}
+		_ = json.NewEncoder(rw).Encode(out)
 	})
 	f.srv = httptest.NewTLSServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
+}
+
+func (f *fakeOIDC) ownIssuer() string {
+	if f.slash {
+		return f.srv.URL + "/"
+	}
+	return f.srv.URL
 }
 
 func (f *fakeOIDC) idToken(t *testing.T) string {
@@ -109,10 +123,7 @@ func (f *fakeOIDC) idToken(t *testing.T) string {
 	if err != nil {
 		t.Fatal(err)
 	}
-	issuer := f.srv.URL
-	if f.slash {
-		issuer += "/"
-	}
+	issuer := f.ownIssuer()
 	if f.issuer != "" {
 		issuer = f.issuer
 	}
@@ -120,53 +131,74 @@ func (f *fakeOIDC) idToken(t *testing.T) string {
 	if f.nonce != "" {
 		nonce = f.nonce
 	}
+	extra := map[string]any{"nonce": nonce}
+	for k, v := range f.idClaims {
+		extra[k] = v
+	}
 	now := time.Now()
 	raw, err := jwt.Signed(signer).Claims(jwt.Claims{
 		Issuer: issuer, Subject: f.sub, Audience: jwt.Audience{f.audience},
 		IssuedAt: jwt.NewNumericDate(now), Expiry: jwt.NewNumericDate(now.Add(f.expires)),
-	}).Claims(map[string]any{"nonce": nonce, "preferred_username": f.user}).Serialize()
+	}).Claims(extra).Serialize()
 	if err != nil {
 		t.Fatal(err)
 	}
 	return raw
 }
 
-const oidcTestHost = "gw.example.test"
+// oidcTestProvider is one dashboard_oidc block of a test gateway.
+type oidcTestProvider struct {
+	name  string
+	f     *fakeOIDC
+	extra string // further attributes, one per line
+}
 
-func newOIDCTestMux(t *testing.T, f *fakeOIDC, allowedGroups string) *webMux {
+func newOIDCTestMuxWith(t *testing.T, providers ...oidcTestProvider) *webMux {
 	t.Helper()
 	w := newUsersTestMux(t)
-	issuer := f.srv.URL
-	if f.slash {
-		issuer += "/"
+	src := "gateway {\n  public_url = \"https://" + oidcTestHost + "\"\n  wireguard { subnet_cidr = \"10.55.0.0/24\" }\n"
+	for _, p := range providers {
+		src += "  dashboard_oidc \"" + p.name + "\" {\n    issuer = \"" + p.f.ownIssuer() + "\"\n    client_id = \"" + oidcTestClientID +
+			"\"\n    client_secret = \"s3cret\"\n    " + p.extra + "\n  }\n"
 	}
-	src := `gateway {
-  public_url = "https://` + oidcTestHost + `"
-  wireguard { subnet_cidr = "10.55.0.0/24" }
-  dashboard_oidc {
-    issuer         = "` + issuer + `"
-    client_id      = "` + oidcTestClientID + `"
-    client_secret  = "s3cret"
-    ` + allowedGroups + `
-  }
-}
-`
+	src += "}\n"
 	gw, diags := config.LoadBytes([]byte(src), "oidc.hcl")
 	if diags.HasErrors() {
-		t.Fatalf("load: %v", diags)
+		t.Fatalf("load: %v\n%s", diags, src)
 	}
 	w.g.cfg.Store(gw)
-	w.g.oidcState = &oidcState{client: f.srv.Client()}
+	// Every fake serves under its own test certificate; one client
+	// trusting them all stands in for the system roots.
+	client := providers[0].f.srv.Client()
+	for _, p := range providers[1:] {
+		pool := client.Transport.(*http.Transport).TLSClientConfig.RootCAs
+		pool.AddCert(p.f.srv.Certificate())
+	}
+	w.g.oidcState = &oidcState{client: client}
 	return w
 }
 
-// oidcSignIn runs the browser's side of a sign-in and returns the
-// callback's response.
-func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, tamper func(state *string, cookie *http.Cookie)) *httptest.ResponseRecorder {
+// newOIDCTestMux is a gateway with one provider, "gitlab", whose extra
+// attributes are given.
+func newOIDCTestMux(t *testing.T, f *fakeOIDC, extra string) *webMux {
+	t.Helper()
+	return newOIDCTestMuxWith(t, oidcTestProvider{"gitlab", f, extra})
+}
+
+func linkAt(t *testing.T, w *webMux, username, provider, account string) {
+	t.Helper()
+	if _, err := setDashboardUserOIDC(w.g.db, username, provider, account); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// oidcSignIn runs the browser's side of a sign-in at provider and
+// returns the callback's response.
+func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, provider string, tamper func(state *string, cookie *http.Cookie)) *httptest.ResponseRecorder {
 	t.Helper()
 	h := w.handler()
 	rw := httptest.NewRecorder()
-	start := httptest.NewRequest(http.MethodGet, oidcStartPath+"?next=/%23/rules", nil)
+	start := httptest.NewRequest(http.MethodGet, oidcStartPath(provider)+"?next=/%23/rules", nil)
 	start.Host = oidcTestHost
 	h.ServeHTTP(rw, start)
 	if rw.Code != http.StatusFound {
@@ -180,6 +212,9 @@ func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, tamper func(state *string,
 	if q.Get("code_challenge") == "" || q.Get("code_challenge_method") != "S256" || q.Get("nonce") == "" {
 		t.Fatalf("authorize request lacks PKCE or nonce: %s", loc)
 	}
+	if want := "https://" + oidcTestHost + oidcCallbackPath(provider); q.Get("redirect_uri") != want {
+		t.Fatalf("redirect_uri = %q, want %q", q.Get("redirect_uri"), want)
+	}
 	f.mu.Lock()
 	f.lastSeen = q.Get("nonce")
 	f.mu.Unlock()
@@ -190,16 +225,16 @@ func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, tamper func(state *string,
 		}
 	}
 	state := q.Get("state")
-	if cookie == nil {
-		t.Fatal("no sign-in cookie set")
+	if cookie == nil || cookie.Path != oidcStartPath(provider) {
+		t.Fatalf("sign-in cookie = %+v, want one on %s", cookie, oidcStartPath(provider))
 	}
-	if pending, ok := w.g.oidc().openPending(cookie.Value); !ok || pending.State != state {
-		t.Fatalf("sign-in cookie does not carry state %q", state)
+	if pending, ok := w.g.oidc().openPending(cookie.Value); !ok || pending.State != state || pending.Provider != provider {
+		t.Fatalf("sign-in cookie does not carry state %q for %s", state, provider)
 	}
 	if tamper != nil {
 		tamper(&state, cookie)
 	}
-	req := httptest.NewRequest(http.MethodGet, oidcCallbackPath+"?code="+oidcTestCode+"&state="+url.QueryEscape(state), nil)
+	req := httptest.NewRequest(http.MethodGet, oidcCallbackPath(provider)+"?code="+oidcTestCode+"&state="+url.QueryEscape(state), nil)
 	req.Host = oidcTestHost
 	if cookie != nil {
 		req.AddCookie(cookie)
@@ -229,10 +264,8 @@ func signedInAs(t *testing.T, w *webMux, rw *httptest.ResponseRecorder) string {
 func TestOIDCSignInBindsTheLinkedUserBySubject(t *testing.T) {
 	f := newFakeOIDC(t)
 	w := newOIDCTestMux(t, f, "")
-	if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "Alice-GL"); err != nil {
-		t.Fatal(err)
-	}
-	rw := oidcSignIn(t, w, f, nil)
+	linkAt(t, w, "alice", "gitlab", "Alice-GL")
+	rw := oidcSignIn(t, w, f, "gitlab", nil)
 	if rw.Code != http.StatusFound || rw.Header().Get("Location") != "/#/rules" {
 		t.Fatalf("callback = %d → %q %s", rw.Code, rw.Header().Get("Location"), rw.Body.String())
 	}
@@ -241,13 +274,13 @@ func TestOIDCSignInBindsTheLinkedUserBySubject(t *testing.T) {
 	}
 
 	// Renamed on the provider: the bound subject still decides.
-	f.user = "alice-renamed"
-	if got := signedInAs(t, w, oidcSignIn(t, w, f, nil)); got != "alice" {
+	f.idClaims["preferred_username"] = "alice-renamed"
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab", nil)); got != "alice" {
 		t.Fatalf("after a provider rename signed in as %q", got)
 	}
 	// Someone else now holds the old username: they get nothing.
-	f.sub, f.user = "9999", "alice-gl"
-	rw = oidcSignIn(t, w, f, nil)
+	f.sub, f.idClaims["preferred_username"] = "9999", "alice-gl"
+	rw = oidcSignIn(t, w, f, "gitlab", nil)
 	if rw.Code != http.StatusForbidden || signedInAs(t, w, rw) != "" {
 		t.Fatalf("recycled username signed in: %d", rw.Code)
 	}
@@ -256,12 +289,13 @@ func TestOIDCSignInBindsTheLinkedUserBySubject(t *testing.T) {
 func TestOIDCUnlinkedAccountIsRefused(t *testing.T) {
 	f := newFakeOIDC(t)
 	w := newOIDCTestMux(t, f, "")
-	rw := oidcSignIn(t, w, f, nil)
+	rw := oidcSignIn(t, w, f, "gitlab", nil)
 	if rw.Code != http.StatusForbidden || !strings.Contains(rw.Body.String(), "ask an admin to link it") {
 		t.Fatalf("unlinked sign-in = %d %s", rw.Code, rw.Body.String())
 	}
 	records, _ := listDashboardAudit(w.g.db, 0, 0)
-	if len(records) == 0 || records[0].Username != "@alice-gl" || records[0].Status != http.StatusForbidden {
+	if len(records) == 0 || records[0].Username != "@alice-gl" || records[0].Status != http.StatusForbidden ||
+		records[0].AuthKind != auditKindOIDC || records[0].Target != "login oidc gitlab" {
 		t.Fatalf("refused sign-in not audited: %+v", records)
 	}
 }
@@ -294,20 +328,21 @@ func TestOIDCSignInRejectsForgedOrMisboundResponses(t *testing.T) {
 	for name, tc := range cases {
 		f := newFakeOIDC(t)
 		w := newOIDCTestMux(t, f, "")
-		if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
-			t.Fatal(err)
-		}
+		linkAt(t, w, "alice", "gitlab", "alice-gl")
 		if tc.provider != nil {
 			tc.provider(f)
 		}
-		rw := oidcSignIn(t, w, f, tc.tamper)
+		rw := oidcSignIn(t, w, f, "gitlab", tc.tamper)
 		if rw.Code != tc.want || signedInAs(t, w, rw) != "" {
 			t.Errorf("%s: callback = %d, want %d and no session", name, rw.Code, tc.want)
 		}
 	}
 }
 
-func TestOIDCAllowedGroups(t *testing.T) {
+func TestOIDCGitLabStyleGroups(t *testing.T) {
+	const gitlabStyle = `allowed_groups = ["unrcs/dco"]
+    groups_source = "userinfo"
+    group_match = "subgroups"`
 	for name, tc := range map[string]struct {
 		groups []string
 		want   int
@@ -318,15 +353,121 @@ func TestOIDCAllowedGroups(t *testing.T) {
 		"no groups":                    {nil, http.StatusForbidden},
 	} {
 		f := newFakeOIDC(t)
-		f.groups = tc.groups
-		w := newOIDCTestMux(t, f, `allowed_groups = ["unrcs/dco"]`)
-		if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
-			t.Fatal(err)
-		}
-		if rw := oidcSignIn(t, w, f, nil); rw.Code != tc.want {
+		f.userinfoClaims["groups"] = tc.groups
+		w := newOIDCTestMux(t, f, gitlabStyle)
+		linkAt(t, w, "alice", "gitlab", "alice-gl")
+		if rw := oidcSignIn(t, w, f, "gitlab", nil); rw.Code != tc.want {
 			t.Errorf("%s: callback = %d, want %d", name, rw.Code, tc.want)
 		}
 	}
+}
+
+func TestOIDCEntraStyleGroupsAndEmailUsernames(t *testing.T) {
+	const groupID = "6f1b2c3d-0000-4000-8000-0123456789ab"
+	for name, tc := range map[string]struct {
+		groups []any
+		want   int
+	}{
+		"in the group":               {[]any{"aaaaaaaa-0000-4000-8000-000000000000", groupID}, http.StatusFound},
+		"not in it":                  {[]any{"aaaaaaaa-0000-4000-8000-000000000000"}, http.StatusForbidden},
+		"prefix is not enough":       {[]any{groupID + "/sub"}, http.StatusForbidden},
+		"groups only somewhere else": {nil, http.StatusForbidden},
+	} {
+		f := newFakeOIDC(t)
+		f.idClaims = map[string]any{"preferred_username": "Alice.Doe@un.org"}
+		if tc.groups != nil {
+			f.idClaims["groups"] = tc.groups
+		}
+		// Groups in userinfo must not count: this provider reads the token.
+		f.userinfoClaims["groups"] = []string{groupID}
+		w := newOIDCTestMuxWith(t, oidcTestProvider{"entra", f, `allowed_groups = ["` + groupID + `"]`})
+		linkAt(t, w, "alice", "entra", "alice.doe@un.org")
+		if rw := oidcSignIn(t, w, f, "entra", nil); rw.Code != tc.want {
+			t.Errorf("%s: callback = %d, want %d", name, rw.Code, tc.want)
+		}
+	}
+}
+
+func TestOIDCUsernameClaimFromUserinfo(t *testing.T) {
+	// A Google-like provider: no username in the token, the email in
+	// userinfo.
+	f := newFakeOIDC(t)
+	f.idClaims = map[string]any{}
+	f.userinfoClaims["email"] = "alice@example.org"
+	w := newOIDCTestMuxWith(t, oidcTestProvider{"google", f, `username_claim = "email"
+    scopes = ["openid", "email"]`})
+	linkAt(t, w, "alice", "google", "alice@example.org")
+	rw := oidcSignIn(t, w, f, "google", nil)
+	if got := signedInAs(t, w, rw); got != "alice" {
+		t.Fatalf("sign-in by userinfo email = %d as %q", rw.Code, got)
+	}
+}
+
+func TestOIDCSeveralProvidersSideBySide(t *testing.T) {
+	gl, entra := newFakeOIDC(t), newFakeOIDC(t)
+	// The same subject value at both: the issuer keeps them apart.
+	gl.sub, entra.sub = "42", "42"
+	gl.idClaims = map[string]any{"preferred_username": "alice-gl"}
+	entra.idClaims = map[string]any{"preferred_username": "alice@un.org"}
+	w := newOIDCTestMuxWith(t,
+		oidcTestProvider{"gitlab", gl, `display_name = "GitLab"`},
+		oidcTestProvider{"entra", entra, `display_name = "Entra ID"`},
+	)
+	linkAt(t, w, "alice", "gitlab", "alice-gl")
+	linkAt(t, w, "alice", "entra", "alice@un.org")
+
+	for provider, f := range map[string]*fakeOIDC{"gitlab": gl, "entra": entra} {
+		if got := signedInAs(t, w, oidcSignIn(t, w, f, provider, nil)); got != "alice" {
+			t.Fatalf("sign-in at %s = %q, want alice", provider, got)
+		}
+	}
+	// A sign-in started at one provider does not complete at the other.
+	h := w.handler()
+	start := httptest.NewRequest(http.MethodGet, oidcStartPath("gitlab"), nil)
+	start.Host = oidcTestHost
+	srw := httptest.NewRecorder()
+	h.ServeHTTP(srw, start)
+	var glCookie *http.Cookie
+	for _, c := range srw.Result().Cookies() {
+		if c.Name == oidcStateCookie {
+			glCookie = c
+		}
+	}
+	state := mustQuery(t, srw.Header().Get("Location"), "state")
+	cross := httptest.NewRequest(http.MethodGet, oidcCallbackPath("entra")+"?code="+oidcTestCode+"&state="+state, nil)
+	cross.Host = oidcTestHost
+	cross.AddCookie(glCookie)
+	crw := httptest.NewRecorder()
+	h.ServeHTTP(crw, cross)
+	if crw.Code != http.StatusBadRequest {
+		t.Errorf("gitlab sign-in completed at entra's callback: %d", crw.Code)
+	}
+
+	// The login page offers both.
+	lrw := httptest.NewRecorder()
+	w.apiDashboardLogin(lrw, httptest.NewRequest(http.MethodGet, "/__login?next=/", nil))
+	for _, want := range []string{"Sign in with GitLab", "Sign in with Entra ID", oidcStartPath("gitlab") + "?next=", oidcStartPath("entra") + "?next="} {
+		if !strings.Contains(lrw.Body.String(), want) {
+			t.Errorf("login page lacks %q", want)
+		}
+	}
+	// An unknown provider is a 404.
+	urw := httptest.NewRecorder()
+	unknown := httptest.NewRequest(http.MethodGet, oidcStartPath("okta"), nil)
+	unknown.Host = oidcTestHost
+	h.ServeHTTP(urw, unknown)
+	if urw.Code != http.StatusNotFound {
+		t.Errorf("unknown provider = %d, want 404", urw.Code)
+	}
+}
+
+func mustQuery(t *testing.T, raw, key string) string {
+	t.Helper()
+	u, err := url.Parse(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Query().Get(key)
 }
 
 func TestPasswordlessLinkedUser(t *testing.T) {
@@ -334,10 +475,10 @@ func TestPasswordlessLinkedUser(t *testing.T) {
 	w := newOIDCTestMux(t, f, "")
 	h := w.handler()
 	root := sessionCookieFor(t, w, dashboardRootUsername)
-	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"carol","oidc_username":"@carol-gl"}`); rw.Code != http.StatusCreated {
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"carol","oidc":{"gitlab":"@carol-gl"}}`); rw.Code != http.StatusCreated {
 		t.Fatalf("create passwordless = %d %s", rw.Code, rw.Body.String())
 	}
-	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"dave","oidc_username":"CAROL-GL"}`); rw.Code != http.StatusConflict {
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"dave","oidc":{"gitlab":"CAROL-GL"}}`); rw.Code != http.StatusConflict {
 		t.Errorf("second link to the same account = %d, want 409", rw.Code)
 	}
 	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"erin"}`); rw.Code != http.StatusBadRequest {
@@ -346,8 +487,8 @@ func TestPasswordlessLinkedUser(t *testing.T) {
 	if rw := postLogin(t, w, "username=carol&password="); rw.Code != http.StatusUnauthorized {
 		t.Errorf("password login of a passwordless user = %d, want 401", rw.Code)
 	}
-	f.sub, f.user = "77", "carol-gl"
-	rw := oidcSignIn(t, w, f, nil)
+	f.sub, f.idClaims["preferred_username"] = "77", "carol-gl"
+	rw := oidcSignIn(t, w, f, "gitlab", nil)
 	if got := signedInAs(t, w, rw); got != "carol" {
 		t.Fatalf("carol's sign-in = %d as %q", rw.Code, got)
 	}
@@ -357,62 +498,21 @@ func TestPasswordlessLinkedUser(t *testing.T) {
 	}
 
 	// Saving the same link (any case) changes nothing and keeps sessions.
-	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc_username":"Carol-GL"}`); rw.Code != http.StatusOK {
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc":{"gitlab":"Carol-GL"}}`); rw.Code != http.StatusOK {
 		t.Fatalf("unchanged link = %d %s", rw.Code, rw.Body.String())
 	}
 	if rw := serveAs(t, h, carol, http.MethodGet, "/api/me", ""); rw.Code != http.StatusOK {
 		t.Errorf("carol's session after an unchanged link = %d, want 200", rw.Code)
 	}
 	// Relinking to another account unbinds the subject and ends sessions.
-	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc_username":"carol-new"}`); rw.Code != http.StatusOK {
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc":{"gitlab":"carol-new"}}`); rw.Code != http.StatusOK {
 		t.Fatalf("relink = %d %s", rw.Code, rw.Body.String())
 	}
 	if rw := serveAs(t, h, carol, http.MethodGet, "/api/me", ""); rw.Code != http.StatusUnauthorized {
 		t.Errorf("carol's session after relinking = %d, want 401", rw.Code)
 	}
-	if rw := oidcSignIn(t, w, f, nil); rw.Code != http.StatusForbidden {
+	if rw := oidcSignIn(t, w, f, "gitlab", nil); rw.Code != http.StatusForbidden {
 		t.Errorf("old account after relinking = %d, want 403", rw.Code)
-	}
-}
-
-func TestLoginPageOffersOIDCOnlyWhenConfigured(t *testing.T) {
-	f := newFakeOIDC(t)
-	w := newOIDCTestMux(t, f, "")
-	rw := httptest.NewRecorder()
-	w.apiDashboardLogin(rw, httptest.NewRequest(http.MethodGet, "/__login?next=/", nil))
-	if !strings.Contains(rw.Body.String(), "Sign in with SSO") || !strings.Contains(rw.Body.String(), oidcStartPath+"?next=") {
-		t.Fatalf("login page lacks the sign-in button:\n%s", rw.Body.String())
-	}
-	plain := newUsersTestMux(t)
-	rw = httptest.NewRecorder()
-	plain.apiDashboardLogin(rw, httptest.NewRequest(http.MethodGet, "/__login?next=/", nil))
-	if strings.Contains(rw.Body.String(), oidcStartPath) {
-		t.Fatal("login page offers OIDC without a dashboard_oidc block")
-	}
-}
-
-func TestDashboardOIDCConfigValidation(t *testing.T) {
-	const publicURL = `public_url = "https://gw.example.test"`
-	for name, tc := range map[string]struct {
-		publicURL string
-		block     []string
-		ok        bool
-	}{
-		"gitlab default":  {publicURL, []string{`client_id = "x"`}, true},
-		"loopback issuer": {publicURL, []string{`issuer = "http://127.0.0.1:9000"`, `client_id = "x"`}, true},
-		"http issuer":     {publicURL, []string{`issuer = "http://gitlab.example"`, `client_id = "x"`}, false},
-		"no client id":    {publicURL, []string{`client_id = ""`}, false},
-		"no public url":   {"", []string{`client_id = "x"`}, false},
-	} {
-		src := "gateway {\n  " + tc.publicURL + "\n  wireguard {\n    subnet_cidr = \"10.55.0.0/24\"\n    endpoint = \"127.0.0.1:51820\"\n  }\n" +
-			"  dashboard_oidc {\n    " + strings.Join(tc.block, "\n    ") + "\n  }\n}\n"
-		_, diags := config.LoadBytes([]byte(src), "v.hcl")
-		if diags.HasErrors() == tc.ok {
-			t.Errorf("%s: errors = %v", name, diags)
-		}
-		if !tc.ok && !strings.Contains(diags.Error(), "dashboard_oidc") {
-			t.Errorf("%s: rejected for another reason: %v", name, diags)
-		}
 	}
 }
 
@@ -427,17 +527,13 @@ func TestOIDCAccountLinkingRules(t *testing.T) {
 	root := sessionCookieFor(t, w, dashboardRootUsername)
 
 	// One admin cannot link another admin, or root, to an account.
-	for _, target := range []string{dashboardRootUsername, "ada"} {
-		caller := ada
-		if target == "ada" {
-			caller = root
-		}
-		if rw := serveAs(t, h, caller, http.MethodPost, "/api/users/update", `{"username":"`+target+`","oidc_username":"takeover"}`); rw.Code != http.StatusForbidden {
+	for target, caller := range map[string]*http.Cookie{dashboardRootUsername: ada, "ada": root} {
+		if rw := serveAs(t, h, caller, http.MethodPost, "/api/users/update", `{"username":"`+target+`","oidc":{"gitlab":"takeover"}}`); rw.Code != http.StatusForbidden {
 			t.Errorf("linking admin %s = %d, want 403", target, rw.Code)
 		}
 	}
 	// An admin may link their own account, and stays signed in.
-	rw := serveAs(t, h, ada, http.MethodPost, "/api/users/update", `{"username":"ada","oidc_username":"ada-gl"}`)
+	rw := serveAs(t, h, ada, http.MethodPost, "/api/users/update", `{"username":"ada","oidc":{"gitlab":"ada-gl"}}`)
 	if rw.Code != http.StatusOK {
 		t.Fatalf("self link = %d %s", rw.Code, rw.Body.String())
 	}
@@ -446,7 +542,7 @@ func TestOIDCAccountLinkingRules(t *testing.T) {
 	}
 
 	// A refused link leaves no partial change behind.
-	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"alice","role":"admin","oidc_username":"ADA-GL"}`); rw.Code != http.StatusConflict {
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"alice","role":"admin","oidc":{"gitlab":"ADA-GL"}}`); rw.Code != http.StatusConflict {
 		t.Fatalf("link to a taken account = %d, want 409", rw.Code)
 	}
 	if role, _, _ := lookupDashboardUserRole(w.g.db, "alice"); role != dashboardRoleMember {
@@ -454,21 +550,22 @@ func TestOIDCAccountLinkingRules(t *testing.T) {
 	}
 
 	// The database itself refuses a second link to one account.
-	if _, err := w.g.db.Exec(`UPDATE dashboard_users SET oidc_username = 'Ada-GL' WHERE username = 'alice'`); !isUniqueViolation(err) {
+	if _, err := w.g.db.Exec(`INSERT INTO dashboard_user_oidc (provider, username, account) VALUES ('gitlab', 'alice', 'Ada-GL')`); !isUniqueViolation(err) {
 		t.Errorf("duplicate link at the database = %v, want a UNIQUE violation", err)
 	}
 }
 
-func TestOIDCLinkNeedsSSOConfigured(t *testing.T) {
-	w := newUsersTestMux(t)
+func TestOIDCLinkNeedsTheProviderConfigured(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
 	h := w.handler()
 	root := sessionCookieFor(t, w, dashboardRootUsername)
 	for path, body := range map[string]string{
-		"/api/users/create": `{"username":"bob","oidc_username":"bob-gl"}`,
-		"/api/users/update": `{"username":"alice","oidc_username":"alice-gl"}`,
+		"/api/users/create": `{"username":"bob","oidc":{"okta":"bob"}}`,
+		"/api/users/update": `{"username":"alice","oidc":{"okta":"alice"}}`,
 	} {
-		if rw := serveAs(t, h, root, http.MethodPost, path, body); rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "not configured") {
-			t.Errorf("%s without dashboard_oidc = %d %s", path, rw.Code, rw.Body.String())
+		if rw := serveAs(t, h, root, http.MethodPost, path, body); rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "no sign-in provider") {
+			t.Errorf("%s with an unknown provider = %d %s", path, rw.Code, rw.Body.String())
 		}
 	}
 }
@@ -477,10 +574,10 @@ func TestOIDCStartMovesToPublicURLHost(t *testing.T) {
 	f := newFakeOIDC(t)
 	w := newOIDCTestMux(t, f, "")
 	rw := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodGet, oidcStartPath+"?next=/x", nil)
+	req := httptest.NewRequest(http.MethodGet, oidcStartPath("gitlab")+"?next=/x", nil)
 	req.Host = "100.64.0.1:8080"
 	w.handler().ServeHTTP(rw, req)
-	if want := "https://" + oidcTestHost + oidcStartPath + "?next=%2Fx"; rw.Code != http.StatusFound || rw.Header().Get("Location") != want {
+	if want := "https://" + oidcTestHost + oidcStartPath("gitlab") + "?next=%2Fx"; rw.Code != http.StatusFound || rw.Header().Get("Location") != want {
 		t.Fatalf("start on another host = %d → %q, want %q", rw.Code, rw.Header().Get("Location"), want)
 	}
 	for _, c := range rw.Result().Cookies() {
@@ -494,10 +591,61 @@ func TestOIDCIssuerWithTrailingSlash(t *testing.T) {
 	f := newFakeOIDC(t)
 	f.slash = true
 	w := newOIDCTestMux(t, f, "")
-	if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
-		t.Fatal(err)
-	}
-	if got := signedInAs(t, w, oidcSignIn(t, w, f, nil)); got != "alice" {
+	linkAt(t, w, "alice", "gitlab", "alice-gl")
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab", nil)); got != "alice" {
 		t.Fatalf("sign-in with a trailing-slash issuer signed in as %q", got)
+	}
+}
+
+func TestLoginPageOffersOIDCOnlyWhenConfigured(t *testing.T) {
+	plain := newUsersTestMux(t)
+	rw := httptest.NewRecorder()
+	plain.apiDashboardLogin(rw, httptest.NewRequest(http.MethodGet, "/__login?next=/", nil))
+	if strings.Contains(rw.Body.String(), oidcPathPrefix) {
+		t.Fatal("login page offers OIDC without a dashboard_oidc block")
+	}
+}
+
+func TestDashboardOIDCConfigValidation(t *testing.T) {
+	const publicURL = `public_url = "https://gw.example.test"`
+	block := func(name string, attrs ...string) string {
+		return "  dashboard_oidc \"" + name + "\" {\n    " + strings.Join(attrs, "\n    ") + "\n  }\n"
+	}
+	for name, tc := range map[string]struct {
+		publicURL string
+		blocks    string
+		ok        bool
+	}{
+		"gitlab default":    {publicURL, block("gitlab", `client_id = "x"`), true},
+		"two providers":     {publicURL, block("gitlab", `client_id = "x"`) + block("entra", `issuer = "https://login.microsoftonline.com/t/v2.0"`, `client_id = "y"`), true},
+		"loopback issuer":   {publicURL, block("dev", `issuer = "http://127.0.0.1:9000"`, `client_id = "x"`), true},
+		"duplicate name":    {publicURL, block("gitlab", `client_id = "x"`) + block("gitlab", `client_id = "y"`), false},
+		"bad name":          {publicURL, block("Git Lab", `client_id = "x"`), false},
+		"http issuer":       {publicURL, block("gl", `issuer = "http://gitlab.example"`, `client_id = "x"`), false},
+		"no client id":      {publicURL, block("gl", `client_id = ""`), false},
+		"no openid scope":   {publicURL, block("gl", `client_id = "x"`, `scopes = ["profile"]`), false},
+		"bad groups_source": {publicURL, block("gl", `client_id = "x"`, `groups_source = "header"`), false},
+		"bad group_match":   {publicURL, block("gl", `client_id = "x"`, `group_match = "prefix"`), false},
+		"no public url":     {"", block("gl", `client_id = "x"`), false},
+	} {
+		src := "gateway {\n  " + tc.publicURL + "\n  wireguard {\n    subnet_cidr = \"10.55.0.0/24\"\n    endpoint = \"127.0.0.1:51820\"\n  }\n" + tc.blocks + "}\n"
+		_, diags := config.LoadBytes([]byte(src), "v.hcl")
+		if diags.HasErrors() == tc.ok {
+			t.Errorf("%s: errors = %v", name, diags)
+		}
+		if !tc.ok && !strings.Contains(diags.Error(), "dashboard_oidc") {
+			t.Errorf("%s: rejected for another reason: %v", name, diags)
+		}
+	}
+}
+
+func TestOIDCProviderDefaults(t *testing.T) {
+	gitlab := &config.DashboardOIDCBlock{Name: "gitlab"}
+	entra := &config.DashboardOIDCBlock{Name: "entra", Issuer: "https://login.microsoftonline.com/t/v2.0"}
+	if gitlab.GroupsSourceOrDefault() != config.OIDCGroupsFromUserinfo || gitlab.GroupMatchOrDefault() != config.OIDCGroupMatchSubtree || gitlab.Label() != "Sign in with GitLab" {
+		t.Errorf("gitlab.com defaults: %s %s %q", gitlab.GroupsSourceOrDefault(), gitlab.GroupMatchOrDefault(), gitlab.Label())
+	}
+	if entra.GroupsSourceOrDefault() != config.OIDCGroupsFromIDToken || entra.GroupMatchOrDefault() != config.OIDCGroupMatchExact || entra.Label() != "Sign in with entra" {
+		t.Errorf("other-provider defaults: %s %s %q", entra.GroupsSourceOrDefault(), entra.GroupMatchOrDefault(), entra.Label())
 	}
 }

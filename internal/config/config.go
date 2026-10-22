@@ -6,6 +6,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -254,19 +256,22 @@ type GatewaySettings struct {
 	// Both transports may be enabled simultaneously.
 	Tailscale *TailscaleBlock `hcl:"tailscale,block"`
 
-	// DashboardOIDC, if present, adds "Sign in with …" to the
-	// dashboard login page through an OpenID Connect provider such as
-	// GitLab.com. Signing in only reaches a dashboard user an admin
-	// linked to that provider account. Requires public_url.
-	DashboardOIDC *DashboardOIDCBlock `hcl:"dashboard_oidc,block"`
+	// DashboardOIDC lists OpenID Connect providers — GitLab.com, Entra
+	// ID, Keycloak, … — each adding a "Sign in with …" button to the
+	// dashboard login page. A sign-in only reaches a dashboard user an
+	// admin linked to that provider account. Requires public_url.
+	DashboardOIDC []*DashboardOIDCBlock `hcl:"dashboard_oidc,block"`
 }
 
-// DashboardOIDCBlock is the body of the `dashboard_oidc { ... }`
-// sub-block inside `gateway { ... }`.
+// DashboardOIDCBlock is the body of a `dashboard_oidc "<name>" { ... }`
+// sub-block inside `gateway { ... }`. The name identifies the provider
+// in URLs (/__login/oidc/<name>) and in account links.
 type DashboardOIDCBlock struct {
-	// Issuer is the provider's issuer URL; its OpenID configuration is
-	// discovered under /.well-known/openid-configuration. Default
-	// "https://gitlab.com".
+	Name string `hcl:"name,label"`
+
+	// Issuer is the provider's issuer URL, exactly as its discovery
+	// document (<issuer>/.well-known/openid-configuration) spells it.
+	// Default "https://gitlab.com".
 	Issuer string `hcl:"issuer,optional"`
 
 	// ClientID is the provider application's ID. Required.
@@ -277,20 +282,63 @@ type DashboardOIDCBlock struct {
 	// variable NAME rather than keep it in the file.
 	ClientSecret string `hcl:"client_secret,optional"`
 
-	// AllowedGroups, if set, refuses anyone who is not a member of one
-	// of these groups (or of a subgroup of one), read from the
-	// provider's `groups` userinfo claim — GitLab paths such as
-	// "unrcs/dco". Checked before any account lookup.
+	// Scopes requested at sign-in; must include "openid". Default
+	// ["openid", "profile"]; add "email" for providers that only name
+	// users by email (Google).
+	Scopes []string `hcl:"scopes,optional"`
+
+	// UsernameClaim is the claim naming the account an admin links:
+	// read from the ID token, else from userinfo. Default
+	// "preferred_username" (GitLab's username, Entra ID's UPN); use
+	// "email" for Google.
+	UsernameClaim string `hcl:"username_claim,optional"`
+
+	// AllowedGroups, if set, refuses anyone not in one of these groups
+	// before any account lookup.
 	AllowedGroups []string `hcl:"allowed_groups,optional"`
 
+	// GroupsClaim is the claim listing the user's groups. Default
+	// "groups".
+	GroupsClaim string `hcl:"groups_claim,optional"`
+
+	// GroupsSource says where GroupsClaim is read: "userinfo" or
+	// "id_token". Default "userinfo" for GitLab.com, which lists every
+	// group there; else "id_token" (Entra ID, Keycloak, Okta).
+	GroupsSource string `hcl:"groups_source,optional"`
+
+	// GroupMatch is how AllowedGroups match: "subgroups" (a group or
+	// any group under it, GitLab paths such as "unrcs/dco") or "exact"
+	// (Entra ID group object ids). Default "subgroups" for GitLab.com,
+	// else "exact".
+	GroupMatch string `hcl:"group_match,optional"`
+
+	// DisplayName names the provider on the dashboard. Default "GitLab"
+	// for GitLab.com, else the block's name.
+	DisplayName string `hcl:"display_name,optional"`
+
 	// ButtonLabel is the login button's text. Default "Sign in with
-	// GitLab" for gitlab.com, else "Sign in with SSO".
+	// <display name>".
 	ButtonLabel string `hcl:"button_label,optional"`
 }
 
 // DefaultOIDCIssuer is the issuer of a dashboard_oidc block that names
 // none.
 const DefaultOIDCIssuer = "https://gitlab.com"
+
+// Values of DashboardOIDCBlock settings.
+const (
+	OIDCGroupsFromUserinfo = "userinfo"
+	OIDCGroupsFromIDToken  = "id_token"
+	OIDCGroupMatchExact    = "exact"
+	OIDCGroupMatchSubtree  = "subgroups"
+)
+
+var (
+	oidcProviderNameRe     = regexp.MustCompile(`^[a-z][a-z0-9-]{0,31}$`)
+	defaultOIDCScopes      = []string{"openid", "profile"}
+	defaultOIDCUsername    = "preferred_username"
+	defaultOIDCGroupsClaim = "groups"
+)
 
 // IssuerOrDefault returns the configured issuer, exactly as written
 // (a trailing slash is part of some providers' issuer), or GitLab.com.
@@ -301,24 +349,75 @@ func (b *DashboardOIDCBlock) IssuerOrDefault() string {
 	return strings.TrimSpace(b.Issuer)
 }
 
-// ProviderName names the provider in the dashboard: "GitLab" for
-// GitLab.com, else "SSO".
+// IsGitLabCom reports whether the provider is GitLab.com, whose
+// defaults differ (groups from userinfo, matched as paths).
+func (b *DashboardOIDCBlock) IsGitLabCom() bool {
+	return strings.TrimRight(b.IssuerOrDefault(), "/") == DefaultOIDCIssuer
+}
+
+// ProviderName names the provider on the dashboard.
 func (b *DashboardOIDCBlock) ProviderName() string {
-	if strings.TrimRight(b.IssuerOrDefault(), "/") == DefaultOIDCIssuer {
+	switch {
+	case b.DisplayName != "":
+		return b.DisplayName
+	case b.IsGitLabCom():
 		return "GitLab"
 	}
-	return "SSO"
+	return b.Name
 }
 
 // Label returns the login button's text.
 func (b *DashboardOIDCBlock) Label() string {
-	if b == nil {
-		return ""
-	}
 	if b.ButtonLabel != "" {
 		return b.ButtonLabel
 	}
 	return "Sign in with " + b.ProviderName()
+}
+
+// ScopesOrDefault returns the scopes requested at sign-in.
+func (b *DashboardOIDCBlock) ScopesOrDefault() []string {
+	if len(b.Scopes) == 0 {
+		return defaultOIDCScopes
+	}
+	return b.Scopes
+}
+
+// UsernameClaimOrDefault returns the claim naming the linked account.
+func (b *DashboardOIDCBlock) UsernameClaimOrDefault() string {
+	if b.UsernameClaim == "" {
+		return defaultOIDCUsername
+	}
+	return b.UsernameClaim
+}
+
+// GroupsClaimOrDefault returns the claim listing the user's groups.
+func (b *DashboardOIDCBlock) GroupsClaimOrDefault() string {
+	if b.GroupsClaim == "" {
+		return defaultOIDCGroupsClaim
+	}
+	return b.GroupsClaim
+}
+
+// GroupsSourceOrDefault returns where the groups claim is read.
+func (b *DashboardOIDCBlock) GroupsSourceOrDefault() string {
+	switch {
+	case b.GroupsSource != "":
+		return b.GroupsSource
+	case b.IsGitLabCom():
+		return OIDCGroupsFromUserinfo
+	}
+	return OIDCGroupsFromIDToken
+}
+
+// GroupMatchOrDefault returns how allowed groups match.
+func (b *DashboardOIDCBlock) GroupMatchOrDefault() string {
+	switch {
+	case b.GroupMatch != "":
+		return b.GroupMatch
+	case b.IsGitLabCom():
+		return OIDCGroupMatchSubtree
+	}
+	return OIDCGroupMatchExact
 }
 
 // GenAITelemetryBlock is the body of the `genai_telemetry { ... }`
@@ -623,8 +722,22 @@ func (g *Gateway) SessionKeep() string { return g.settings().SessionKeep }
 // ActionsKeep returns the raw global actions-retention string, or empty.
 func (g *Gateway) ActionsKeep() string { return g.settings().ActionsKeep }
 
-// DashboardOIDC returns the dashboard_oidc block, or nil.
-func (g *Gateway) DashboardOIDC() *DashboardOIDCBlock { return g.settings().DashboardOIDC }
+// DashboardOIDCProviders returns the dashboard_oidc blocks, in
+// declaration order.
+func (g *Gateway) DashboardOIDCProviders() []*DashboardOIDCBlock {
+	return g.settings().DashboardOIDC
+}
+
+// DashboardOIDCProvider returns the dashboard_oidc block named name,
+// or nil.
+func (g *Gateway) DashboardOIDCProvider(name string) *DashboardOIDCBlock {
+	for _, b := range g.settings().DashboardOIDC {
+		if b.Name == name {
+			return b
+		}
+	}
+	return nil
+}
 
 // DashboardAuditKeep returns the raw dashboard-audit retention string,
 // or empty.
@@ -1344,31 +1457,49 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 	return diags
 }
 
-// validateDashboardOIDC checks the dashboard_oidc block: an https
-// issuer (http only for a loopback provider), a client ID, and the
-// public_url its callback lives under.
+// validateDashboardOIDC checks every dashboard_oidc block: a unique
+// name usable in URLs, an https issuer (http only for a loopback
+// provider), a client ID, scopes with "openid", known enum values, and
+// the public_url the callbacks live under.
 func validateDashboardOIDC(s *GatewaySettings) hcl.Diagnostics {
-	b := s.DashboardOIDC
-	if b == nil {
-		return nil
+	var diags hcl.Diagnostics
+	bad := func(name, detail string) {
+		diags = append(diags, &hcl.Diagnostic{Severity: hcl.DiagError,
+			Summary: fmt.Sprintf("Invalid dashboard_oidc %q block", name), Detail: detail})
 	}
-	bad := func(detail string) hcl.Diagnostics {
-		return hcl.Diagnostics{{Severity: hcl.DiagError, Summary: "Invalid dashboard_oidc block", Detail: detail}}
+	seen := map[string]bool{}
+	for _, b := range s.DashboardOIDC {
+		if !oidcProviderNameRe.MatchString(b.Name) {
+			bad(b.Name, "the name must be lowercase letters, digits and dashes, starting with a letter: it appears in /__login/oidc/<name>.")
+			continue
+		}
+		if seen[b.Name] {
+			bad(b.Name, "a dashboard_oidc block of this name is declared twice.")
+		}
+		seen[b.Name] = true
+		u, err := url.Parse(b.IssuerOrDefault())
+		if err != nil || u.Host == "" {
+			bad(b.Name, fmt.Sprintf("issuer %q is not a URL.", b.Issuer))
+		} else if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
+			bad(b.Name, fmt.Sprintf("issuer %q must use https.", b.Issuer))
+		}
+		if strings.TrimSpace(b.ClientID) == "" {
+			bad(b.Name, "client_id is required.")
+		}
+		if len(b.Scopes) > 0 && !slices.Contains(b.Scopes, "openid") {
+			bad(b.Name, `scopes must include "openid".`)
+		}
+		if v := b.GroupsSource; v != "" && v != OIDCGroupsFromUserinfo && v != OIDCGroupsFromIDToken {
+			bad(b.Name, `groups_source must be "userinfo" or "id_token".`)
+		}
+		if v := b.GroupMatch; v != "" && v != OIDCGroupMatchExact && v != OIDCGroupMatchSubtree {
+			bad(b.Name, `group_match must be "exact" or "subgroups".`)
+		}
 	}
-	u, err := url.Parse(b.IssuerOrDefault())
-	if err != nil || u.Host == "" {
-		return bad(fmt.Sprintf("issuer %q is not a URL.", b.Issuer))
+	if len(s.DashboardOIDC) > 0 && s.PublicURL == "" {
+		bad("", "dashboard_oidc needs gateway.public_url: providers redirect back to <public_url>/__login/oidc/<name>/callback.")
 	}
-	if u.Scheme != "https" && !(u.Scheme == "http" && isLoopbackHost(u.Hostname())) {
-		return bad(fmt.Sprintf("issuer %q must use https.", b.Issuer))
-	}
-	if strings.TrimSpace(b.ClientID) == "" {
-		return bad("client_id is required.")
-	}
-	if s.PublicURL == "" {
-		return bad("dashboard_oidc needs gateway.public_url: the provider redirects back to <public_url>/__login/oidc/callback.")
-	}
-	return nil
+	return diags
 }
 
 func isLoopbackHost(host string) bool {

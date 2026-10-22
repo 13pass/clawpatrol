@@ -141,50 +141,71 @@ clawpatrol gateway --set-dashboard-password '<password>' gateway.hcl
 clawpatrol gateway --reset-dashboard-password gateway.hcl
 ```
 
-### Sign in with GitLab (or another OpenID Connect provider)
+### Sign in with GitLab, Entra ID or another OpenID Connect provider
 
-Dashboard users can sign in with their GitLab.com account instead of a
-password. Only users an admin has linked get in.
+Dashboard users can sign in through one or more OpenID Connect
+providers instead of a password — each `dashboard_oidc "<name>"` block
+adds a button to the login page. Only users an admin has linked get in.
 
-1. Register an application on GitLab.com — under your group's
-   **Settings → Applications** (or **User settings → Applications**):
-   - **Redirect URI**: `<public_url>/__login/oidc/callback`, e.g.
-     `https://gw.example.com/__login/oidc/callback`;
-   - **Confidential**: checked;
-   - **Scopes**: `openid` and `profile`.
-2. Put the application secret in the gateway's environment, e.g.
+1. Register an application at each provider:
+   - **GitLab.com** — your group's **Settings → Applications**:
+     confidential, scopes `openid` and `profile`;
+   - **Entra ID** — **App registrations → New registration**, a client
+     secret under **Certificates & secrets**, and for group checks the
+     `groups` claim under **Token configuration**.
+
+   The **redirect URI** is `<public_url>/__login/oidc/<name>/callback`,
+   with the block's name: e.g.
+   `https://gw.example.com/__login/oidc/gitlab/callback`.
+2. Put each application secret in the gateway's environment, e.g.
    `GITLAB_OIDC_SECRET=…` in the systemd unit's environment file.
-3. Add the block to `gateway {}` (`public_url` is required):
+3. Add a block per provider to `gateway {}` (`public_url` is required):
 
    ```hcl
    gateway {
      public_url = "https://gw.example.com"
      # ...
-     dashboard_oidc {
+     dashboard_oidc "gitlab" {
        client_id      = "<GitLab application ID>"
        client_secret  = "{{secret:GITLAB_OIDC_SECRET}}"
-       allowed_groups = ["my-group"]   # optional: members of this group or its subgroups only
+       allowed_groups = ["my-group"]   # optional: this group or its subgroups
+     }
+
+     dashboard_oidc "entra" {
+       issuer         = "https://login.microsoftonline.com/<tenant id>/v2.0"
+       client_id      = "<Entra application (client) ID>"
+       client_secret  = "{{secret:ENTRA_OIDC_SECRET}}"
+       display_name   = "Entra ID"
+       allowed_groups = ["<group object id>"]   # optional
      }
    }
    ```
 
-   `issuer` defaults to `https://gitlab.com`; set it for a
-   self-managed GitLab or any other OpenID Connect provider, exactly
-   as the provider's discovery document spells it (some end in `/`).
-4. On the dashboard's **Users** page, create the user with their
-   GitLab username (the password may then be left empty), or link an
-   existing user with **Link GitLab**.
+   | Setting | Default | Notes |
+   |---|---|---|
+   | `issuer` | `https://gitlab.com` | Exactly as the provider's discovery document spells it (some end in `/`). Entra ID: a tenant id, not `common`. |
+   | `scopes` | `["openid", "profile"]` | Must include `openid`; add `email` for Google. |
+   | `username_claim` | `preferred_username` | The claim an admin links: a GitLab username, an Entra ID UPN. Use `email` for Google. Read from the ID token, else userinfo. |
+   | `groups_claim` | `groups` | |
+   | `groups_source` | `userinfo` for GitLab.com, else `id_token` | Where the groups claim is read. |
+   | `group_match` | `subgroups` for GitLab.com, else `exact` | `subgroups` matches GitLab paths and anything under them; `exact` matches ids such as Entra ID group object ids. |
+   | `display_name` | `GitLab` for GitLab.com, else the block's name | |
+   | `button_label` | `Sign in with <display name>` | |
 
-The login page then shows **Sign in with GitLab**. The first sign-in
-as a linked username binds that GitLab account's permanent id; from
-then on the id decides, so renaming the GitLab account keeps access
-and a recycled username gets none. To point a user at a different
-GitLab account, change the link: that unbinds the old id and ends the
-user's sessions. An admin can link members, and their own account;
-another admin's — or `root`'s — only that admin can link. Keep `root`
-on a password as the break-glass account: removing the
-`dashboard_oidc` block later leaves users without a password unable to
-sign in until an admin gives them one.
+4. On the dashboard's **Users** page, link each user's account at the
+   providers they use — a GitLab username, an Entra ID UPN — when
+   creating them (the password may then be left empty) or with **Link**
+   on their row. A user may be linked at several providers.
+
+The first sign-in as a linked account binds that provider account's
+permanent id; from then on the id decides, so renaming the account
+keeps access and a recycled name gets none. To point a user at a
+different account, change the link: that unbinds the old id and ends
+the user's sessions. An admin can link members, and their own
+accounts; another admin's — or `root`'s — only that admin can link.
+Keep `root` on a password as the break-glass account: removing a
+`dashboard_oidc` block later leaves users who signed in only through
+it unable to sign in until an admin gives them a password.
 
 ### Where to bind the dashboard
 

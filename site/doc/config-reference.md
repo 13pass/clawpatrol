@@ -55,7 +55,7 @@ The gateway block carries operational settings — listen addresses, the WireGua
 | `genai_telemetry` | `block` | no | GenAITelemetry, if present, enables export of OpenTelemetry GenAI semantic-convention spans (gen_ai.*) for intercepted LLM requests. Requires the OTLP exporter to be configured (OTEL_EXPORTER_OTLP_ENDPOINT); without it there is nothing to export to. The block is opt-in: when absent, no gen_ai.* spans are emitted and there is no added per-request overhead. |
 | `wireguard` | `block` | no | WireGuard, if present, enables the embedded userspace WireGuard server. Required block when running WG-mode deployments. |
 | `tailscale` | `block` | no | Tailscale, if present, enables the embedded tsnet node and the Tailscale control plane (OAuth key minting, exit-node routing). Both transports may be enabled simultaneously. |
-| `dashboard_oidc` | `block` | no | DashboardOIDC, if present, adds "Sign in with …" to the dashboard login page through an OpenID Connect provider such as GitLab.com. Signing in only reaches a dashboard user an admin linked to that provider account. Requires public_url. |
+| `dashboard_oidc` | `block` | no | Lists OpenID Connect providers — GitLab.com, Entra ID, Keycloak, … — each adding a "Sign in with …" button to the dashboard login page. A sign-in only reaches a dashboard user an admin linked to that provider account. Requires public_url. |
 
 **Nested block `limits {}`:**
 
@@ -122,16 +122,23 @@ inside `gateway { ... }`. Presence of the block enables tsnet.
 
 **Nested block `dashboard_oidc {}`:**
 
-The body of the `dashboard_oidc { ... }`
-sub-block inside `gateway { ... }`.
+The body of a `dashboard_oidc "<name>" { ... }`
+sub-block inside `gateway { ... }`. The name identifies the provider
+in URLs (/__login/oidc/<name>) and in account links.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `issuer` | `string` | no | The provider's issuer URL; its OpenID configuration is discovered under /.well-known/openid-configuration. Default "https://gitlab.com". |
+| `issuer` | `string` | no | The provider's issuer URL, exactly as its discovery document (<issuer>/.well-known/openid-configuration) spells it. Default "https://gitlab.com". |
 | `client_id` | `string` | yes | The provider application's ID. Required. |
 | `client_secret` | `string` | no | The application's secret. Write it as "{{secret:NAME}}" to read it from the gateway's environment variable NAME rather than keep it in the file. |
-| `allowed_groups` | `[]string` | no | AllowedGroups, if set, refuses anyone who is not a member of one of these groups (or of a subgroup of one), read from the provider's `groups` userinfo claim — GitLab paths such as "unrcs/dco". Checked before any account lookup. |
-| `button_label` | `string` | no | The login button's text. Default "Sign in with GitLab" for gitlab.com, else "Sign in with SSO". |
+| `scopes` | `[]string` | no | Requested at sign-in; must include "openid". Default ["openid", "profile"]; add "email" for providers that only name users by email (Google). |
+| `username_claim` | `string` | no | The claim naming the account an admin links: read from the ID token, else from userinfo. Default "preferred_username" (GitLab's username, Entra ID's UPN); use "email" for Google. |
+| `allowed_groups` | `[]string` | no | AllowedGroups, if set, refuses anyone not in one of these groups before any account lookup. |
+| `groups_claim` | `string` | no | The claim listing the user's groups. Default "groups". |
+| `groups_source` | `string` | no | Says where GroupsClaim is read: "userinfo" or "id_token". Default "userinfo" for GitLab.com, which lists every group there; else "id_token" (Entra ID, Keycloak, Okta). |
+| `group_match` | `string` | no | How AllowedGroups match: "subgroups" (a group or any group under it, GitLab paths such as "unrcs/dco") or "exact" (Entra ID group object ids). Default "subgroups" for GitLab.com, else "exact". |
+| `display_name` | `string` | no | Names the provider on the dashboard. Default "GitLab" for GitLab.com, else the block's name. |
+| `button_label` | `string` | no | The login button's text. Default "Sign in with <display name>". |
 
 ## `profile "<name>" { ... }`
 

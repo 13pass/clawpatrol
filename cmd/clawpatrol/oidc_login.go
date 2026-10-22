@@ -25,22 +25,26 @@ import (
 	"golang.org/x/oauth2"
 )
 
-// Dashboard sign-in through an OpenID Connect provider (GitLab.com by
-// default; see gateway.dashboard_oidc). The flow is the authorization
-// code flow with PKCE: /__login/oidc redirects to the provider, which
-// redirects back to /__login/oidc/callback. A sign-in only reaches a
-// dashboard user an admin linked to the provider account.
+// Dashboard sign-in through OpenID Connect providers — one per
+// gateway.dashboard_oidc "<name>" block (GitLab.com, Entra ID, …). The
+// flow is the authorization code flow with PKCE: /__login/oidc/<name>
+// redirects to the provider, which redirects back to
+// /__login/oidc/<name>/callback. A sign-in only reaches a dashboard
+// user an admin linked to that provider account.
 
 const (
-	oidcStartPath    = "/__login/oidc"
-	oidcCallbackPath = "/__login/oidc/callback"
+	// oidcPathPrefix is followed by "<provider>" (start) or
+	// "<provider>/callback".
+	oidcPathPrefix     = "/__login/oidc/"
+	oidcCallbackSuffix = "/callback"
 	// oidcStateCookie carries a sign-in in progress — state, nonce,
 	// PKCE verifier and where to go after — signed with a key that
 	// never leaves the gateway. Holding it in the browser binds the
 	// callback to the browser that started the sign-in, and leaves no
-	// server-side table a stranger could fill.
+	// server-side table a stranger could fill. Its path is the
+	// provider's, so sign-ins at two providers do not clash.
 	oidcStateCookie = "cp_oidc_state"
-	// auditKindOIDC marks sign-ins through the provider in the audit log.
+	// auditKindOIDC marks sign-ins through a provider in the audit log.
 	auditKindOIDC = "oidc"
 
 	oidcPendingTTL      = 10 * time.Minute
@@ -53,6 +57,9 @@ const (
 )
 
 var oidcSignatureAlgorithms = []jose.SignatureAlgorithm{jose.RS256, jose.ES256}
+
+func oidcStartPath(provider string) string    { return oidcPathPrefix + provider }
+func oidcCallbackPath(provider string) string { return oidcPathPrefix + provider + oidcCallbackSuffix }
 
 // oidcProvider is a provider's discovered configuration and keys.
 type oidcProvider struct {
@@ -69,6 +76,7 @@ type oidcProvider struct {
 
 // oidcPending is a sign-in in progress, carried in oidcStateCookie.
 type oidcPending struct {
+	Provider string `json:"p"`
 	State    string `json:"s"`
 	Nonce    string `json:"n"`
 	Verifier string `json:"v"`
@@ -84,7 +92,7 @@ type oidcState struct {
 	// cookieKey signs oidcStateCookie. Random per process: a restart
 	// only voids sign-ins in progress.
 	cookieKey []byte
-	// client is the HTTP client used to talk to the provider; tests
+	// client is the HTTP client used to talk to providers; tests
 	// replace it.
 	client *http.Client
 }
@@ -103,10 +111,10 @@ func (g *Gateway) oidc() *oidcState {
 	return g.oidcState
 }
 
-func (s *oidcState) sign(payload []byte) string {
-	mac := hmac.New(sha256.New, s.cookieKey)
-	mac.Write(payload)
-	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+func (s *oidcState) mac(payload []byte) []byte {
+	m := hmac.New(sha256.New, s.cookieKey)
+	m.Write(payload)
+	return m.Sum(nil)
 }
 
 func (s *oidcState) sealPending(p oidcPending) (string, error) {
@@ -114,7 +122,7 @@ func (s *oidcState) sealPending(p oidcPending) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return s.sign(payload), nil
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(s.mac(payload)), nil
 }
 
 // openPending verifies and decodes a sign-in cookie; a forged,
@@ -127,12 +135,7 @@ func (s *oidcState) openPending(cookie string) (oidcPending, bool) {
 	}
 	payload, err1 := base64.RawURLEncoding.DecodeString(body)
 	got, err2 := base64.RawURLEncoding.DecodeString(sig)
-	if err1 != nil || err2 != nil {
-		return p, false
-	}
-	mac := hmac.New(sha256.New, s.cookieKey)
-	mac.Write(payload)
-	if !hmac.Equal(got, mac.Sum(nil)) {
+	if err1 != nil || err2 != nil || !hmac.Equal(got, s.mac(payload)) {
 		return p, false
 	}
 	if json.Unmarshal(payload, &p) != nil || time.Now().Unix() > p.Expires {
@@ -228,29 +231,43 @@ func (w *webMux) oidcOAuthConfig(b *config.DashboardOIDCBlock, p *oidcProvider) 
 		ClientID:     b.ClientID,
 		ClientSecret: resolveTemplate(b.ClientSecret),
 		Endpoint:     oauth2.Endpoint{AuthURL: p.AuthURL, TokenURL: p.TokenURL},
-		RedirectURL:  strings.TrimRight(w.g.cfg.Load().PublicURL(), "/") + oidcCallbackPath,
-		Scopes:       []string{"openid", "profile"},
+		RedirectURL:  strings.TrimRight(w.g.cfg.Load().PublicURL(), "/") + oidcCallbackPath(b.Name),
+		Scopes:       b.ScopesOrDefault(),
 	}
 }
 
-// apiOIDCStart begins a sign-in: GET /__login/oidc?next=...
-func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
-	b := w.g.cfg.Load().DashboardOIDC()
-	if b == nil {
+// apiOIDC serves /__login/oidc/<provider>[/callback].
+func (w *webMux) apiOIDC(rw http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(rw, http.MethodGet, http.StatusMethodNotAllowed)
+		return
+	}
+	rest := strings.TrimPrefix(r.URL.Path, oidcPathPrefix)
+	name, callback := strings.CutSuffix(rest, oidcCallbackSuffix)
+	b := w.g.cfg.Load().DashboardOIDCProvider(name)
+	if b == nil || strings.Contains(name, "/") {
 		http.NotFound(rw, r)
 		return
 	}
+	if callback {
+		w.oidcCallback(rw, r, b)
+		return
+	}
+	w.oidcStart(rw, r, b)
+}
+
+func (w *webMux) oidcStart(rw http.ResponseWriter, r *http.Request, b *config.DashboardOIDCBlock) {
 	next := safeDashboardLoginNext(r.URL.Query().Get("next"))
 	// The provider returns to public_url, so the sign-in cookie must be
 	// set there: start over on that host when this one is another.
 	if pu, err := url.Parse(w.g.cfg.Load().PublicURL()); err == nil && pu.Host != "" && !strings.EqualFold(pu.Host, r.Host) {
-		http.Redirect(rw, r, strings.TrimRight(pu.String(), "/")+oidcStartPath+"?next="+url.QueryEscape(next), http.StatusFound)
+		http.Redirect(rw, r, strings.TrimRight(pu.String(), "/")+oidcStartPath(b.Name)+"?next="+url.QueryEscape(next), http.StatusFound)
 		return
 	}
 	st := w.g.oidc()
 	p, err := st.provider(r.Context(), b.IssuerOrDefault())
 	if err != nil {
-		log.Printf("dashboard oidc: %v", err)
+		log.Printf("dashboard oidc %s: %v", b.Name, err)
 		w.renderLogin(rw, next, "the sign-in provider is unreachable; try again or use a password", false, http.StatusBadGateway)
 		return
 	}
@@ -261,8 +278,8 @@ func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
-	sealed, err := st.sealPending(oidcPending{State: state, Nonce: nonce, Verifier: verifier, Next: next,
-		Expires: time.Now().Add(oidcPendingTTL).Unix()})
+	sealed, err := st.sealPending(oidcPending{Provider: b.Name, State: state, Nonce: nonce, Verifier: verifier,
+		Next: next, Expires: time.Now().Add(oidcPendingTTL).Unix()})
 	if err != nil {
 		http.Error(rw, "could not start sign-in", http.StatusInternalServerError)
 		return
@@ -270,7 +287,7 @@ func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
 	http.SetCookie(rw, &http.Cookie{
 		Name:     oidcStateCookie,
 		Value:    sealed,
-		Path:     oidcStartPath,
+		Path:     oidcStartPath(b.Name),
 		HttpOnly: true,
 		Secure:   strings.HasPrefix(w.g.cfg.Load().PublicURL(), "https://"),
 		// Lax: the provider's redirect back is a top-level GET, which
@@ -283,33 +300,22 @@ func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
 	http.Redirect(rw, r, url, http.StatusFound)
 }
 
-type oidcIDClaims struct {
-	Nonce             string `json:"nonce"`
-	PreferredUsername string `json:"preferred_username"`
-	Nickname          string `json:"nickname"`
-}
-
-// apiOIDCCallback completes a sign-in: GET /__login/oidc/callback.
-func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
-	b := w.g.cfg.Load().DashboardOIDC()
-	if b == nil {
-		http.NotFound(rw, r)
-		return
-	}
+func (w *webMux) oidcCallback(rw http.ResponseWriter, r *http.Request, b *config.DashboardOIDCBlock) {
 	q := r.URL.Query()
-	http.SetCookie(rw, &http.Cookie{Name: oidcStateCookie, Value: "", Path: oidcStartPath, HttpOnly: true, MaxAge: -1})
+	http.SetCookie(rw, &http.Cookie{Name: oidcStateCookie, Value: "", Path: oidcStartPath(b.Name), HttpOnly: true, MaxAge: -1})
 	st := w.g.oidc()
 	var pending oidcPending
 	var opened bool
 	if c, err := r.Cookie(oidcStateCookie); err == nil {
 		pending, opened = st.openPending(c.Value)
 	}
+	opened = opened && pending.Provider == b.Name
 	next := "/"
 	if opened {
 		next = pending.Next
 	}
 	fail := func(status int, msg, auditUser string) {
-		w.recordAudit(r, auditUsername(auditUser), auditKindOIDC, "login oidc", status)
+		w.recordAudit(r, auditUsername(auditUser), auditKindOIDC, "login oidc "+b.Name, status)
 		w.renderLogin(rw, next, msg, false, status)
 	}
 	if e := q.Get("error"); e != "" {
@@ -324,41 +330,42 @@ func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
 	issuer := b.IssuerOrDefault()
 	p, err := st.provider(r.Context(), issuer)
 	if err != nil {
-		log.Printf("dashboard oidc: %v", err)
+		log.Printf("dashboard oidc %s: %v", b.Name, err)
 		fail(http.StatusBadGateway, "the sign-in provider is unreachable; try again", "")
 		return
 	}
 	ctx := context.WithValue(r.Context(), oauth2.HTTPClient, st.client)
 	tok, err := w.oidcOAuthConfig(b, p).Exchange(ctx, q.Get("code"), oauth2.VerifierOption(pending.Verifier))
 	if err != nil {
-		log.Printf("dashboard oidc: code exchange: %v", err)
+		log.Printf("dashboard oidc %s: code exchange: %v", b.Name, err)
 		fail(http.StatusUnauthorized, "the sign-in could not be completed; start again", "")
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
-	subject, claims, err := w.verifyOIDCIDToken(ctx, st, p, b.ClientID, rawID, pending.Nonce)
+	subject, idClaims, err := w.verifyOIDCIDToken(ctx, st, p, b.ClientID, rawID, pending.Nonce)
 	if err != nil {
-		log.Printf("dashboard oidc: id token: %v", err)
+		log.Printf("dashboard oidc %s: id token: %v", b.Name, err)
 		fail(http.StatusUnauthorized, "the sign-in could not be verified; start again", "")
 		return
 	}
-	providerUser := claims.PreferredUsername
-	if providerUser == "" {
-		providerUser = claims.Nickname
+	userinfo := oidcUserinfo{st: st, p: p, token: tok.AccessToken, subject: subject}
+	account, err := oidcClaimString(ctx, b.UsernameClaimOrDefault(), idClaims, &userinfo)
+	if err != nil {
+		log.Printf("dashboard oidc %s: username: %v", b.Name, err)
 	}
 	if len(b.AllowedGroups) > 0 {
-		member, err := w.oidcInAllowedGroups(ctx, st, p, tok.AccessToken, subject, b.AllowedGroups)
+		member, err := oidcInAllowedGroups(ctx, b, idClaims, &userinfo)
 		if err != nil {
-			log.Printf("dashboard oidc: groups: %v", err)
+			log.Printf("dashboard oidc %s: groups: %v", b.Name, err)
 		}
 		if !member {
-			fail(http.StatusForbidden, "your account is not in a group allowed to use this dashboard", "@"+providerUser)
+			fail(http.StatusForbidden, "your account is not in a group allowed to use this dashboard", "@"+account)
 			return
 		}
 	}
-	username, err := dashboardUserForOIDC(w.g.db, issuer+"|"+subject, providerUser)
+	username, err := dashboardUserForOIDC(w.g.db, b.Name, issuer+"|"+subject, account)
 	if errors.Is(err, errOIDCUnlinked) {
-		fail(http.StatusForbidden, fmt.Sprintf("no dashboard user is linked to @%s; ask an admin to link it", providerUser), "@"+providerUser)
+		fail(http.StatusForbidden, fmt.Sprintf("no dashboard user is linked to %s account %s; ask an admin to link it", b.ProviderName(), account), "@"+account)
 		return
 	}
 	if err != nil {
@@ -369,15 +376,15 @@ func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "could not mint session", http.StatusInternalServerError)
 		return
 	}
-	w.recordAudit(r, username, auditKindOIDC, "login oidc", http.StatusFound)
+	w.recordAudit(r, username, auditKindOIDC, "login oidc "+b.Name, http.StatusFound)
 	http.Redirect(rw, r, pending.Next, http.StatusFound)
 }
 
 // verifyOIDCIDToken checks an ID token's signature against the
 // provider's keys, then its issuer, audience, expiry and nonce, and
-// returns its subject.
-func (w *webMux) verifyOIDCIDToken(ctx context.Context, st *oidcState, p *oidcProvider, clientID, raw, nonce string) (string, oidcIDClaims, error) {
-	var claims oidcIDClaims
+// returns its subject and all its claims.
+func (w *webMux) verifyOIDCIDToken(ctx context.Context, st *oidcState, p *oidcProvider, clientID, raw, nonce string) (string, map[string]any, error) {
+	claims := map[string]any{}
 	if raw == "" {
 		return "", claims, errors.New("token response has no id_token")
 	}
@@ -406,7 +413,8 @@ func (w *webMux) verifyOIDCIDToken(ctx context.Context, st *oidcState, p *oidcPr
 	if std.Expiry == nil {
 		return "", claims, errors.New("id_token has no expiry")
 	}
-	if subtle.ConstantTimeCompare([]byte(claims.Nonce), []byte(nonce)) != 1 {
+	got, _ := claims["nonce"].(string)
+	if subtle.ConstantTimeCompare([]byte(got), []byte(nonce)) != 1 {
 		return "", claims, errors.New("id_token nonce does not match this sign-in")
 	}
 	if std.Subject == "" {
@@ -415,30 +423,95 @@ func (w *webMux) verifyOIDCIDToken(ctx context.Context, st *oidcState, p *oidcPr
 	return std.Subject, claims, nil
 }
 
-// oidcInAllowedGroups reads the userinfo `groups` claim — GitLab lists
-// every group the user belongs to, directly or through a parent — and
-// reports whether one is an allowed group or inside one.
-func (w *webMux) oidcInAllowedGroups(ctx context.Context, st *oidcState, p *oidcProvider, accessToken, subject string, allowed []string) (bool, error) {
-	if p.UserinfoURL == "" {
-		return false, errors.New("provider has no userinfo endpoint")
+// oidcUserinfo fetches the userinfo claims once, on first need, and
+// only for the subject the ID token names.
+type oidcUserinfo struct {
+	st      *oidcState
+	p       *oidcProvider
+	token   string
+	subject string
+	claims  map[string]any
+	err     error
+	fetched bool
+}
+
+func (u *oidcUserinfo) get(ctx context.Context) (map[string]any, error) {
+	if u.fetched {
+		return u.claims, u.err
 	}
-	var info struct {
-		Sub    string   `json:"sub"`
-		Groups []string `json:"groups"`
+	u.fetched = true
+	if u.p.UserinfoURL == "" {
+		u.err = errors.New("provider has no userinfo endpoint")
+		return nil, u.err
 	}
-	if err := st.getJSON(ctx, p.UserinfoURL, accessToken, &info); err != nil {
-		return false, err
+	if err := u.st.getJSON(ctx, u.p.UserinfoURL, u.token, &u.claims); err != nil {
+		u.err = err
+		return nil, err
 	}
-	if info.Sub != subject {
-		return false, errors.New("userinfo subject differs from the id_token's")
+	if sub, _ := u.claims["sub"].(string); sub != u.subject {
+		u.claims, u.err = nil, errors.New("userinfo subject differs from the id_token's")
 	}
-	for _, g := range info.Groups {
-		for _, a := range allowed {
-			a = strings.Trim(a, "/")
-			if strings.EqualFold(g, a) || strings.HasPrefix(strings.ToLower(g), strings.ToLower(a)+"/") {
+	return u.claims, u.err
+}
+
+// oidcClaimString reads a string claim from the ID token, else from
+// userinfo.
+func oidcClaimString(ctx context.Context, claim string, idClaims map[string]any, userinfo *oidcUserinfo) (string, error) {
+	if v, ok := idClaims[claim].(string); ok && v != "" {
+		return v, nil
+	}
+	info, err := userinfo.get(ctx)
+	if err != nil {
+		return "", err
+	}
+	if v, ok := info[claim].(string); ok && v != "" {
+		return v, nil
+	}
+	return "", fmt.Errorf("no %q claim", claim)
+}
+
+// oidcInAllowedGroups reports whether the user is in an allowed group,
+// reading the groups claim from where the provider puts it and
+// matching as the provider names groups: GitLab paths (a group or one
+// under it) or opaque ids (exact).
+func oidcInAllowedGroups(ctx context.Context, b *config.DashboardOIDCBlock, idClaims map[string]any, userinfo *oidcUserinfo) (bool, error) {
+	source := idClaims
+	if b.GroupsSourceOrDefault() == config.OIDCGroupsFromUserinfo {
+		info, err := userinfo.get(ctx)
+		if err != nil {
+			return false, err
+		}
+		source = info
+	}
+	subtree := b.GroupMatchOrDefault() == config.OIDCGroupMatchSubtree
+	for _, g := range claimStrings(source[b.GroupsClaimOrDefault()]) {
+		for _, a := range b.AllowedGroups {
+			if subtree {
+				a = strings.Trim(a, "/")
+				if strings.EqualFold(g, a) || strings.HasPrefix(strings.ToLower(g), strings.ToLower(a)+"/") {
+					return true, nil
+				}
+			} else if strings.EqualFold(g, a) {
 				return true, nil
 			}
 		}
 	}
 	return false, nil
+}
+
+// claimStrings reads a claim holding one string or a list of them.
+func claimStrings(v any) []string {
+	switch t := v.(type) {
+	case string:
+		return []string{t}
+	case []any:
+		out := make([]string, 0, len(t))
+		for _, e := range t {
+			if s, ok := e.(string); ok {
+				out = append(out, s)
+			}
+		}
+		return out
+	}
+	return nil
 }
