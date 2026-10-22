@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"testing"
@@ -305,5 +307,71 @@ func TestMemberRoutesAreReviewed(t *testing.T) {
 	sort.Strings(reviewed)
 	if strings.Join(got, "\n") != strings.Join(reviewed, "\n") {
 		t.Fatalf("member routes changed; review each new one, then update this list.\ngot:\n%s", strings.Join(got, "\n"))
+	}
+}
+
+// TestCredentialGuardFailsClosedOnAmbiguousRequests replays requests
+// that name one credential to the guard and another to the handler.
+func TestCredentialGuardFailsClosedOnAmbiguousRequests(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	env.w.sessions = map[string]*oauthSession{
+		"root-state":  {id: "gl", state: "root-state", owner: dashboardRootUsername, created: time.Now()},
+		"alice-state": {id: "sentry-a", state: "alice-state", owner: "alice", created: time.Now()},
+	}
+	for name, tc := range map[string]struct{ path, body string }{
+		"tailscale connect, query vs body":    {"/api/tailscale/connect?id=gl", `{"id":"sentry-a"}`},
+		"tailscale disconnect, query vs body": {"/api/tailscale/disconnect?id=gl", `{"id":"sentry-a"}`},
+		"oauth start, query vs body":          {"/api/oauth/start?id=gl", `{"id":"sentry-a"}`},
+		"set, trailing data":                  {"/api/credentials/set?id=sentry-a", `{"id":"gl","slots":{}} x`},
+		"clear, mixed-case keys":              {"/api/credentials/clear", `{"ID":"gl","id":"sentry-a"}`},
+		"device poll, query vs body":          {"/api/oauth/device-poll?state=root-state", `{"state":"alice-state"}`},
+		"exchange, unknown state":             {"/api/oauth/exchange", `{"state":"nope","code":"c"}`},
+		"set, no id at all":                   {"/api/credentials/set", `{"slots":{}}`},
+	} {
+		if rw := serveAs(t, env.h, env.alice, http.MethodPost, tc.path, tc.body); rw.Code != http.StatusForbidden {
+			t.Errorf("%s = %d %s, want 403", name, rw.Code, rw.Body.String())
+		}
+	}
+}
+
+func TestApproverCredentialsStayWithAdmins(t *testing.T) {
+	dir := t.TempDir()
+	src := scopedRuleTestConfig + `
+credential "slack_tokens" "team-a-slack" {}
+approver "human_approver" "team-a-chat" {
+  channel    = "#team-a"
+  credential = slack_tokens.team-a-slack
+}
+`
+	src = strings.Replace(src, `profile "team-a" { credentials = [bearer_token.gl] }`,
+		`profile "team-a" { credentials = [bearer_token.gl, slack_tokens.team-a-slack] }`, 1)
+	if err := os.WriteFile(filepath.Join(dir, "00.hcl"), []byte(src), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, cp, err := loadConfig(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := viewer{username: "alice", profiles: map[string]bool{"team-a": true}}
+	if v.managesCredential(cp, "team-a-slack") {
+		t.Fatal("a member manages a credential an approver uses")
+	}
+}
+
+func TestMemberCannotClaimAnotherTeamsJoin(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	reg := newOnboardRegistry()
+	env.w.onboard, env.w.g.onboard = reg, reg
+	bobs := reg.start()
+	reg.mu.Lock()
+	bobs.profile = "team-b"
+	reg.mu.Unlock()
+	noAsk := reg.start()
+
+	for name, code := range map[string]string{"asked for team-b": bobs.userCode, "asked for nothing": noAsk.userCode} {
+		rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/onboard/approve", `{"code":"`+code+`","profile":"team-a"}`)
+		if rw.Code != http.StatusForbidden {
+			t.Errorf("%s: alice approving into team-a = %d %s, want 403", name, rw.Code, rw.Body.String())
+		}
 	}
 }

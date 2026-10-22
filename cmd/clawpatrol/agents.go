@@ -722,18 +722,23 @@ func (w *webMux) apiStatus(rw http.ResponseWriter, r *http.Request) {
 // can bundle it without going through writeJSON. Same data shape; no
 // behavior change.
 func (w *webMux) statusList(r *http.Request) ([]IntegrationRow, error) {
-	out := []IntegrationRow{}
 	v, err := w.viewerFor(r)
 	if err != nil {
 		return nil, err
 	}
+	return w.statusListFor(v, r.URL.Query().Get("profile")), nil
+}
+
+// statusListFor lists the credentials the viewer may see, of one
+// profile when profile is set.
+func (w *webMux) statusListFor(v viewer, profile string) []IntegrationRow {
+	out := []IntegrationRow{}
 	policy := w.g.policy.Load()
 	if policy == nil {
-		return out, nil
+		return out
 	}
-	profile := r.URL.Query().Get("profile")
 	if profile != "" && !v.ownsProfile(profile) {
-		return out, nil
+		return out
 	}
 	allowed := credentialsInProfile(policy, profile)
 	visible := v.visibleCredentials(policy)
@@ -815,11 +820,15 @@ func (w *webMux) statusList(r *http.Request) ([]IntegrationRow, error) {
 			row.Passthrough = true
 		}
 		row.Profiles, row.Endpoints = credentialBindings(policy, name)
+		if !v.admin {
+			// Other teams' profile names stay with admins.
+			row.Profiles = slices.DeleteFunc(row.Profiles, func(p string) bool { return !v.ownsProfile(p) })
+		}
 		row.Config = credentialConfig(ent, name)
 		row.UpdatedAt = credentialUpdatedAt(w.g.db, name)
 		out = append(out, row)
 	}
-	return out, nil
+	return out
 }
 
 // credentialBindings reports every profile + endpoint that references

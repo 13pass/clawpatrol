@@ -108,3 +108,15 @@ func resolveRefs(decoded any, name string, plugin *Plugin, table *SymbolTable, b
 	}
 	return refs, diags
 }
+
+// All returns every symbol resolved anywhere in the entity's body.
+func (r *Refs) All() []*Symbol {
+	if r == nil {
+		return nil
+	}
+	var out []*Symbol
+	for _, syms := range r.resolved {
+		out = append(out, syms...)
+	}
+	return out
+}

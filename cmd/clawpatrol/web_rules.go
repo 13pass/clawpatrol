@@ -1,12 +1,10 @@
 package main
 
 import (
-	"bytes"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
@@ -61,6 +59,10 @@ func (w *webMux) viewerFor(r *http.Request) (viewer, error) {
 	if !ok {
 		return viewer{}, fmt.Errorf("no authenticated principal")
 	}
+	return w.viewerForPrincipal(p)
+}
+
+func (w *webMux) viewerForPrincipal(p principal) (viewer, error) {
 	if principalRole(p) == dashboardRoleAdmin {
 		return viewer{admin: true, username: p.Owner}, nil
 	}
@@ -337,12 +339,10 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	}
 	// Read the body before taking the config lock, so a slow client
 	// cannot hold up every other config write.
-	raw, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, ruleRequestMaxBytes))
-	if err != nil {
+	if _, err := readAndRestoreBody(rw, r, ruleRequestMaxBytes); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	r.Body = io.NopCloser(bytes.NewReader(raw))
 	w.g.configMu.Lock()
 	defer w.g.configMu.Unlock()
 	v, _, rule, ok := w.scopedRuleFor(rw, r)

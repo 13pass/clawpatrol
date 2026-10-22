@@ -330,16 +330,16 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodGet, Path: "/api/hitl/pending", Auth: authDashboard, Handler: w.apiHITLPending},
 		{Method: http.MethodPost, Path: "/api/hitl/decide", Auth: authDashboard, Handler: w.apiHITLDecide},
 		{Method: http.MethodGet, Path: hitlOperationStatusPrefix, Auth: authSelfAuthenticating, Handler: w.apiHITLOperationStatus},
-		{Method: http.MethodPost, Path: "/api/oauth/start", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiOAuthStart)},
-		{Method: http.MethodPost, Path: "/api/oauth/exchange", Auth: authDashboard, Handler: w.guardCredential(credentialFromOAuthSession, w.apiOAuthExchange)},
-		{Method: http.MethodPost, Path: "/api/oauth/device-poll", Auth: authDashboard, Handler: w.guardCredential(credentialFromOAuthSession, w.apiOAuthDevicePoll)},
-		{Method: http.MethodPost, Path: "/api/oauth/revoke", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiOAuthRevoke)},
+		{Method: http.MethodPost, Path: "/api/oauth/start", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiOAuthStart)},
+		{Method: http.MethodPost, Path: "/api/oauth/exchange", Auth: authDashboard, Handler: w.guardCredential(credentialByState, w.apiOAuthExchange)},
+		{Method: http.MethodPost, Path: "/api/oauth/device-poll", Auth: authDashboard, Handler: w.guardCredential(credentialByState, w.apiOAuthDevicePoll)},
+		{Method: http.MethodPost, Path: "/api/oauth/revoke", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiOAuthRevoke)},
 		{Method: http.MethodGet, Path: "/oauth/callback", Auth: authDashboard, Handler: w.serveOAuthCallback},
-		{Method: http.MethodPost, Path: "/api/tailscale/connect", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiTailscaleConnect)},
-		{Method: http.MethodGet, Path: "/api/tailscale/status", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiTailscaleStatus)},
-		{Method: http.MethodPost, Path: "/api/tailscale/disconnect", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiTailscaleDisconnect)},
-		{Method: http.MethodPost, Path: "/api/credentials/set", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiCredentialsSet)},
-		{Method: http.MethodPost, Path: "/api/credentials/clear", Auth: authDashboard, Handler: w.guardCredential(credentialFromBodyOrQuery, w.apiCredentialsClear)},
+		{Method: http.MethodPost, Path: "/api/tailscale/connect", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiTailscaleConnect)},
+		{Method: http.MethodGet, Path: "/api/tailscale/status", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiTailscaleStatus)},
+		{Method: http.MethodPost, Path: "/api/tailscale/disconnect", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiTailscaleDisconnect)},
+		{Method: http.MethodPost, Path: "/api/credentials/set", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsSet)},
+		{Method: http.MethodPost, Path: "/api/credentials/clear", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsClear)},
 		{Method: http.MethodGet, Path: "/api/events", Auth: authDashboard, Handler: w.apiEventsSSE},
 		{Method: http.MethodPost, Path: "/api/actions/rule-preview", Auth: authDashboard, Handler: w.apiActionRulePreview},
 		{Method: http.MethodGet, Path: "/api/actions/", Auth: authDashboard, Handler: w.apiActionByID},
@@ -1232,7 +1232,7 @@ func (w *webMux) selectedProfileForRequest(r *http.Request) (key, label string) 
 // fall back to the bare whois lookup only when no principal is on
 // the context (e.g. on a route the gate let through without one,
 // which shouldn't happen for authDashboard but stays defensive).
-func (w *webMux) whoamiData(r *http.Request) map[string]any {
+func (w *webMux) whoamiData(r *http.Request, v viewer) map[string]any {
 	pu := w.g.cfg.Load().PublicURL()
 	if pu == "" {
 		pu = w.publicURL
@@ -1258,7 +1258,7 @@ func (w *webMux) whoamiData(r *http.Request) map[string]any {
 		}
 		// A member's profiles and approver shape what the dashboard
 		// offers them.
-		if v, err := w.viewerFor(r); err == nil && !v.admin {
+		if !v.admin {
 			out["profiles"] = v.sortedProfiles()
 			out["approver"] = v.approver
 		}
@@ -1312,11 +1312,7 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), 500)
 		return
 	}
-	integrations, err := w.statusList(r)
-	if err != nil {
-		http.Error(rw, err.Error(), 500)
-		return
-	}
+	integrations := w.statusListFor(v, r.URL.Query().Get("profile"))
 	agents := []*Agent{}
 	for _, a := range w.agentsList() {
 		if v.ownsProfile(a.Profile) {
@@ -1324,7 +1320,7 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 	state := map[string]any{
-		"whoami":                  w.whoamiData(r),
+		"whoami":                  w.whoamiData(r, v),
 		"integrations":            integrations,
 		"agents":                  agents,
 		"update":                  currentUpdateBanner.Load(),
@@ -2011,10 +2007,12 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	wantIP := r.URL.Query().Get("agent")
-	// A member sees the events of their own profiles only. The viewer
-	// is re-read on every keepalive, so a profile taken away or an
-	// account deleted stops the stream within one tick.
-	v, err := w.viewerFor(r)
+	// A member sees the events of their own profiles only. For a
+	// password session the viewer is re-read on every keepalive, so a
+	// demotion, a profile taken away or an account deleted rescopes or
+	// ends the stream within one tick.
+	p, _ := principalFromContext(r.Context())
+	v, err := w.viewerForPrincipal(p)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusUnauthorized)
 		return
@@ -2060,11 +2058,13 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
-			if !v.admin {
-				if _, stillMember := w.lookupSessionUserFromRequest(r); stillMember == "" {
+			if p.Kind == principalDashboardPassword {
+				username, role := w.lookupSessionUserFromRequest(r)
+				if username == "" || role == "" {
 					return
 				}
-				if v, err = w.viewerFor(r); err != nil {
+				p.Role = role
+				if v, err = w.viewerForPrincipal(p); err != nil {
 					return
 				}
 			}

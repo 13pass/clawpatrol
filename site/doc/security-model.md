@@ -333,13 +333,17 @@ username, an initial password and one of two roles:
   - turn their requests into rules — deny, pre-approve, or require
     approval (below);
   - set, connect or clear the secret of a credential only their
-    profiles use; a credential another team's profile also uses stays
-    with admins, since rotating it would change that team's access.
-    An OAuth sign-in can only be finished by the user who started it;
+    profiles use; a credential another team's profile also uses, or
+    an approver's Slack or model credential, stays with admins, since
+    rotating it would change others' access. An OAuth sign-in can only
+    be finished by the user who started it. Every id or sign-in state
+    a request could carry — query or body, however parsed — must pass
+    this check, so a request read one way by the check and another by
+    the handler is refused;
   - delete their devices, move them between their own profiles, and
-    approve a joining device into one of their profiles (named
-    explicitly — no fallback to the device's suggestion or the
-    default profile);
+    approve a joining device into one of their profiles — only when
+    the device asked for that profile (`clawpatrol join --profile
+    X`), so knowing another team's join code is not enough;
   - see and decide the approvals raised by their own rules. Approvals
     raised by an admin's rules stay with the approver the admin chose.
 

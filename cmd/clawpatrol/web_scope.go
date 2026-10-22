@@ -3,8 +3,11 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
+	"sort"
+	"strings"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -34,13 +37,14 @@ func (v viewer) visibleCredentials(policy *config.CompiledPolicy) map[string]boo
 
 // managesCredential reports whether the viewer may set, connect,
 // refresh or clear a credential's secret. A member may only when every
-// profile using it is theirs: rotating a credential another team
-// shares would change that team's access.
+// profile using it is theirs and nothing outside profiles — an
+// approver's Slack or model credential — depends on it: rotating a
+// credential something else uses would change other teams' access.
 func (v viewer) managesCredential(policy *config.CompiledPolicy, name string) bool {
 	if v.admin {
 		return true
 	}
-	if policy == nil || policy.Credentials[name] == nil {
+	if policy == nil || policy.Credentials[name] == nil || credentialUsedByApprover(policy, name) {
 		return false
 	}
 	profiles, _ := credentialBindings(policy, name)
@@ -55,50 +59,95 @@ func (v viewer) managesCredential(policy *config.CompiledPolicy, name string) bo
 	return true
 }
 
-// credentialRequestMaxBytes bounds a credential request body, read in
-// full by guardCredential before the handler decodes it again.
-const credentialRequestMaxBytes = 1 << 20
+func credentialUsedByApprover(policy *config.CompiledPolicy, name string) bool {
+	for _, ent := range policy.Approvers {
+		if ent == nil {
+			continue
+		}
+		for _, sym := range ent.Refs.All() {
+			if sym != nil && sym.Kind == config.KindCredential && sym.Name == name {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// Bounds on request bodies a guard reads before its handler.
+const (
+	credentialRequestMaxBytes = 1 << 20
+	// onboardApproveMaxBytes matches decodeOnboardApproveBody's limit.
+	onboardApproveMaxBytes = 4 << 10
+)
+
+// readAndRestoreBody reads the request body in full (at most max
+// bytes) and puts it back for the handler.
+func readAndRestoreBody(rw http.ResponseWriter, r *http.Request, max int64) ([]byte, error) {
+	if r.Body == nil {
+		return nil, nil
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(rw, r.Body, max))
+	if err != nil {
+		return nil, err
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return body, nil
+}
+
+// requestValues collects every value a handler could read for field:
+// the query parameter, and the body's field parsed both strictly
+// (json.Unmarshal) and as a json.Decoder does (first value only,
+// trailing data ignored), with Go's case-insensitive key matching. A
+// guard requires the member to be entitled to all of them, so a
+// request that a guard and its handler would read differently fails
+// closed instead of authorizing one value and acting on another.
+func requestValues(r *http.Request, body []byte, field string) []string {
+	set := map[string]bool{}
+	add := func(m map[string]any) {
+		for k, v := range m {
+			if s, ok := v.(string); ok && s != "" && strings.EqualFold(k, field) {
+				set[s] = true
+			}
+		}
+	}
+	if v := r.URL.Query().Get(field); v != "" {
+		set[v] = true
+	}
+	var strict map[string]any
+	if json.Unmarshal(body, &strict) == nil {
+		add(strict)
+	}
+	var lenient map[string]any
+	if json.NewDecoder(bytes.NewReader(body)).Decode(&lenient) == nil {
+		add(lenient)
+	}
+	out := make([]string, 0, len(set))
+	for v := range set {
+		out = append(out, v)
+	}
+	sort.Strings(out)
+	return out
+}
 
 func principalOwner(r *http.Request) string {
 	p, _ := principalFromContext(r.Context())
 	return p.Owner
 }
 
-// credentialTarget names the credential a request acts on and, for an
-// OAuth flow already started, the user who started it.
-type credentialTarget func(w *webMux, r *http.Request, body []byte) (id, owner string)
+// credentialField is where a guarded route names its credential: an
+// "id", or the "state" of an OAuth flow already started.
+type credentialField string
 
-func credentialFromBodyOrQuery(_ *webMux, r *http.Request, body []byte) (string, string) {
-	var b struct {
-		ID string `json:"id"`
-	}
-	_ = json.Unmarshal(body, &b)
-	if b.ID == "" {
-		b.ID = r.URL.Query().Get("id")
-	}
-	return b.ID, ""
-}
+const (
+	credentialByID    credentialField = "id"
+	credentialByState credentialField = "state"
+)
 
-func credentialFromOAuthSession(w *webMux, r *http.Request, body []byte) (string, string) {
-	var b struct {
-		State string `json:"state"`
-	}
-	_ = json.Unmarshal(body, &b)
-	if b.State == "" {
-		b.State = r.URL.Query().Get("state")
-	}
-	w.mu.Lock()
-	defer w.mu.Unlock()
-	if sess := w.sessions[b.State]; sess != nil {
-		return sess.id, sess.owner
-	}
-	return "", ""
-}
-
-// guardCredential lets a member through only to a credential they
-// manage (viewer.managesCredential), and only into an OAuth flow they
-// started. Admins pass unchecked.
-func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc) http.HandlerFunc {
+// guardCredential lets a member through only when every credential the
+// request could name is one they manage (viewer.managesCredential), and
+// every OAuth flow it could name is one they started. Admins pass
+// unchecked.
+func (w *webMux) guardCredential(field credentialField, next http.HandlerFunc) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
 		v, err := w.viewerFor(r)
 		if err != nil {
@@ -109,26 +158,52 @@ func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc)
 			next(rw, r)
 			return
 		}
-		var body []byte
-		if r.Body != nil {
-			if body, err = io.ReadAll(http.MaxBytesReader(rw, r.Body, credentialRequestMaxBytes)); err != nil {
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
-			}
-			r.Body = io.NopCloser(bytes.NewReader(body))
+		body, err := readAndRestoreBody(rw, r, credentialRequestMaxBytes)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
 		}
-		id, owner := target(w, r, body)
-		setAuditTarget(r, id)
-		if !v.managesCredential(w.g.Policy(), id) {
+		values := requestValues(r, body, string(field))
+		ids, owners, known := values, []string(nil), true
+		if field == credentialByState {
+			ids, owners, known = w.oauthSessionsFor(values)
+		}
+		setAuditTarget(r, strings.Join(ids, ","))
+		policy := w.g.Policy()
+		allowed := len(ids) > 0 && known
+		for _, id := range ids {
+			allowed = allowed && v.managesCredential(policy, id)
+		}
+		if !allowed {
 			http.Error(rw, "only an admin can change this credential: it is not used by your profiles alone", http.StatusForbidden)
 			return
 		}
-		if owner != "" && owner != v.username {
-			http.Error(rw, "this sign-in was started by someone else", http.StatusForbidden)
-			return
+		for _, owner := range owners {
+			if owner != v.username {
+				http.Error(rw, "this sign-in was started by someone else", http.StatusForbidden)
+				return
+			}
 		}
 		next(rw, r)
 	}
+}
+
+// oauthSessionsFor maps OAuth states to their credentials and owners;
+// known is false if any state names no session.
+func (w *webMux) oauthSessionsFor(states []string) (ids, owners []string, known bool) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	known = true
+	for _, state := range states {
+		sess := w.sessions[state]
+		if sess == nil {
+			known = false
+			continue
+		}
+		ids = append(ids, sess.id)
+		owners = append(owners, sess.owner)
+	}
+	return ids, owners, known
 }
 
 // guardDevice lets a member act only on a device of a profile they
@@ -158,8 +233,9 @@ func (w *webMux) guardDevice(next http.HandlerFunc) http.HandlerFunc {
 }
 
 // guardOnboardApprove lets a member approve a joining device only into
-// a profile they own, named explicitly: no fallback to the device's
-// suggestion or to the default profile.
+// a profile they own, named explicitly, and only when the device asked
+// for that profile (`clawpatrol join --profile X`): a member must not
+// claim another team's pending enrollment by knowing its code.
 func (w *webMux) guardOnboardApprove(next http.HandlerFunc) http.HandlerFunc {
 	return func(rw http.ResponseWriter, r *http.Request) {
 		p, ok := principalFromContext(r.Context())
@@ -172,24 +248,28 @@ func (w *webMux) guardOnboardApprove(next http.HandlerFunc) http.HandlerFunc {
 			http.Error(rw, err.Error(), http.StatusUnauthorized)
 			return
 		}
-		var raw []byte
-		if r.Body != nil {
-			if raw, err = io.ReadAll(http.MaxBytesReader(rw, r.Body, credentialRequestMaxBytes)); err != nil {
-				http.Error(rw, err.Error(), http.StatusBadRequest)
-				return
-			}
-			r.Body = io.NopCloser(bytes.NewReader(raw))
+		body, err := readAndRestoreBody(rw, r, onboardApproveMaxBytes)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
 		}
-		var body struct {
-			Profile string `json:"profile"`
-		}
-		_ = json.Unmarshal(raw, &body)
-		if body.Profile == "" {
-			body.Profile = r.URL.Query().Get("profile")
-		}
-		if body.Profile == "" || !v.ownsProfile(body.Profile) {
+		profiles := requestValues(r, body, "profile")
+		if len(profiles) != 1 || !v.ownsProfile(profiles[0]) {
 			http.Error(rw, "choose one of your profiles for this device", http.StatusForbidden)
 			return
+		}
+		for _, code := range requestValues(r, body, "code") {
+			s := w.onboard.byUserCode(code)
+			if s == nil {
+				continue
+			}
+			w.onboard.mu.Lock()
+			asked := s.profile
+			w.onboard.mu.Unlock()
+			if asked != profiles[0] {
+				http.Error(rw, fmt.Sprintf("this device did not ask to join %q; it must join with `clawpatrol join --profile %s`", profiles[0], profiles[0]), http.StatusForbidden)
+				return
+			}
 		}
 		next(rw, r)
 	}
