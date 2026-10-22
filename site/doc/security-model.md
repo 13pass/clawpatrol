@@ -391,7 +391,9 @@ signature, issuer, audience, expiry and nonce are all checked. A
 sign-in reaches only a dashboard user an admin linked to that
 provider account (one link per user and provider): the first sign-in binds the provider's permanent
 subject id, which decides from then on, so a renamed or recycled
-provider username cannot take an account over. Linking decides who
+provider username cannot take an account over. When the username claim
+is `email`, the address counts only if the provider marks it
+`email_verified`: an unverified address is anyone's to type in. Linking decides who
 may sign in as a user, so an admin may link members and themselves,
 never another admin or `root`. The sign-in in progress is kept in a
 signed cookie, not a server table, so nothing a stranger sends can

@@ -402,7 +402,8 @@ function UserRow({
 }
 
 // SignInCell shows how a user signs in, and lets an admin link or
-// unlink their account at each sign-in provider.
+// unlink their account at each sign-in provider. A link at a provider
+// the config no longer declares stays listed so it can be removed.
 function SignInCell({
   user,
   providers,
@@ -424,6 +425,18 @@ function SignInCell({
           onChanged={onChanged}
         />
       ))}
+      {user.oidc
+        .filter((l) => !providers.some((p) => p.name === l.provider))
+        .map((l) => (
+          <ProviderLink
+            key={l.provider}
+            user={user}
+            provider={{ name: l.provider, displayName: l.provider }}
+            link={l}
+            removed
+            onChanged={onChanged}
+          />
+        ))}
     </div>
   );
 }
@@ -432,19 +445,23 @@ function ProviderLink({
   user,
   provider,
   link,
+  removed = false,
   onChanged,
 }: {
   user: DashboardUser;
   provider: OIDCProvider;
   link?: { account: string; linked: boolean };
+  // removed: the provider is no longer configured; the link can only
+  // be unlinked.
+  removed?: boolean;
   onChanged: () => void;
 }) {
   const [editing, setEditing] = useState(false);
   const [value, setValue] = useState(link?.account ?? "");
   const [err, setErr] = useState("");
-  async function save() {
+  async function apply(change: Parameters<typeof updateUser>[1]) {
     try {
-      await updateUser(user.username, { oidc: { [provider.name]: value } });
+      await updateUser(user.username, change);
       setEditing(false);
       setErr("");
       onChanged();
@@ -452,6 +469,7 @@ function ProviderLink({
       setErr(String(e instanceof Error ? e.message : e));
     }
   }
+  const save = () => apply({ oidc: { [provider.name]: value } });
   return (
     <div>
       <span className="text-text-muted">{provider.displayName}:</span>{" "}
@@ -459,7 +477,7 @@ function ProviderLink({
         <>
           <span className="font-mono">{link.account}</span>{" "}
           <span className="text-text-muted">
-            ({link.linked ? "linked" : "waiting for first sign-in"})
+            ({removed ? "provider removed" : link.linked ? "linked" : "waiting for first sign-in"})
           </span>
         </>
       ) : (
@@ -487,17 +505,49 @@ function ProviderLink({
             Cancel
           </Button>
         </form>
-      ) : (
+      ) : removed ? (
         <Button
           size="xs"
           variant="outline"
           onClick={() => {
-            setValue(link?.account ?? "");
-            setEditing(true);
+            if (window.confirm(`Unlink ${user.username}'s ${provider.name} account?`)) {
+              apply({ oidc: { [provider.name]: "" } });
+            }
           }}
         >
-          {link ? "Change" : "Link"}
+          Unlink
         </Button>
+      ) : (
+        <>
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={() => {
+              setValue(link?.account ?? "");
+              setEditing(true);
+            }}
+          >
+            {link ? "Change" : "Link"}
+          </Button>
+          {link?.linked && (
+            <Button
+              size="xs"
+              variant="outline"
+              title="For an account deleted and recreated at the provider: the next sign-in as this account binds afresh"
+              onClick={() => {
+                if (
+                  window.confirm(
+                    `Reset ${user.username}'s ${provider.displayName} binding? Their sessions end, and the next sign-in as ${link.account} is bound to them.`,
+                  )
+                ) {
+                  apply({ oidc_rebind: [provider.name] });
+                }
+              }}
+            >
+              Reset binding
+            </Button>
+          )}
+        </>
       )}
       {err && <div className="text-xs text-danger-500">{err}</div>}
     </div>

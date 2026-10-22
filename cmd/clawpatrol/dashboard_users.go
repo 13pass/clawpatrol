@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -349,15 +350,37 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	if err := rows.Err(); err != nil {
 		return nil, err
 	}
+	profiles, err := allDashboardUserProfiles(db)
+	if err != nil {
+		return nil, err
+	}
+	links, err := allDashboardUserOIDC(db)
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
-		if out[i].Profiles, err = listDashboardUserProfiles(db, out[i].Username); err != nil {
-			return nil, err
-		}
-		if out[i].OIDC, err = listDashboardUserOIDC(db, out[i].Username); err != nil {
-			return nil, err
-		}
+		out[i].Profiles = append([]string{}, profiles[out[i].Username]...)
+		out[i].OIDC = append([]oidcLink{}, links[out[i].Username]...)
 	}
 	return out, nil
+}
+
+// allDashboardUserProfiles returns every user's profiles, sorted.
+func allDashboardUserProfiles(db *sql.DB) (map[string][]string, error) {
+	rows, err := db.Query(`SELECT username, profile FROM dashboard_user_profiles ORDER BY username, profile`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string][]string{}
+	for rows.Next() {
+		var u, p string
+		if err := rows.Scan(&u, &p); err != nil {
+			return nil, err
+		}
+		out[u] = append(out[u], p)
+	}
+	return out, rows.Err()
 }
 
 // listDashboardUserProfiles returns the profiles username owns, sorted.
@@ -485,24 +508,28 @@ type oidcLink struct {
 	Linked   bool   `json:"linked"`
 }
 
-func listDashboardUserOIDC(db *sql.DB, username string) ([]oidcLink, error) {
-	rows, err := db.Query(
-		`SELECT provider, account, subject != '' FROM dashboard_user_oidc WHERE username = ? ORDER BY provider`,
-		username,
-	)
+// allDashboardUserOIDC returns every user's provider links.
+func allDashboardUserOIDC(db *sql.DB) (map[string][]oidcLink, error) {
+	rows, err := db.Query(`SELECT username, provider, account, subject != '' FROM dashboard_user_oidc ORDER BY username, provider`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
-	out := []oidcLink{}
+	out := map[string][]oidcLink{}
 	for rows.Next() {
+		var u string
 		var l oidcLink
-		if err := rows.Scan(&l.Provider, &l.Account, &l.Linked); err != nil {
+		if err := rows.Scan(&u, &l.Provider, &l.Account, &l.Linked); err != nil {
 			return nil, err
 		}
-		out = append(out, l)
+		out[u] = append(out[u], l)
 	}
 	return out, rows.Err()
+}
+
+func listDashboardUserOIDC(db *sql.DB, username string) ([]oidcLink, error) {
+	all, err := allDashboardUserOIDC(db)
+	return append([]oidcLink{}, all[username]...), err
 }
 
 // oidcAccountTaken reports whether a user other than except is linked
@@ -524,12 +551,19 @@ func isUniqueViolation(err error) bool {
 	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
 }
 
-// setDashboardUserOIDC links username to an account at provider (""
-// unlinks) and reports whether the link changed. A change drops the
-// bound subject — the next sign-in as the new account binds it afresh
-// — and ends the user's sessions, since a different account may now
-// sign in as them. Accounts compare case-insensitively.
+// setDashboardUserOIDC links username to an account at one provider
+// ("" unlinks); see setDashboardUserOIDCLinks.
 func setDashboardUserOIDC(db *sql.DB, username, provider, account string) (bool, error) {
+	return setDashboardUserOIDCLinks(db, username, map[string]string{provider: account}, nil)
+}
+
+// setDashboardUserOIDCLinks applies link changes (provider → account,
+// "" unlinks) and rebinds (a link keeps its account but its bound
+// subject is dropped, so the next sign-in binds afresh), all in one
+// transaction, and reports whether anything changed. A change ends
+// the user's sessions, since a different provider account may now
+// sign in as them. Accounts compare case-insensitively.
+func setDashboardUserOIDCLinks(db *sql.DB, username string, links map[string]string, rebind []string) (bool, error) {
 	if db == nil {
 		return false, fmt.Errorf("no db")
 	}
@@ -538,35 +572,70 @@ func setDashboardUserOIDC(db *sql.DB, username, provider, account string) (bool,
 	} else if !exists {
 		return false, errDashboardUserNotFound
 	}
-	var current string
-	err := db.QueryRow(`SELECT account FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username).Scan(&current)
-	if err != nil && !errors.Is(err, sql.ErrNoRows) {
-		return false, err
-	}
-	if strings.EqualFold(current, account) {
-		return false, nil
-	}
-	if taken, err := oidcAccountTaken(db, provider, account, username); err != nil {
-		return false, err
-	} else if taken {
-		return false, errOIDCUsernameTaken
-	}
-	if account == "" {
-		_, err = db.Exec(`DELETE FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username)
-	} else {
-		_, err = db.Exec(
-			`INSERT INTO dashboard_user_oidc (provider, username, account) VALUES (?, ?, ?)
-			 ON CONFLICT(provider, username) DO UPDATE SET account = excluded.account, subject = ''`,
-			provider, username, account,
-		)
-	}
-	if isUniqueViolation(err) {
-		return false, errOIDCUsernameTaken
-	}
+	tx, err := db.Begin()
 	if err != nil {
 		return false, err
 	}
+	defer func() { _ = tx.Rollback() }()
+	changed := false
+	providers := make([]string, 0, len(links))
+	for p := range links {
+		providers = append(providers, p)
+	}
+	sort.Strings(providers)
+	for _, provider := range providers {
+		account := links[provider]
+		var current string
+		err := tx.QueryRow(`SELECT account FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username).Scan(&current)
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
+			return false, err
+		}
+		if strings.EqualFold(current, account) {
+			continue
+		}
+		if account == "" {
+			_, err = tx.Exec(`DELETE FROM dashboard_user_oidc WHERE provider = ? AND username = ?`, provider, username)
+		} else {
+			_, err = tx.Exec(
+				`INSERT INTO dashboard_user_oidc (provider, username, account) VALUES (?, ?, ?)
+				 ON CONFLICT(provider, username) DO UPDATE SET account = excluded.account, subject = ''`,
+				provider, username, account,
+			)
+		}
+		if isUniqueViolation(err) {
+			return false, errOIDCUsernameTaken
+		}
+		if err != nil {
+			return false, err
+		}
+		changed = true
+	}
+	for _, provider := range rebind {
+		res, err := tx.Exec(
+			`UPDATE dashboard_user_oidc SET subject = '' WHERE provider = ? AND username = ? AND subject != ''`,
+			provider, username,
+		)
+		if err != nil {
+			return false, err
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			changed = true
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	if !changed {
+		return false, nil
+	}
 	return true, revokeAllDashboardSessionsFor(db, username)
+}
+
+// dashboardUserHasPassword reports whether username can sign in with
+// a password.
+func dashboardUserHasPassword(db *sql.DB, username string) (bool, error) {
+	hash, _, err := lookupDashboardUser(db, username)
+	return hash != "", err
 }
 
 // dashboardUserForOIDC resolves a sign-in at provider to the dashboard

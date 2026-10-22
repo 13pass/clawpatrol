@@ -129,15 +129,16 @@ in URLs (/__login/oidc/<name>) and in account links.
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
 | `issuer` | `string` | no | The provider's issuer URL, exactly as its discovery document (<issuer>/.well-known/openid-configuration) spells it. Default "https://gitlab.com". |
+| `kind` | `string` | no | Selects defaults for the provider's claims: "gitlab" (any GitLab instance: groups from userinfo, matched as paths) or "generic". Default "gitlab" for GitLab.com, else "generic"; set "gitlab" for a self-managed GitLab. |
 | `client_id` | `string` | yes | The provider application's ID. Required. |
 | `client_secret` | `string` | no | The application's secret. Write it as "{{secret:NAME}}" to read it from the gateway's environment variable NAME rather than keep it in the file. |
 | `scopes` | `[]string` | no | Requested at sign-in; must include "openid". Default ["openid", "profile"]; add "email" for providers that only name users by email (Google). |
-| `username_claim` | `string` | no | The claim naming the account an admin links: read from the ID token, else from userinfo. Default "preferred_username" (GitLab's username, Entra ID's UPN); use "email" for Google. |
+| `username_claim` | `string` | no | The claim naming the account an admin links: read from the ID token, else from userinfo. Default "preferred_username" (GitLab's username, Entra ID's UPN); use "email" for Google. An "email" account counts only when the same source marks it email_verified. |
 | `allowed_groups` | `[]string` | no | AllowedGroups, if set, refuses anyone not in one of these groups before any account lookup. |
 | `groups_claim` | `string` | no | The claim listing the user's groups. Default "groups". |
-| `groups_source` | `string` | no | Says where GroupsClaim is read: "userinfo" or "id_token". Default "userinfo" for GitLab.com, which lists every group there; else "id_token" (Entra ID, Keycloak, Okta). |
-| `group_match` | `string` | no | How AllowedGroups match: "subgroups" (a group or any group under it, GitLab paths such as "unrcs/dco") or "exact" (Entra ID group object ids). Default "subgroups" for GitLab.com, else "exact". |
-| `display_name` | `string` | no | Names the provider on the dashboard. Default "GitLab" for GitLab.com, else the block's name. |
+| `groups_source` | `string` | no | Says where GroupsClaim is read: "userinfo" or "id_token". Default "userinfo" for kind "gitlab", which lists every group there; else "id_token" (Entra ID, Keycloak, Okta). |
+| `group_match` | `string` | no | How AllowedGroups match: "subgroups" (a group or any group under it, GitLab paths such as "unrcs/dco") or "exact" (Entra ID group object ids). Default "subgroups" for kind "gitlab", else "exact". |
+| `display_name` | `string` | no | Names the provider on the dashboard. Default "GitLab" for kind "gitlab", else the block's name. |
 | `button_label` | `string` | no | The login button's text. Default "Sign in with <display name>". |
 
 ## `profile "<name>" { ... }`

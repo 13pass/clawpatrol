@@ -37,6 +37,10 @@ const (
 	// "<provider>/callback".
 	oidcPathPrefix     = "/__login/oidc/"
 	oidcCallbackSuffix = "/callback"
+	// oidcEmailClaim as a username claim also needs
+	// oidcEmailVerifiedClaim true.
+	oidcEmailClaim         = "email"
+	oidcEmailVerifiedClaim = "email_verified"
 	// oidcStateCookie carries a sign-in in progress — state, nonce,
 	// PKCE verifier and where to go after — signed with a key that
 	// never leaves the gateway. Holding it in the browser binds the
@@ -455,19 +459,37 @@ func (u *oidcUserinfo) get(ctx context.Context) (map[string]any, error) {
 }
 
 // oidcClaimString reads a string claim from the ID token, else from
-// userinfo.
+// userinfo. An email only counts when the same source vouches for it
+// with email_verified: an unverified address is anyone's to claim.
 func oidcClaimString(ctx context.Context, claim string, idClaims map[string]any, userinfo *oidcUserinfo) (string, error) {
-	if v, ok := idClaims[claim].(string); ok && v != "" {
-		return v, nil
+	source := idClaims
+	v, ok := source[claim].(string)
+	if !ok || v == "" {
+		info, err := userinfo.get(ctx)
+		if err != nil {
+			return "", err
+		}
+		source = info
+		if v, ok = source[claim].(string); !ok || v == "" {
+			return "", fmt.Errorf("no %q claim", claim)
+		}
 	}
-	info, err := userinfo.get(ctx)
-	if err != nil {
-		return "", err
+	if claim == oidcEmailClaim && !claimTrue(source[oidcEmailVerifiedClaim]) {
+		return "", fmt.Errorf("the %q claim is not marked %s", claim, oidcEmailVerifiedClaim)
 	}
-	if v, ok := info[claim].(string); ok && v != "" {
-		return v, nil
+	return v, nil
+}
+
+// claimTrue accepts a JSON true, or the string "true" some providers
+// send instead.
+func claimTrue(v any) bool {
+	switch v := v.(type) {
+	case bool:
+		return v
+	case string:
+		return strings.EqualFold(v, "true")
 	}
-	return "", fmt.Errorf("no %q claim", claim)
+	return false
 }
 
 // oidcInAllowedGroups reports whether the user is in an allowed group,

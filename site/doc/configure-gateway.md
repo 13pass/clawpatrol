@@ -184,12 +184,13 @@ adds a button to the login page. Only users an admin has linked get in.
    | Setting | Default | Notes |
    |---|---|---|
    | `issuer` | `https://gitlab.com` | Exactly as the provider's discovery document spells it (some end in `/`). Entra ID: a tenant id, not `common`. |
+   | `kind` | `gitlab` for GitLab.com, else `generic` | Picks the group defaults below. Set `kind = "gitlab"` for a self-managed GitLab. |
    | `scopes` | `["openid", "profile"]` | Must include `openid`; add `email` for Google. |
-   | `username_claim` | `preferred_username` | The claim an admin links: a GitLab username, an Entra ID UPN. Use `email` for Google. Read from the ID token, else userinfo. |
+   | `username_claim` | `preferred_username` | The claim an admin links: a GitLab username, an Entra ID UPN. Use `email` for Google. Read from the ID token, else userinfo. An `email` counts only when the same source sets `email_verified` to true; Entra ID does not, so keep its default. |
    | `groups_claim` | `groups` | |
    | `groups_source` | `userinfo` for GitLab.com, else `id_token` | Where the groups claim is read. |
    | `group_match` | `subgroups` for GitLab.com, else `exact` | `subgroups` matches GitLab paths and anything under them; `exact` matches ids such as Entra ID group object ids. |
-   | `display_name` | `GitLab` for GitLab.com, else the block's name | |
+   | `display_name` | `GitLab` for any `kind = "gitlab"`, else the block's name | |
    | `button_label` | `Sign in with <display name>` | |
 
 4. On the dashboard's **Users** page, link each user's account at the
@@ -201,11 +202,30 @@ The first sign-in as a linked account binds that provider account's
 permanent id; from then on the id decides, so renaming the account
 keeps access and a recycled name gets none. To point a user at a
 different account, change the link: that unbinds the old id and ends
-the user's sessions. An admin can link members, and their own
-accounts; another admin's — or `root`'s — only that admin can link.
+the user's sessions. If the same account was deleted and recreated at
+the provider, it has a new id: **Reset binding** keeps the link but
+forgets the old id, so the next sign-in binds afresh. An admin can
+link members, and their own accounts; another admin's — or `root`'s —
+only that admin can link. A user is never left with no way in: an
+unlink that would remove a passwordless user's last link is refused
+unless it also sets a password.
+
 Keep `root` on a password as the break-glass account: removing a
 `dashboard_oidc` block later leaves users who signed in only through
-it unable to sign in until an admin gives them a password.
+it unable to sign in until an admin gives them a password. Their links
+are kept — renaming the block back restores them — and the Users page
+lists them as "provider removed" with an **Unlink** button.
+
+With `allowed_groups` at Entra ID, a user in more than 200 groups gets
+no `groups` claim at all (Entra's "groups overage") and is refused.
+Limit the claim to the application's groups under **Token
+configuration** ("Groups assigned to the application").
+
+**Upgrading from a single `dashboard_oidc` block:** the block now needs
+a name, and the redirect URI includes it. Rename `dashboard_oidc {` to
+`dashboard_oidc "gitlab" {` — existing links were migrated under the
+name `gitlab` — and change the application's redirect URI from
+`/__login/oidc/callback` to `/__login/oidc/gitlab/callback`.
 
 ### Where to bind the dashboard
 

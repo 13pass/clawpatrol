@@ -274,6 +274,12 @@ type DashboardOIDCBlock struct {
 	// Default "https://gitlab.com".
 	Issuer string `hcl:"issuer,optional"`
 
+	// Kind selects defaults for the provider's claims: "gitlab" (any
+	// GitLab instance: groups from userinfo, matched as paths) or
+	// "generic". Default "gitlab" for GitLab.com, else "generic"; set
+	// "gitlab" for a self-managed GitLab.
+	Kind string `hcl:"kind,optional"`
+
 	// ClientID is the provider application's ID. Required.
 	ClientID string `hcl:"client_id"`
 
@@ -290,7 +296,8 @@ type DashboardOIDCBlock struct {
 	// UsernameClaim is the claim naming the account an admin links:
 	// read from the ID token, else from userinfo. Default
 	// "preferred_username" (GitLab's username, Entra ID's UPN); use
-	// "email" for Google.
+	// "email" for Google. An "email" account counts only when the same
+	// source marks it email_verified.
 	UsernameClaim string `hcl:"username_claim,optional"`
 
 	// AllowedGroups, if set, refuses anyone not in one of these groups
@@ -302,18 +309,18 @@ type DashboardOIDCBlock struct {
 	GroupsClaim string `hcl:"groups_claim,optional"`
 
 	// GroupsSource says where GroupsClaim is read: "userinfo" or
-	// "id_token". Default "userinfo" for GitLab.com, which lists every
-	// group there; else "id_token" (Entra ID, Keycloak, Okta).
+	// "id_token". Default "userinfo" for kind "gitlab", which lists
+	// every group there; else "id_token" (Entra ID, Keycloak, Okta).
 	GroupsSource string `hcl:"groups_source,optional"`
 
 	// GroupMatch is how AllowedGroups match: "subgroups" (a group or
 	// any group under it, GitLab paths such as "unrcs/dco") or "exact"
-	// (Entra ID group object ids). Default "subgroups" for GitLab.com,
-	// else "exact".
+	// (Entra ID group object ids). Default "subgroups" for kind
+	// "gitlab", else "exact".
 	GroupMatch string `hcl:"group_match,optional"`
 
 	// DisplayName names the provider on the dashboard. Default "GitLab"
-	// for GitLab.com, else the block's name.
+	// for kind "gitlab", else the block's name.
 	DisplayName string `hcl:"display_name,optional"`
 
 	// ButtonLabel is the login button's text. Default "Sign in with
@@ -327,6 +334,8 @@ const DefaultOIDCIssuer = "https://gitlab.com"
 
 // Values of DashboardOIDCBlock settings.
 const (
+	OIDCKindGitLab         = "gitlab"
+	OIDCKindGeneric        = "generic"
 	OIDCGroupsFromUserinfo = "userinfo"
 	OIDCGroupsFromIDToken  = "id_token"
 	OIDCGroupMatchExact    = "exact"
@@ -349,18 +358,26 @@ func (b *DashboardOIDCBlock) IssuerOrDefault() string {
 	return strings.TrimSpace(b.Issuer)
 }
 
-// IsGitLabCom reports whether the provider is GitLab.com, whose
-// defaults differ (groups from userinfo, matched as paths).
-func (b *DashboardOIDCBlock) IsGitLabCom() bool {
-	return strings.TrimRight(b.IssuerOrDefault(), "/") == DefaultOIDCIssuer
+// KindOrDefault returns the provider kind: as set, else "gitlab" for
+// GitLab.com and "generic" for any other issuer.
+func (b *DashboardOIDCBlock) KindOrDefault() string {
+	switch {
+	case b.Kind != "":
+		return b.Kind
+	case strings.TrimRight(b.IssuerOrDefault(), "/") == DefaultOIDCIssuer:
+		return OIDCKindGitLab
+	}
+	return OIDCKindGeneric
 }
+
+func (b *DashboardOIDCBlock) isGitLab() bool { return b.KindOrDefault() == OIDCKindGitLab }
 
 // ProviderName names the provider on the dashboard.
 func (b *DashboardOIDCBlock) ProviderName() string {
 	switch {
 	case b.DisplayName != "":
 		return b.DisplayName
-	case b.IsGitLabCom():
+	case b.isGitLab():
 		return "GitLab"
 	}
 	return b.Name
@@ -403,7 +420,7 @@ func (b *DashboardOIDCBlock) GroupsSourceOrDefault() string {
 	switch {
 	case b.GroupsSource != "":
 		return b.GroupsSource
-	case b.IsGitLabCom():
+	case b.isGitLab():
 		return OIDCGroupsFromUserinfo
 	}
 	return OIDCGroupsFromIDToken
@@ -414,7 +431,7 @@ func (b *DashboardOIDCBlock) GroupMatchOrDefault() string {
 	switch {
 	case b.GroupMatch != "":
 		return b.GroupMatch
-	case b.IsGitLabCom():
+	case b.isGitLab():
 		return OIDCGroupMatchSubtree
 	}
 	return OIDCGroupMatchExact
@@ -1488,6 +1505,9 @@ func validateDashboardOIDC(s *GatewaySettings) hcl.Diagnostics {
 		}
 		if len(b.Scopes) > 0 && !slices.Contains(b.Scopes, "openid") {
 			bad(b.Name, `scopes must include "openid".`)
+		}
+		if v := b.Kind; v != "" && v != OIDCKindGitLab && v != OIDCKindGeneric {
+			bad(b.Name, `kind must be "gitlab" or "generic".`)
 		}
 		if v := b.GroupsSource; v != "" && v != OIDCGroupsFromUserinfo && v != OIDCGroupsFromIDToken {
 			bad(b.Name, `groups_source must be "userinfo" or "id_token".`)

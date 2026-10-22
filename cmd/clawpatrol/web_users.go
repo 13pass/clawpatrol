@@ -16,14 +16,17 @@ import (
 )
 
 // normalizeOIDCLinks checks links (provider name → account) against
-// the configured providers, and trims a leading "@" from accounts.
+// the configured providers — an unlink ("") is accepted at any — and
+// trims a leading "@" from accounts.
 func (w *webMux) normalizeOIDCLinks(links map[string]string) (map[string]string, error) {
 	out := make(map[string]string, len(links))
 	for provider, account := range links {
-		if w.g.cfg.Load().DashboardOIDCProvider(provider) == nil {
+		account = strings.TrimPrefix(strings.TrimSpace(account), "@")
+		// Unlinking works at any provider, so links left by a removed or
+		// renamed dashboard_oidc block can be cleared.
+		if account != "" && w.g.cfg.Load().DashboardOIDCProvider(provider) == nil {
 			return nil, fmt.Errorf("no sign-in provider %q is configured (gateway.dashboard_oidc); a linked account could never sign in", provider)
 		}
-		account = strings.TrimPrefix(strings.TrimSpace(account), "@")
 		if account != "" && !validOIDCAccount(account) {
 			return nil, fmt.Errorf("%q is not a valid account name", account)
 		}
@@ -213,29 +216,38 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		// OIDC sets the account linked at each named provider; ""
 		// unlinks. Providers left out are unchanged.
 		OIDC map[string]string `json:"oidc"`
+		// OIDCRebind lists providers whose link keeps its account but
+		// drops its bound subject: the next sign-in binds afresh.
+		OIDCRebind []string `json:"oidc_rebind"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
 	setAuditTarget(r, auditUsername(body.Username))
-	if body.Role == "" && body.Password == "" && body.Profiles == nil && body.Approver == nil && body.OIDC == nil {
-		http.Error(rw, "nothing to update: set role, password, profiles, approver and/or oidc", http.StatusBadRequest)
+	if body.Role == "" && body.Password == "" && body.Profiles == nil && body.Approver == nil && body.OIDC == nil && len(body.OIDCRebind) == 0 {
+		http.Error(rw, "nothing to update: set role, password, profiles, approver, oidc and/or oidc_rebind", http.StatusBadRequest)
 		return
 	}
 	caller, _ := principalFromContext(r.Context())
+	targetRole, exists, err := lookupDashboardUserRole(w.g.db, body.Username)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !exists {
+		http.Error(rw, errDashboardUserNotFound.Error(), http.StatusNotFound)
+		return
+	}
 	links, err := w.normalizeOIDCLinks(body.OIDC)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	if len(links) > 0 {
+	if len(links) > 0 || len(body.OIDCRebind) > 0 {
 		// Linking an account decides who may sign in as the user: one
 		// admin must not be able to take over another's (or root's).
-		if role, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		} else if exists && role == dashboardRoleAdmin && caller.Owner != body.Username {
+		if targetRole == dashboardRoleAdmin && caller.Owner != body.Username {
 			http.Error(rw, "an admin's sign-in accounts can only be linked by that admin", http.StatusForbidden)
 			return
 		}
@@ -248,16 +260,35 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 				return
 			}
 		}
+		// Never leave a user with no way to sign in.
+		current, err := listDashboardUserOIDC(w.g.db, body.Username)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		hasPassword, err := dashboardUserHasPassword(w.g.db, body.Username)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		final := map[string]string{}
+		for _, l := range current {
+			final[l.Provider] = l.Account
+		}
+		for provider, account := range links {
+			final[provider] = account
+		}
+		signIn := hasPassword || body.Password != ""
+		for provider, account := range final {
+			signIn = signIn || (account != "" && w.g.cfg.Load().DashboardOIDCProvider(provider) != nil)
+		}
+		if !signIn {
+			http.Error(rw, "this would leave the user no way to sign in: keep a link at a configured provider, or set a password", http.StatusBadRequest)
+			return
+		}
 	}
 	if err := validateUserAssignment(w.g.Policy(), body.Profiles, body.Approver); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return
-	}
-	if _, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
-	} else if !exists {
-		http.Error(rw, errDashboardUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
 	if body.Role != "" {
@@ -269,7 +300,7 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, "root is always an admin", http.StatusBadRequest)
 			return
 		}
-		if p, _ := principalFromContext(r.Context()); p.Owner == body.Username {
+		if caller.Owner == body.Username {
 			http.Error(rw, "you cannot change your own role", http.StatusBadRequest)
 			return
 		}
@@ -278,8 +309,9 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "password must be at least "+strconv.Itoa(dashboardMinPasswordLen)+" characters", http.StatusBadRequest)
 		return
 	}
-	// The password step runs first: it is the one that can still be
-	// refused, and a refused request must not leave a role change behind.
+	// The steps that can still be refused run first — the password
+	// reset, then the links in one transaction — so a refused request
+	// leaves no role or profile change behind.
 	if body.Password != "" {
 		switch err := setDashboardMemberPassword(w.g.db, body.Username, body.Password); {
 		case errors.Is(err, errDashboardUserNotFound):
@@ -293,6 +325,30 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		log.Printf("dashboard auth: user %q password reset by an admin", body.Username)
+	}
+	relinked, err := setDashboardUserOIDCLinks(w.g.db, body.Username, links, body.OIDCRebind)
+	switch {
+	case errors.Is(err, errOIDCUsernameTaken):
+		http.Error(rw, err.Error(), http.StatusConflict)
+		return
+	case err != nil:
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if relinked {
+		log.Printf("dashboard auth: user %q sign-in links changed: %v, rebind %v", body.Username, links, body.OIDCRebind)
+		// Relinking ends the user's sessions; one changing their own
+		// links stays signed in.
+		if caller.Owner == body.Username && caller.Kind == principalDashboardPassword {
+			method := caller.Method
+			if method == "" {
+				method = sessionMethodPassword
+			}
+			if err := w.mintAndSetSessionCookieWithMethod(rw, caller.Owner, method); err != nil {
+				http.Error(rw, "linked, but could not mint a new session; log in again", http.StatusInternalServerError)
+				return
+			}
+		}
 	}
 	if body.Role != "" {
 		if err := setDashboardUserRole(w.g.db, body.Username, body.Role); errors.Is(err, errDashboardUserNotFound) {
@@ -311,41 +367,6 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		} else if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
-		}
-	}
-	relinked := false
-	for provider, account := range links {
-		changed, err := setDashboardUserOIDC(w.g.db, body.Username, provider, account)
-		switch {
-		case errors.Is(err, errDashboardUserNotFound):
-			http.Error(rw, err.Error(), http.StatusNotFound)
-			return
-		case errors.Is(err, errOIDCUsernameTaken):
-			http.Error(rw, err.Error(), http.StatusConflict)
-			return
-		case err != nil:
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		if changed {
-			log.Printf("dashboard auth: user %q linked at %s to %q", body.Username, provider, account)
-			relinked = true
-		}
-	}
-	{
-		if relinked {
-			// Relinking ends the user's sessions; one changing their own
-			// link stays signed in.
-			if caller.Owner == body.Username && caller.Kind == principalDashboardPassword {
-				method := caller.Method
-				if method == "" {
-					method = sessionMethodPassword
-				}
-				if err := w.mintAndSetSessionCookieWithMethod(rw, caller.Owner, method); err != nil {
-					http.Error(rw, "linked, but could not mint a new session; log in again", http.StatusInternalServerError)
-					return
-				}
-			}
 		}
 	}
 	if body.Approver != nil {

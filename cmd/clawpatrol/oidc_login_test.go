@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -390,16 +391,35 @@ func TestOIDCEntraStyleGroupsAndEmailUsernames(t *testing.T) {
 
 func TestOIDCUsernameClaimFromUserinfo(t *testing.T) {
 	// A Google-like provider: no username in the token, the email in
-	// userinfo.
-	f := newFakeOIDC(t)
-	f.idClaims = map[string]any{}
-	f.userinfoClaims["email"] = "alice@example.org"
-	w := newOIDCTestMuxWith(t, oidcTestProvider{"google", f, `username_claim = "email"
+	// userinfo. The email counts only when userinfo itself verifies it.
+	for name, tc := range map[string]struct {
+		token, userinfo map[string]any
+		want            int
+	}{
+		"verified":                   {map[string]any{}, map[string]any{"email_verified": true}, http.StatusFound},
+		"verified as a string":       {map[string]any{}, map[string]any{"email_verified": "true"}, http.StatusFound},
+		"not verified":               {map[string]any{}, map[string]any{"email_verified": false}, http.StatusForbidden},
+		"verification missing":       {map[string]any{}, map[string]any{}, http.StatusForbidden},
+		"verified in another source": {map[string]any{"email_verified": true}, map[string]any{}, http.StatusForbidden},
+	} {
+		f := newFakeOIDC(t)
+		f.idClaims = tc.token
+		f.userinfoClaims["email"] = "alice@example.org"
+		for k, v := range tc.userinfo {
+			f.userinfoClaims[k] = v
+		}
+		w := newOIDCTestMuxWith(t, oidcTestProvider{"google", f, `username_claim = "email"
     scopes = ["openid", "email"]`})
-	linkAt(t, w, "alice", "google", "alice@example.org")
-	rw := oidcSignIn(t, w, f, "google", nil)
-	if got := signedInAs(t, w, rw); got != "alice" {
-		t.Fatalf("sign-in by userinfo email = %d as %q", rw.Code, got)
+		linkAt(t, w, "alice", "google", "alice@example.org")
+		rw := oidcSignIn(t, w, f, "google", nil)
+		if rw.Code != tc.want {
+			t.Errorf("%s: callback = %d, want %d", name, rw.Code, tc.want)
+		}
+		if tc.want == http.StatusFound {
+			if got := signedInAs(t, w, rw); got != "alice" {
+				t.Errorf("%s: signed in as %q", name, got)
+			}
+		}
 	}
 }
 
@@ -645,7 +665,136 @@ func TestOIDCProviderDefaults(t *testing.T) {
 	if gitlab.GroupsSourceOrDefault() != config.OIDCGroupsFromUserinfo || gitlab.GroupMatchOrDefault() != config.OIDCGroupMatchSubtree || gitlab.Label() != "Sign in with GitLab" {
 		t.Errorf("gitlab.com defaults: %s %s %q", gitlab.GroupsSourceOrDefault(), gitlab.GroupMatchOrDefault(), gitlab.Label())
 	}
+	selfManaged := &config.DashboardOIDCBlock{Name: "gitlab-un", Issuer: "https://git.un.org", Kind: config.OIDCKindGitLab}
+	if selfManaged.GroupsSourceOrDefault() != config.OIDCGroupsFromUserinfo || selfManaged.GroupMatchOrDefault() != config.OIDCGroupMatchSubtree {
+		t.Errorf("self-managed GitLab defaults: %s %s", selfManaged.GroupsSourceOrDefault(), selfManaged.GroupMatchOrDefault())
+	}
 	if entra.GroupsSourceOrDefault() != config.OIDCGroupsFromIDToken || entra.GroupMatchOrDefault() != config.OIDCGroupMatchExact || entra.Label() != "Sign in with entra" {
 		t.Errorf("other-provider defaults: %s %s %q", entra.GroupsSourceOrDefault(), entra.GroupMatchOrDefault(), entra.Label())
+	}
+}
+
+func TestOIDCLinkAtARemovedProviderCanBeUnlinked(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
+	h := w.handler()
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+	// Linked while an "okta" block was configured, since removed.
+	linkAt(t, w, "alice", "okta", "alice-okta")
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"alice","oidc":{"okta":""}}`); rw.Code != http.StatusOK {
+		t.Fatalf("unlink at a removed provider = %d %s", rw.Code, rw.Body.String())
+	}
+	if links, _ := listDashboardUserOIDC(w.g.db, "alice"); len(links) != 0 {
+		t.Errorf("links after unlinking: %+v", links)
+	}
+}
+
+func TestOIDCUpdateKeepsAWayToSignIn(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
+	h := w.handler()
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+	if err := createLinkedDashboardUser(w.g.db, "carol", "", dashboardRoleMember, map[string]string{"gitlab": "carol-gl"}); err != nil {
+		t.Fatal(err)
+	}
+	// A link at a provider no longer configured does not count.
+	linkAt(t, w, "carol", "okta", "carol-okta")
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc":{"gitlab":""}}`); rw.Code != http.StatusBadRequest {
+		t.Fatalf("unlinking a passwordless user's last sign-in = %d, want 400", rw.Code)
+	}
+	if links, _ := listDashboardUserOIDC(w.g.db, "carol"); len(links) != 2 {
+		t.Errorf("refused unlink changed the links: %+v", links)
+	}
+	// Setting a password in the same request makes it fine.
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","password":"carol-passphrase-1234","oidc":{"gitlab":""}}`); rw.Code != http.StatusOK {
+		t.Fatalf("unlink with a new password = %d %s", rw.Code, rw.Body.String())
+	}
+	// A user with a password may drop every link.
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc":{"okta":""}}`); rw.Code != http.StatusOK {
+		t.Fatalf("unlink the last link of a user with a password = %d %s", rw.Code, rw.Body.String())
+	}
+}
+
+func TestOIDCRebindLetsANewSubjectSignIn(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
+	h := w.handler()
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+	linkAt(t, w, "alice", "gitlab", "alice-gl")
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab", nil)); got != "alice" {
+		t.Fatalf("first sign-in as %q", got)
+	}
+	alice := sessionCookieFor(t, w, "alice")
+	// The account was deleted and recreated on the provider: a new
+	// subject under the same username is refused until rebound.
+	f.sub = "5151"
+	if rw := oidcSignIn(t, w, f, "gitlab", nil); rw.Code != http.StatusForbidden {
+		t.Fatalf("new subject before rebind = %d, want 403", rw.Code)
+	}
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"alice","oidc_rebind":["gitlab"]}`); rw.Code != http.StatusOK {
+		t.Fatalf("rebind = %d %s", rw.Code, rw.Body.String())
+	}
+	if rw := serveAs(t, h, alice, http.MethodGet, "/api/me", ""); rw.Code != http.StatusUnauthorized {
+		t.Errorf("alice's session after a rebind = %d, want 401", rw.Code)
+	}
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab", nil)); got != "alice" {
+		t.Fatalf("sign-in after rebind as %q", got)
+	}
+}
+
+func TestOIDCLinkWritesAreAllOrNothing(t *testing.T) {
+	w := newUsersTestMux(t)
+	if err := createLinkedDashboardUser(w.g.db, "bob", "", dashboardRoleMember, map[string]string{"okta": "taken"}); err != nil {
+		t.Fatal(err)
+	}
+	// "gitlab" sorts first, so it is written before "okta" fails.
+	_, err := setDashboardUserOIDCLinks(w.g.db, "alice", map[string]string{"gitlab": "alice-gl", "okta": "TAKEN"}, nil)
+	if !errors.Is(err, errOIDCUsernameTaken) {
+		t.Fatalf("conflicting link = %v, want errOIDCUsernameTaken", err)
+	}
+	if links, _ := listDashboardUserOIDC(w.g.db, "alice"); len(links) != 0 {
+		t.Errorf("a failed write left links behind: %+v", links)
+	}
+}
+
+func TestOIDCMigrationCopiesTheGitLabLinks(t *testing.T) {
+	w := newUsersTestMux(t)
+	db := w.g.db
+	// Roll the schema back to 0029, where a link lived on the user row.
+	for _, q := range []string{
+		`DROP TABLE dashboard_user_oidc`,
+		`DELETE FROM _schema WHERE version >= 30`,
+		`UPDATE dashboard_users SET oidc_username = 'Alice-GL', oidc_subject = 'https://gitlab.com|42' WHERE username = 'alice'`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	links, err := listDashboardUserOIDC(db, "alice")
+	if err != nil || len(links) != 1 || links[0].Provider != "gitlab" || links[0].Account != "Alice-GL" || !links[0].Linked {
+		t.Fatalf("migrated links = %+v, %v", links, err)
+	}
+	if got, err := dashboardUserForOIDC(db, "gitlab", "https://gitlab.com|42", "renamed"); err != nil || got != "alice" {
+		t.Errorf("bound subject after migration = %q, %v", got, err)
+	}
+}
+
+func TestOIDCTwoProvidersOnOneIssuer(t *testing.T) {
+	// Two applications at one GitLab: each provider keeps its own links.
+	f := newFakeOIDC(t)
+	w := newOIDCTestMuxWith(t, oidcTestProvider{"gitlab", f, ""}, oidcTestProvider{"gitlab-ops", f, ""})
+	if err := createDashboardUser(w.g.db, "bob", usersTestMemberPassword, dashboardRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	linkAt(t, w, "alice", "gitlab", "alice-gl")
+	linkAt(t, w, "bob", "gitlab-ops", "alice-gl")
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab", nil)); got != "alice" {
+		t.Errorf("sign-in at gitlab as %q, want alice", got)
+	}
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, "gitlab-ops", nil)); got != "bob" {
+		t.Errorf("sign-in at gitlab-ops as %q, want bob", got)
 	}
 }

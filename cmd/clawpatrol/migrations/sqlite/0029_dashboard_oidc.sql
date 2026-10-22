@@ -1,28 +1,21 @@
--- 0029_dashboard_oidc — sign in through OpenID Connect providers
--- (gateway.dashboard_oidc "<provider>" blocks) as an admin-linked
--- dashboard user.
+-- 0029_dashboard_oidc — sign in through an OpenID Connect provider
+-- (GitLab.com) as an admin-linked dashboard user.
 --
--- An admin links a user to an account at a provider (account: the
--- provider's username claim, e.g. a GitLab username or an Entra ID
--- UPN). The first sign-in as that account binds the provider's
--- permanent user id (subject, "<issuer>|<sub>"); from then on the
--- subject alone identifies the user, so a renamed or recycled account
--- name cannot take the user over. One link per user and provider; a
--- user may be linked at several providers. A user with an empty
--- password_hash has no password and signs in only through a provider.
+-- An admin links a user to a provider username (oidc_username). The
+-- first sign-in as that username binds the provider's permanent user
+-- id (oidc_subject, "<issuer>|<sub>"); from then on the subject alone
+-- identifies the user, so a renamed or recycled provider username
+-- cannot take the account over. A user with an empty password_hash has
+-- no password and can only sign in through the provider.
 --
 -- dashboard_sessions.method records how a session was opened
--- ("password" or "oidc").
+-- ("password" or "oidc"), for display and for the password-change
+-- check.
 
-CREATE TABLE dashboard_user_oidc (
-  provider TEXT NOT NULL,
-  username TEXT NOT NULL,
-  account  TEXT NOT NULL,
-  subject  TEXT NOT NULL DEFAULT '',
-  PRIMARY KEY (provider, username)
-);
--- Account names compare case-insensitively; one account links one user.
-CREATE UNIQUE INDEX dashboard_user_oidc_account ON dashboard_user_oidc (provider, lower(account));
-CREATE UNIQUE INDEX dashboard_user_oidc_subject ON dashboard_user_oidc (subject) WHERE subject != '';
+ALTER TABLE dashboard_users ADD COLUMN oidc_username TEXT NOT NULL DEFAULT '';
+ALTER TABLE dashboard_users ADD COLUMN oidc_subject TEXT NOT NULL DEFAULT '';
+CREATE UNIQUE INDEX dashboard_users_oidc_subject ON dashboard_users (oidc_subject) WHERE oidc_subject != '';
+-- Provider usernames compare case-insensitively; one account links one user.
+CREATE UNIQUE INDEX dashboard_users_oidc_username ON dashboard_users (lower(oidc_username)) WHERE oidc_username != '';
 
 ALTER TABLE dashboard_sessions ADD COLUMN method TEXT NOT NULL DEFAULT 'password';

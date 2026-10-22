@@ -541,6 +541,9 @@ export function updateUser(
     approver?: string;
     // oidc sets the account at each named provider; "" unlinks.
     oidc?: Record<string, string>;
+    // oidc_rebind keeps the account at each named provider but forgets
+    // its bound subject: the next sign-in binds afresh.
+    oidc_rebind?: string[];
   },
 ) {
   return postUsers("/api/users/update", { username, ...change });

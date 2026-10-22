@@ -236,10 +236,15 @@ Each `gateway.dashboard_oidc "<name>"` block adds sign-in through an
 OpenID Connect provider — GitLab.com by default, Entra ID, Google,
 Keycloak, a self-managed GitLab — side by side, with per-provider
 `scopes`, `username_claim`, `groups_claim`, `groups_source` and
-`group_match` (defaults suit GitLab.com, and the common convention
-elsewhere). Accounts are admin-linked, one link per user and provider
+`group_match` (defaults suit GitLab.com, any GitLab with
+`kind = "gitlab"`, and the common convention elsewhere; an `email`
+username needs `email_verified`). Accounts are admin-linked, one link per user and provider
 (`dashboard_user_oidc`): the first sign-in binds the provider's
-permanent subject id, and only a bound subject decides afterwards.
+permanent subject id, and only a bound subject decides afterwards; an
+admin can reset the binding for a recreated provider account. Links at
+a removed provider are kept and can be unlinked; no change may leave a
+user with no way to sign in. Migration 0030 moved the earlier
+single-provider links to the provider name `gitlab`.
 Optional `allowed_groups` refuses non-members first. Sessions record
 their method (`password` / `oidc`); a linked user may have no
 password. Setup: `site/doc/configure-gateway.md`.
