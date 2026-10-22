@@ -292,12 +292,22 @@ type DashboardOIDCBlock struct {
 // none.
 const DefaultOIDCIssuer = "https://gitlab.com"
 
-// IssuerOrDefault returns the configured issuer, or GitLab.com.
+// IssuerOrDefault returns the configured issuer, exactly as written
+// (a trailing slash is part of some providers' issuer), or GitLab.com.
 func (b *DashboardOIDCBlock) IssuerOrDefault() string {
 	if b == nil || strings.TrimSpace(b.Issuer) == "" {
 		return DefaultOIDCIssuer
 	}
-	return strings.TrimRight(strings.TrimSpace(b.Issuer), "/")
+	return strings.TrimSpace(b.Issuer)
+}
+
+// ProviderName names the provider in the dashboard: "GitLab" for
+// GitLab.com, else "SSO".
+func (b *DashboardOIDCBlock) ProviderName() string {
+	if strings.TrimRight(b.IssuerOrDefault(), "/") == DefaultOIDCIssuer {
+		return "GitLab"
+	}
+	return "SSO"
 }
 
 // Label returns the login button's text.
@@ -308,10 +318,7 @@ func (b *DashboardOIDCBlock) Label() string {
 	if b.ButtonLabel != "" {
 		return b.ButtonLabel
 	}
-	if b.IssuerOrDefault() == DefaultOIDCIssuer {
-		return "Sign in with GitLab"
-	}
-	return "Sign in with SSO"
+	return "Sign in with " + b.ProviderName()
 }
 
 // GenAITelemetryBlock is the body of the `genai_telemetry { ... }`
@@ -1337,12 +1344,6 @@ func validateOperational(gw *Gateway) hcl.Diagnostics {
 	return diags
 }
 
-// validateRetentionDuration flags a retention setting that is neither
-// empty, the "0" / "off" disable sentinels, nor a valid non-negative
-// time.ParseDuration string. Zero-valued durations ("0s") are allowed
-// and mean the same as "0": disable / keep forever. Negative durations
-// are rejected — downstream they would put the sweep cutoff in the
-// future and delete everything, the inverse of a retention floor.
 // validateDashboardOIDC checks the dashboard_oidc block: an https
 // issuer (http only for a loopback provider), a client ID, and the
 // public_url its callback lives under.
@@ -1378,6 +1379,12 @@ func isLoopbackHost(host string) bool {
 	return ip != nil && ip.IsLoopback()
 }
 
+// validateRetentionDuration flags a retention setting that is neither
+// empty, the "0" / "off" disable sentinels, nor a valid non-negative
+// time.ParseDuration string. Zero-valued durations ("0s") are allowed
+// and mean the same as "0": disable / keep forever. Negative durations
+// are rejected — downstream they would put the sweep cutoff in the
+// future and delete everything, the inverse of a retention floor.
 func validateRetentionDuration(name, val string) hcl.Diagnostics {
 	v := strings.TrimSpace(val)
 	if v == "" || v == "0" || v == "off" {

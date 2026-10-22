@@ -45,7 +45,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
       setDeclared({
         profiles: list.profiles,
         approvers: list.human_approvers,
-        oidcProvider: list.oidc ? providerName(list.oidc.issuer) : null,
+        oidcProvider: list.oidc?.provider ?? null,
       });
       setErr("");
     } catch (e) {
@@ -82,12 +82,6 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
 // Declared is what the config offers for assignment, and the single
 // sign-on provider's name when gateway.dashboard_oidc is set.
 type Declared = { profiles: string[]; approvers: string[]; oidcProvider: string | null };
-
-const GITLAB_ISSUER = "https://gitlab.com";
-
-function providerName(issuer: string): string {
-  return issuer === GITLAB_ISSUER ? "GitLab" : "SSO";
-}
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (

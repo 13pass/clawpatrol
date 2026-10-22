@@ -15,6 +15,8 @@ import (
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
+var errSSONotConfigured = errors.New("single sign-on is not configured (gateway.dashboard_oidc); a linked account could never sign in")
+
 // humanApproverType is the approver plugin a user's "require approval"
 // rules may route to.
 const humanApproverType = "human_approver"
@@ -57,7 +59,7 @@ func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
 	policy := w.g.Policy()
 	var oidc any
 	if b := w.g.cfg.Load().DashboardOIDC(); b != nil {
-		oidc = map[string]string{"issuer": b.IssuerOrDefault(), "label": b.Label()}
+		oidc = map[string]string{"issuer": b.IssuerOrDefault(), "label": b.Label(), "provider": b.ProviderName()}
 	}
 	writeJSON(rw, map[string]any{
 		"users":           users,
@@ -135,6 +137,10 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		body.Role = dashboardRoleMember
 	}
 	body.OIDCUsername = strings.TrimPrefix(strings.TrimSpace(body.OIDCUsername), "@")
+	if body.OIDCUsername != "" && w.g.cfg.Load().DashboardOIDC() == nil {
+		http.Error(rw, errSSONotConfigured.Error(), http.StatusBadRequest)
+		return
+	}
 	if body.OIDCUsername != "" && !validOIDCUsername(body.OIDCUsername) {
 		http.Error(rw, "that is not a valid sign-in account username", http.StatusBadRequest)
 		return
@@ -200,10 +206,31 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "nothing to update: set role, password, profiles, approver and/or oidc_username", http.StatusBadRequest)
 		return
 	}
+	caller, _ := principalFromContext(r.Context())
 	if body.OIDCUsername != nil {
 		v := strings.TrimPrefix(strings.TrimSpace(*body.OIDCUsername), "@")
+		if v != "" && w.g.cfg.Load().DashboardOIDC() == nil {
+			http.Error(rw, errSSONotConfigured.Error(), http.StatusBadRequest)
+			return
+		}
 		if v != "" && !validOIDCUsername(v) {
 			http.Error(rw, "that is not a valid sign-in account username", http.StatusBadRequest)
+			return
+		}
+		// Linking an account decides who may sign in as the user: one
+		// admin must not be able to take over another's (or root's).
+		if role, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		} else if exists && role == dashboardRoleAdmin && caller.Owner != body.Username {
+			http.Error(rw, "an admin's sign-in account can only be linked by that admin", http.StatusForbidden)
+			return
+		}
+		if taken, err := oidcUsernameTaken(w.g.db, v, body.Username); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		} else if taken {
+			http.Error(rw, errOIDCUsernameTaken.Error(), http.StatusConflict)
 			return
 		}
 		body.OIDCUsername = &v
@@ -273,7 +300,8 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if body.OIDCUsername != nil {
-		switch err := setDashboardUserOIDCUsername(w.g.db, body.Username, *body.OIDCUsername); {
+		changed, err := setDashboardUserOIDCUsername(w.g.db, body.Username, *body.OIDCUsername)
+		switch {
 		case errors.Is(err, errDashboardUserNotFound):
 			http.Error(rw, err.Error(), http.StatusNotFound)
 			return
@@ -284,7 +312,21 @@ func (w *webMux) apiUsersUpdate(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		log.Printf("dashboard auth: user %q linked to sign-in account %q", body.Username, *body.OIDCUsername)
+		if changed {
+			log.Printf("dashboard auth: user %q linked to sign-in account %q", body.Username, *body.OIDCUsername)
+			// Relinking ends the user's sessions; one changing their own
+			// link stays signed in.
+			if caller.Owner == body.Username && caller.Kind == principalDashboardPassword {
+				method := caller.Method
+				if method == "" {
+					method = sessionMethodPassword
+				}
+				if err := w.mintAndSetSessionCookieWithMethod(rw, caller.Owner, method); err != nil {
+					http.Error(rw, "linked, but could not mint a new session; log in again", http.StatusInternalServerError)
+					return
+				}
+			}
+		}
 	}
 	if body.Approver != nil {
 		if err := setDashboardUserApprover(w.g.db, body.Username, *body.Approver); errors.Is(err, errDashboardUserNotFound) {

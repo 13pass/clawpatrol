@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/hmac"
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -11,6 +14,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -30,12 +34,16 @@ import (
 const (
 	oidcStartPath    = "/__login/oidc"
 	oidcCallbackPath = "/__login/oidc/callback"
-	// oidcStateCookie binds a callback to the browser that started the
-	// sign-in, so a third party cannot complete it with their own code.
+	// oidcStateCookie carries a sign-in in progress — state, nonce,
+	// PKCE verifier and where to go after — signed with a key that
+	// never leaves the gateway. Holding it in the browser binds the
+	// callback to the browser that started the sign-in, and leaves no
+	// server-side table a stranger could fill.
 	oidcStateCookie = "cp_oidc_state"
+	// auditKindOIDC marks sign-ins through the provider in the audit log.
+	auditKindOIDC = "oidc"
 
 	oidcPendingTTL      = 10 * time.Minute
-	oidcPendingMax      = 1024
 	oidcDiscoveryTTL    = time.Hour
 	oidcJWKSRefetchMin  = time.Minute
 	oidcClockLeeway     = time.Minute
@@ -59,9 +67,13 @@ type oidcProvider struct {
 	keysAt       time.Time
 }
 
+// oidcPending is a sign-in in progress, carried in oidcStateCookie.
 type oidcPending struct {
-	nonce, verifier, next string
-	expires               time.Time
+	State    string `json:"s"`
+	Nonce    string `json:"n"`
+	Verifier string `json:"v"`
+	Next     string `json:"x"`
+	Expires  int64  `json:"e"`
 }
 
 // oidcState is the gateway-wide sign-in state, shared by every
@@ -69,7 +81,9 @@ type oidcPending struct {
 type oidcState struct {
 	mu        sync.Mutex
 	providers map[string]*oidcProvider
-	pending   map[string]oidcPending
+	// cookieKey signs oidcStateCookie. Random per process: a restart
+	// only voids sign-ins in progress.
+	cookieKey []byte
 	// client is the HTTP client used to talk to the provider; tests
 	// replace it.
 	client *http.Client
@@ -81,9 +95,50 @@ func (g *Gateway) oidc() *oidcState {
 			g.oidcState = &oidcState{client: &http.Client{Timeout: oidcHTTPTimeout}}
 		}
 		g.oidcState.providers = map[string]*oidcProvider{}
-		g.oidcState.pending = map[string]oidcPending{}
+		g.oidcState.cookieKey = make([]byte, oidcRandomBytes)
+		if _, err := rand.Read(g.oidcState.cookieKey); err != nil {
+			panic("oidc: read random: " + err.Error())
+		}
 	})
 	return g.oidcState
+}
+
+func (s *oidcState) sign(payload []byte) string {
+	mac := hmac.New(sha256.New, s.cookieKey)
+	mac.Write(payload)
+	return base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(mac.Sum(nil))
+}
+
+func (s *oidcState) sealPending(p oidcPending) (string, error) {
+	payload, err := json.Marshal(p)
+	if err != nil {
+		return "", err
+	}
+	return s.sign(payload), nil
+}
+
+// openPending verifies and decodes a sign-in cookie; a forged,
+// tampered or expired one is refused.
+func (s *oidcState) openPending(cookie string) (oidcPending, bool) {
+	var p oidcPending
+	body, sig, ok := strings.Cut(cookie, ".")
+	if !ok {
+		return p, false
+	}
+	payload, err1 := base64.RawURLEncoding.DecodeString(body)
+	got, err2 := base64.RawURLEncoding.DecodeString(sig)
+	if err1 != nil || err2 != nil {
+		return p, false
+	}
+	mac := hmac.New(sha256.New, s.cookieKey)
+	mac.Write(payload)
+	if !hmac.Equal(got, mac.Sum(nil)) {
+		return p, false
+	}
+	if json.Unmarshal(payload, &p) != nil || time.Now().Unix() > p.Expires {
+		return p, false
+	}
+	return p, true
 }
 
 func (s *oidcState) getJSON(ctx context.Context, url, bearer string, dst any) error {
@@ -108,7 +163,8 @@ func (s *oidcState) getJSON(ctx context.Context, url, bearer string, dst any) er
 
 // provider returns the issuer's configuration, discovering it at most
 // once per oidcDiscoveryTTL. The document must name the configured
-// issuer: anything else would let tokens from another issuer in.
+// issuer exactly — the ID token's iss is checked against it, and
+// anything else would let tokens from another issuer in.
 func (s *oidcState) provider(ctx context.Context, issuer string) (*oidcProvider, error) {
 	s.mu.Lock()
 	p := s.providers[issuer]
@@ -117,16 +173,16 @@ func (s *oidcState) provider(ctx context.Context, issuer string) (*oidcProvider,
 		return p, nil
 	}
 	var doc oidcProvider
-	if err := s.getJSON(ctx, issuer+"/.well-known/openid-configuration", "", &doc); err != nil {
+	discovery := strings.TrimRight(issuer, "/") + "/.well-known/openid-configuration"
+	if err := s.getJSON(ctx, discovery, "", &doc); err != nil {
 		return nil, fmt.Errorf("discover %s: %w", issuer, err)
 	}
-	if strings.TrimRight(doc.Issuer, "/") != issuer {
-		return nil, fmt.Errorf("discovery document names issuer %q, want %q", doc.Issuer, issuer)
+	if doc.Issuer != issuer {
+		return nil, fmt.Errorf("discovery document names issuer %q; set dashboard_oidc.issuer to exactly that", doc.Issuer)
 	}
 	if doc.AuthURL == "" || doc.TokenURL == "" || doc.JWKSURL == "" {
 		return nil, fmt.Errorf("discovery document of %s lacks endpoints", issuer)
 	}
-	doc.Issuer = issuer
 	doc.discoveredAt = time.Now()
 	s.mu.Lock()
 	s.providers[issuer] = &doc
@@ -159,33 +215,6 @@ func (s *oidcState) signingKey(ctx context.Context, p *oidcProvider, kid string)
 	return nil, fmt.Errorf("unknown signing key %q", kid)
 }
 
-func (s *oidcState) addPending(state string, p oidcPending) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := time.Now()
-	for k, v := range s.pending {
-		if now.After(v.expires) {
-			delete(s.pending, k)
-		}
-	}
-	if len(s.pending) >= oidcPendingMax {
-		return errors.New("too many sign-ins in progress; try again shortly")
-	}
-	s.pending[state] = p
-	return nil
-}
-
-func (s *oidcState) takePending(state string) (oidcPending, bool) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	p, ok := s.pending[state]
-	delete(s.pending, state)
-	if !ok || time.Now().After(p.expires) {
-		return oidcPending{}, false
-	}
-	return p, true
-}
-
 func oidcRandom() (string, error) {
 	b := make([]byte, oidcRandomBytes)
 	if _, err := rand.Read(b); err != nil {
@@ -212,6 +241,12 @@ func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	next := safeDashboardLoginNext(r.URL.Query().Get("next"))
+	// The provider returns to public_url, so the sign-in cookie must be
+	// set there: start over on that host when this one is another.
+	if pu, err := url.Parse(w.g.cfg.Load().PublicURL()); err == nil && pu.Host != "" && !strings.EqualFold(pu.Host, r.Host) {
+		http.Redirect(rw, r, strings.TrimRight(pu.String(), "/")+oidcStartPath+"?next="+url.QueryEscape(next), http.StatusFound)
+		return
+	}
 	st := w.g.oidc()
 	p, err := st.provider(r.Context(), b.IssuerOrDefault())
 	if err != nil {
@@ -226,13 +261,15 @@ func (w *webMux) apiOIDCStart(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	verifier := oauth2.GenerateVerifier()
-	if err := st.addPending(state, oidcPending{nonce: nonce, verifier: verifier, next: next, expires: time.Now().Add(oidcPendingTTL)}); err != nil {
-		w.renderLogin(rw, next, err.Error(), false, http.StatusServiceUnavailable)
+	sealed, err := st.sealPending(oidcPending{State: state, Nonce: nonce, Verifier: verifier, Next: next,
+		Expires: time.Now().Add(oidcPendingTTL).Unix()})
+	if err != nil {
+		http.Error(rw, "could not start sign-in", http.StatusInternalServerError)
 		return
 	}
 	http.SetCookie(rw, &http.Cookie{
 		Name:     oidcStateCookie,
-		Value:    state,
+		Value:    sealed,
 		Path:     oidcStartPath,
 		HttpOnly: true,
 		Secure:   strings.HasPrefix(w.g.cfg.Load().PublicURL(), "https://"),
@@ -261,24 +298,27 @@ func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
 	}
 	q := r.URL.Query()
 	http.SetCookie(rw, &http.Cookie{Name: oidcStateCookie, Value: "", Path: oidcStartPath, HttpOnly: true, MaxAge: -1})
+	st := w.g.oidc()
+	var pending oidcPending
+	var opened bool
+	if c, err := r.Cookie(oidcStateCookie); err == nil {
+		pending, opened = st.openPending(c.Value)
+	}
+	next := "/"
+	if opened {
+		next = pending.Next
+	}
 	fail := func(status int, msg, auditUser string) {
-		w.recordAudit(r, auditUsername(auditUser), string(principalDashboardPassword), "login oidc", status)
-		w.renderLogin(rw, "/", msg, false, status)
+		w.recordAudit(r, auditUsername(auditUser), auditKindOIDC, "login oidc", status)
+		w.renderLogin(rw, next, msg, false, status)
 	}
 	if e := q.Get("error"); e != "" {
 		fail(http.StatusUnauthorized, "the sign-in provider refused or cancelled the sign-in", "")
 		return
 	}
 	state := q.Get("state")
-	c, err := r.Cookie(oidcStateCookie)
-	if err != nil || state == "" || subtle.ConstantTimeCompare([]byte(c.Value), []byte(state)) != 1 {
-		fail(http.StatusBadRequest, "this sign-in was not started in this browser; start again", "")
-		return
-	}
-	st := w.g.oidc()
-	pending, ok := st.takePending(state)
-	if !ok {
-		fail(http.StatusBadRequest, "this sign-in expired; start again", "")
+	if !opened || state == "" || subtle.ConstantTimeCompare([]byte(pending.State), []byte(state)) != 1 {
+		fail(http.StatusBadRequest, "this sign-in was not started in this browser, or it expired; start again", "")
 		return
 	}
 	issuer := b.IssuerOrDefault()
@@ -289,14 +329,14 @@ func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ctx := context.WithValue(r.Context(), oauth2.HTTPClient, st.client)
-	tok, err := w.oidcOAuthConfig(b, p).Exchange(ctx, q.Get("code"), oauth2.VerifierOption(pending.verifier))
+	tok, err := w.oidcOAuthConfig(b, p).Exchange(ctx, q.Get("code"), oauth2.VerifierOption(pending.Verifier))
 	if err != nil {
 		log.Printf("dashboard oidc: code exchange: %v", err)
 		fail(http.StatusUnauthorized, "the sign-in could not be completed; start again", "")
 		return
 	}
 	rawID, _ := tok.Extra("id_token").(string)
-	subject, claims, err := w.verifyOIDCIDToken(ctx, st, p, b.ClientID, rawID, pending.nonce)
+	subject, claims, err := w.verifyOIDCIDToken(ctx, st, p, b.ClientID, rawID, pending.Nonce)
 	if err != nil {
 		log.Printf("dashboard oidc: id token: %v", err)
 		fail(http.StatusUnauthorized, "the sign-in could not be verified; start again", "")
@@ -329,8 +369,8 @@ func (w *webMux) apiOIDCCallback(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "could not mint session", http.StatusInternalServerError)
 		return
 	}
-	w.recordAudit(r, username, string(principalDashboardPassword), "login oidc", http.StatusFound)
-	http.Redirect(rw, r, pending.next, http.StatusFound)
+	w.recordAudit(r, username, auditKindOIDC, "login oidc", http.StatusFound)
+	http.Redirect(rw, r, pending.Next, http.StatusFound)
 }
 
 // verifyOIDCIDToken checks an ID token's signature against the

@@ -15,5 +15,7 @@
 ALTER TABLE dashboard_users ADD COLUMN oidc_username TEXT NOT NULL DEFAULT '';
 ALTER TABLE dashboard_users ADD COLUMN oidc_subject TEXT NOT NULL DEFAULT '';
 CREATE UNIQUE INDEX dashboard_users_oidc_subject ON dashboard_users (oidc_subject) WHERE oidc_subject != '';
+-- Provider usernames compare case-insensitively; one account links one user.
+CREATE UNIQUE INDEX dashboard_users_oidc_username ON dashboard_users (lower(oidc_username)) WHERE oidc_username != '';
 
 ALTER TABLE dashboard_sessions ADD COLUMN method TEXT NOT NULL DEFAULT 'password';

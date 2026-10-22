@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -189,13 +190,10 @@ func createLinkedDashboardUser(db *sql.DB, username, password string, role dashb
 	if password == "" && oidcUsername == "" {
 		return fmt.Errorf("a user needs a password or a linked sign-in account")
 	}
-	if oidcUsername != "" {
-		var taken int
-		if err := db.QueryRow(`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?)`, oidcUsername).Scan(&taken); err != nil {
-			return err
-		} else if taken > 0 {
-			return errOIDCUsernameTaken
-		}
+	if taken, err := oidcUsernameTaken(db, oidcUsername, username); err != nil {
+		return err
+	} else if taken {
+		return errOIDCUsernameTaken
 	}
 	hash := ""
 	if password != "" {
@@ -212,6 +210,9 @@ func createLinkedDashboardUser(db *sql.DB, username, password string, role dashb
 		 ON CONFLICT(username) DO NOTHING`,
 		username, hash, string(role), oidcUsername, now, now,
 	)
+	if isUniqueViolation(err) {
+		return errOIDCUsernameTaken
+	}
 	if err != nil {
 		return err
 	}
@@ -448,52 +449,62 @@ func validOIDCUsername(name string) bool {
 	return oidcUsernameRe.MatchString(name)
 }
 
+// oidcUsernameTaken reports whether a user other than except is
+// already linked to the provider username.
+func oidcUsernameTaken(db *sql.DB, oidcUsername, except string) (bool, error) {
+	if oidcUsername == "" {
+		return false, nil
+	}
+	var n int
+	err := db.QueryRow(
+		`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND username != ?`,
+		oidcUsername, except,
+	).Scan(&n)
+	return n > 0, err
+}
+
+// isUniqueViolation reports a SQLite UNIQUE constraint failure.
+func isUniqueViolation(err error) bool {
+	return err != nil && strings.Contains(err.Error(), "UNIQUE constraint failed")
+}
+
 // setDashboardUserOIDCUsername links username to a provider account
-// ("" unlinks). Changing the link drops the bound subject: the next
-// sign-in as the new account binds it afresh. Provider usernames
-// compare case-insensitively, as GitLab's do.
-func setDashboardUserOIDCUsername(db *sql.DB, username, oidcUsername string) error {
+// ("" unlinks) and reports whether the link changed. A change drops
+// the bound subject — the next sign-in as the new account binds it
+// afresh — and ends the user's sessions, since a different account
+// may now sign in as them. Provider usernames compare
+// case-insensitively, as GitLab's do.
+func setDashboardUserOIDCUsername(db *sql.DB, username, oidcUsername string) (bool, error) {
 	if db == nil {
-		return fmt.Errorf("no db")
+		return false, fmt.Errorf("no db")
 	}
-	tx, err := db.Begin()
+	var current string
+	err := db.QueryRow(`SELECT oidc_username FROM dashboard_users WHERE username = ?`, username).Scan(&current)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, errDashboardUserNotFound
+	}
 	if err != nil {
-		return err
+		return false, err
 	}
-	defer func() { _ = tx.Rollback() }()
-	if oidcUsername != "" {
-		var taken int
-		if err := tx.QueryRow(
-			`SELECT COUNT(*) FROM dashboard_users WHERE lower(oidc_username) = lower(?) AND username != ?`,
-			oidcUsername, username,
-		).Scan(&taken); err != nil {
-			return err
-		}
-		if taken > 0 {
-			return errOIDCUsernameTaken
-		}
+	if strings.EqualFold(current, oidcUsername) {
+		return false, nil
 	}
-	res, err := tx.Exec(
-		`UPDATE dashboard_users
-		 SET oidc_subject = CASE WHEN lower(oidc_username) = lower(?) THEN oidc_subject ELSE '' END,
-		     oidc_username = ?, updated_ns = ?
-		 WHERE username = ?`,
-		oidcUsername, oidcUsername, time.Now().UnixNano(), username,
+	if taken, err := oidcUsernameTaken(db, oidcUsername, username); err != nil {
+		return false, err
+	} else if taken {
+		return false, errOIDCUsernameTaken
+	}
+	_, err = db.Exec(
+		`UPDATE dashboard_users SET oidc_username = ?, oidc_subject = '', updated_ns = ? WHERE username = ?`,
+		oidcUsername, time.Now().UnixNano(), username,
 	)
+	if isUniqueViolation(err) {
+		return false, errOIDCUsernameTaken
+	}
 	if err != nil {
-		return err
+		return false, err
 	}
-	if n, err := res.RowsAffected(); err != nil {
-		return err
-	} else if n == 0 {
-		return errDashboardUserNotFound
-	}
-	if err := tx.Commit(); err != nil {
-		return err
-	}
-	// A different account now signs in as this user: end the sessions
-	// the previous one opened.
-	return revokeAllDashboardSessionsFor(db, username)
+	return true, revokeAllDashboardSessionsFor(db, username)
 }
 
 // dashboardUserForOIDC resolves a provider sign-in to the dashboard

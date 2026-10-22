@@ -503,7 +503,7 @@ export async function listUsers(): Promise<{
   profiles: string[];
   human_approvers: string[];
   // oidc is set when gateway.dashboard_oidc offers single sign-on.
-  oidc: { issuer: string; label: string } | null;
+  oidc: { issuer: string; label: string; provider: string } | null;
 }> {
   const r = await api("/api/users");
   if (!r.ok) throw new Error(await r.text());

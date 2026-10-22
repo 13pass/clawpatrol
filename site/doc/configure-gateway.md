@@ -169,7 +169,8 @@ password. Only users an admin has linked get in.
    ```
 
    `issuer` defaults to `https://gitlab.com`; set it for a
-   self-managed GitLab or any other OpenID Connect provider.
+   self-managed GitLab or any other OpenID Connect provider, exactly
+   as the provider's discovery document spells it (some end in `/`).
 4. On the dashboard's **Users** page, create the user with their
    GitLab username (the password may then be left empty), or link an
    existing user with **Link GitLab**.
@@ -179,7 +180,11 @@ as a linked username binds that GitLab account's permanent id; from
 then on the id decides, so renaming the GitLab account keeps access
 and a recycled username gets none. To point a user at a different
 GitLab account, change the link: that unbinds the old id and ends the
-user's sessions. Keep `root` on a password as the break-glass account.
+user's sessions. An admin can link members, and their own account;
+another admin's — or `root`'s — only that admin can link. Keep `root`
+on a password as the break-glass account: removing the
+`dashboard_oidc` block later leaves users without a password unable to
+sign in until an admin gives them one.
 
 ### Where to bind the dashboard
 

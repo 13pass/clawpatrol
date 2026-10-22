@@ -3,6 +3,7 @@ package main
 import (
 	"crypto/rand"
 	"crypto/rsa"
+	"encoding/base64"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -37,9 +38,11 @@ type fakeOIDC struct {
 	lastSeen string
 	audience string
 	issuer   string
-	expires  time.Duration
-	signKey  *rsa.PrivateKey
-	groups   []string
+	// slash makes the provider's own issuer end in "/".
+	slash   bool
+	expires time.Duration
+	signKey *rsa.PrivateKey
+	groups  []string
 }
 
 func newFakeOIDC(t *testing.T) *fakeOIDC {
@@ -51,8 +54,12 @@ func newFakeOIDC(t *testing.T) *fakeOIDC {
 	f := &fakeOIDC{key: key, sub: "4242", user: "alice-gl", audience: oidcTestClientID, expires: time.Hour}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/openid-configuration", func(rw http.ResponseWriter, r *http.Request) {
+		issuer := f.srv.URL
+		if f.slash {
+			issuer += "/"
+		}
 		_ = json.NewEncoder(rw).Encode(map[string]string{
-			"issuer":                 f.srv.URL,
+			"issuer":                 issuer,
 			"authorization_endpoint": f.srv.URL + "/authorize",
 			"token_endpoint":         f.srv.URL + "/token",
 			"userinfo_endpoint":      f.srv.URL + "/userinfo",
@@ -103,6 +110,9 @@ func (f *fakeOIDC) idToken(t *testing.T) string {
 		t.Fatal(err)
 	}
 	issuer := f.srv.URL
+	if f.slash {
+		issuer += "/"
+	}
 	if f.issuer != "" {
 		issuer = f.issuer
 	}
@@ -121,14 +131,20 @@ func (f *fakeOIDC) idToken(t *testing.T) string {
 	return raw
 }
 
+const oidcTestHost = "gw.example.test"
+
 func newOIDCTestMux(t *testing.T, f *fakeOIDC, allowedGroups string) *webMux {
 	t.Helper()
 	w := newUsersTestMux(t)
+	issuer := f.srv.URL
+	if f.slash {
+		issuer += "/"
+	}
 	src := `gateway {
-  public_url = "https://gw.example.test"
+  public_url = "https://` + oidcTestHost + `"
   wireguard { subnet_cidr = "10.55.0.0/24" }
   dashboard_oidc {
-    issuer         = "` + f.srv.URL + `"
+    issuer         = "` + issuer + `"
     client_id      = "` + oidcTestClientID + `"
     client_secret  = "s3cret"
     ` + allowedGroups + `
@@ -150,7 +166,9 @@ func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, tamper func(state *string,
 	t.Helper()
 	h := w.handler()
 	rw := httptest.NewRecorder()
-	h.ServeHTTP(rw, httptest.NewRequest(http.MethodGet, oidcStartPath+"?next=/%23/rules", nil))
+	start := httptest.NewRequest(http.MethodGet, oidcStartPath+"?next=/%23/rules", nil)
+	start.Host = oidcTestHost
+	h.ServeHTTP(rw, start)
 	if rw.Code != http.StatusFound {
 		t.Fatalf("start = %d %s", rw.Code, rw.Body.String())
 	}
@@ -172,13 +190,17 @@ func oidcSignIn(t *testing.T, w *webMux, f *fakeOIDC, tamper func(state *string,
 		}
 	}
 	state := q.Get("state")
-	if cookie == nil || cookie.Value != state {
-		t.Fatalf("state cookie %v does not match state %q", cookie, state)
+	if cookie == nil {
+		t.Fatal("no sign-in cookie set")
+	}
+	if pending, ok := w.g.oidc().openPending(cookie.Value); !ok || pending.State != state {
+		t.Fatalf("sign-in cookie does not carry state %q", state)
 	}
 	if tamper != nil {
 		tamper(&state, cookie)
 	}
 	req := httptest.NewRequest(http.MethodGet, oidcCallbackPath+"?code="+oidcTestCode+"&state="+url.QueryEscape(state), nil)
+	req.Host = oidcTestHost
 	if cookie != nil {
 		req.AddCookie(cookie)
 	}
@@ -207,7 +229,7 @@ func signedInAs(t *testing.T, w *webMux, rw *httptest.ResponseRecorder) string {
 func TestOIDCSignInBindsTheLinkedUserBySubject(t *testing.T) {
 	f := newFakeOIDC(t)
 	w := newOIDCTestMux(t, f, "")
-	if err := setDashboardUserOIDCUsername(w.g.db, "alice", "Alice-GL"); err != nil {
+	if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "Alice-GL"); err != nil {
 		t.Fatal(err)
 	}
 	rw := oidcSignIn(t, w, f, nil)
@@ -254,8 +276,15 @@ func TestOIDCSignInRejectsForgedOrMisboundResponses(t *testing.T) {
 		tamper   func(state *string, cookie *http.Cookie)
 		want     int
 	}{
-		"no state cookie":       {tamper: func(_ *string, c *http.Cookie) { c.Value = "" }, want: http.StatusBadRequest},
-		"cookie of another run": {tamper: func(_ *string, c *http.Cookie) { c.Value = "forged" }, want: http.StatusBadRequest},
+		"no state cookie":        {tamper: func(_ *string, c *http.Cookie) { c.Value = "" }, want: http.StatusBadRequest},
+		"cookie of another run":  {tamper: func(_ *string, c *http.Cookie) { c.Value = "forged" }, want: http.StatusBadRequest},
+		"state not the cookie's": {tamper: func(s *string, _ *http.Cookie) { *s = "another-state" }, want: http.StatusBadRequest},
+		"tampered cookie": {tamper: func(_ *string, c *http.Cookie) {
+			body, sig, _ := strings.Cut(c.Value, ".")
+			payload, _ := base64.RawURLEncoding.DecodeString(body)
+			payload = []byte(strings.Replace(string(payload), `"x":"/#/rules"`, `"x":"/evil"`, 1))
+			c.Value = base64.RawURLEncoding.EncodeToString(payload) + "." + sig
+		}, want: http.StatusBadRequest},
 		"wrong nonce":           {provider: func(f *fakeOIDC) { f.nonce = "replayed" }, want: http.StatusUnauthorized},
 		"wrong audience":        {provider: func(f *fakeOIDC) { f.audience = "another-app" }, want: http.StatusUnauthorized},
 		"wrong issuer":          {provider: func(f *fakeOIDC) { f.issuer = "https://evil.example" }, want: http.StatusUnauthorized},
@@ -265,7 +294,7 @@ func TestOIDCSignInRejectsForgedOrMisboundResponses(t *testing.T) {
 	for name, tc := range cases {
 		f := newFakeOIDC(t)
 		w := newOIDCTestMux(t, f, "")
-		if err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
+		if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
 			t.Fatal(err)
 		}
 		if tc.provider != nil {
@@ -291,7 +320,7 @@ func TestOIDCAllowedGroups(t *testing.T) {
 		f := newFakeOIDC(t)
 		f.groups = tc.groups
 		w := newOIDCTestMux(t, f, `allowed_groups = ["unrcs/dco"]`)
-		if err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
+		if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
 			t.Fatal(err)
 		}
 		if rw := oidcSignIn(t, w, f, nil); rw.Code != tc.want {
@@ -327,6 +356,13 @@ func TestPasswordlessLinkedUser(t *testing.T) {
 		t.Errorf("passwordless user setting a password = %d, want 400", rw.Code)
 	}
 
+	// Saving the same link (any case) changes nothing and keeps sessions.
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc_username":"Carol-GL"}`); rw.Code != http.StatusOK {
+		t.Fatalf("unchanged link = %d %s", rw.Code, rw.Body.String())
+	}
+	if rw := serveAs(t, h, carol, http.MethodGet, "/api/me", ""); rw.Code != http.StatusOK {
+		t.Errorf("carol's session after an unchanged link = %d, want 200", rw.Code)
+	}
 	// Relinking to another account unbinds the subject and ends sessions.
 	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"carol","oidc_username":"carol-new"}`); rw.Code != http.StatusOK {
 		t.Fatalf("relink = %d %s", rw.Code, rw.Body.String())
@@ -377,5 +413,91 @@ func TestDashboardOIDCConfigValidation(t *testing.T) {
 		if !tc.ok && !strings.Contains(diags.Error(), "dashboard_oidc") {
 			t.Errorf("%s: rejected for another reason: %v", name, diags)
 		}
+	}
+}
+
+func TestOIDCAccountLinkingRules(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
+	h := w.handler()
+	if err := createDashboardUser(w.g.db, "ada", "ada-passphrase-1234", dashboardRoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	ada := sessionCookieFor(t, w, "ada")
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+
+	// One admin cannot link another admin, or root, to an account.
+	for _, target := range []string{dashboardRootUsername, "ada"} {
+		caller := ada
+		if target == "ada" {
+			caller = root
+		}
+		if rw := serveAs(t, h, caller, http.MethodPost, "/api/users/update", `{"username":"`+target+`","oidc_username":"takeover"}`); rw.Code != http.StatusForbidden {
+			t.Errorf("linking admin %s = %d, want 403", target, rw.Code)
+		}
+	}
+	// An admin may link their own account, and stays signed in.
+	rw := serveAs(t, h, ada, http.MethodPost, "/api/users/update", `{"username":"ada","oidc_username":"ada-gl"}`)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("self link = %d %s", rw.Code, rw.Body.String())
+	}
+	if got := sessionUserFromResponse(t, w, rw); got != "ada" {
+		t.Errorf("self link did not re-mint the caller's session (got %q)", got)
+	}
+
+	// A refused link leaves no partial change behind.
+	if rw := serveAs(t, h, root, http.MethodPost, "/api/users/update", `{"username":"alice","role":"admin","oidc_username":"ADA-GL"}`); rw.Code != http.StatusConflict {
+		t.Fatalf("link to a taken account = %d, want 409", rw.Code)
+	}
+	if role, _, _ := lookupDashboardUserRole(w.g.db, "alice"); role != dashboardRoleMember {
+		t.Errorf("refused request promoted alice to %q", role)
+	}
+
+	// The database itself refuses a second link to one account.
+	if _, err := w.g.db.Exec(`UPDATE dashboard_users SET oidc_username = 'Ada-GL' WHERE username = 'alice'`); !isUniqueViolation(err) {
+		t.Errorf("duplicate link at the database = %v, want a UNIQUE violation", err)
+	}
+}
+
+func TestOIDCLinkNeedsSSOConfigured(t *testing.T) {
+	w := newUsersTestMux(t)
+	h := w.handler()
+	root := sessionCookieFor(t, w, dashboardRootUsername)
+	for path, body := range map[string]string{
+		"/api/users/create": `{"username":"bob","oidc_username":"bob-gl"}`,
+		"/api/users/update": `{"username":"alice","oidc_username":"alice-gl"}`,
+	} {
+		if rw := serveAs(t, h, root, http.MethodPost, path, body); rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "not configured") {
+			t.Errorf("%s without dashboard_oidc = %d %s", path, rw.Code, rw.Body.String())
+		}
+	}
+}
+
+func TestOIDCStartMovesToPublicURLHost(t *testing.T) {
+	f := newFakeOIDC(t)
+	w := newOIDCTestMux(t, f, "")
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodGet, oidcStartPath+"?next=/x", nil)
+	req.Host = "100.64.0.1:8080"
+	w.handler().ServeHTTP(rw, req)
+	if want := "https://" + oidcTestHost + oidcStartPath + "?next=%2Fx"; rw.Code != http.StatusFound || rw.Header().Get("Location") != want {
+		t.Fatalf("start on another host = %d → %q, want %q", rw.Code, rw.Header().Get("Location"), want)
+	}
+	for _, c := range rw.Result().Cookies() {
+		if c.Name == oidcStateCookie {
+			t.Fatal("sign-in cookie set on the wrong host")
+		}
+	}
+}
+
+func TestOIDCIssuerWithTrailingSlash(t *testing.T) {
+	f := newFakeOIDC(t)
+	f.slash = true
+	w := newOIDCTestMux(t, f, "")
+	if _, err := setDashboardUserOIDCUsername(w.g.db, "alice", "alice-gl"); err != nil {
+		t.Fatal(err)
+	}
+	if got := signedInAs(t, w, oidcSignIn(t, w, f, nil)); got != "alice" {
+		t.Fatalf("sign-in with a trailing-slash issuer signed in as %q", got)
 	}
 }

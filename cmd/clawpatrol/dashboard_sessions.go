@@ -24,15 +24,15 @@ func hashSessionToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// createDashboardSession mints a new session for username, persists
-// it, and returns the raw cookie value. Caller sets that as the
-// cookie value; the DB only holds its SHA-256.
 // How a dashboard session was opened.
 const (
 	sessionMethodPassword = "password"
 	sessionMethodOIDC     = "oidc"
 )
 
+// createDashboardSession mints a new session for username, persists
+// it, and returns the raw cookie value. Caller sets that as the
+// cookie value; the DB only holds its SHA-256.
 func createDashboardSession(db *sql.DB, username string, ttl time.Duration) (string, error) {
 	return createDashboardSessionWithMethod(db, username, sessionMethodPassword, ttl)
 }
