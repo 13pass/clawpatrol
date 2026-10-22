@@ -189,7 +189,22 @@ profile, and a deleted user's file is renamed to
 - The client sends `{action_id, verdict, scope, approver}`; raw-HCL
   `/api/config/apply` stays admin-only.
 
-### Phase 4 — scope every API
+### Phase 4 — scope every API (done)
+
+Built as listed below, with these decisions:
+
+- A member manages a credential's secret only when every profile
+  using it is theirs (`viewer.managesCredential`); a shared credential
+  is visible but admin-managed. OAuth sessions record who started
+  them.
+- A member decides only approvals raised by rules of their own file
+  (`HITLPending` now carries `profile` and `rule`).
+- The live stream re-reads the member's profiles on every keepalive.
+- Clearing a credential's secrets when it leaves the HCL was dropped:
+  doing it on reload would wipe the secret of a credential commented
+  out for a moment. Orphans stay; a re-declared name reuses them.
+
+Original plan:
 
 The security-critical phase. Each route gets an ownership check or a
 filter, and a cross-tenant test (user A against user B's resource must

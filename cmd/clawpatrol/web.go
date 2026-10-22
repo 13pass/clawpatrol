@@ -1232,12 +1232,12 @@ func (w *webMux) selectedProfileForRequest(r *http.Request) (key, label string) 
 // fall back to the bare whois lookup only when no principal is on
 // the context (e.g. on a route the gate let through without one,
 // which shouldn't happen for authDashboard but stays defensive).
-func (w *webMux) whoamiData(r *http.Request) map[string]string {
+func (w *webMux) whoamiData(r *http.Request) map[string]any {
 	pu := w.g.cfg.Load().PublicURL()
 	if pu == "" {
 		pu = w.publicURL
 	}
-	out := map[string]string{
+	out := map[string]any{
 		"user":        "",
 		"device":      "",
 		"host":        "",
@@ -1255,6 +1255,12 @@ func (w *webMux) whoamiData(r *http.Request) map[string]string {
 			out["auth_method"] = "password"
 		case principalTailnet:
 			out["auth_method"] = "tailscale"
+		}
+		// A member's profiles and approver shape what the dashboard
+		// offers them.
+		if v, err := w.viewerFor(r); err == nil && !v.admin {
+			out["profiles"] = v.sortedProfiles()
+			out["approver"] = v.approver
 		}
 		return out
 	}

@@ -52,6 +52,9 @@ export type TailscaleAuthStatusUI = {
 // directly on the row; multi-tenant per-owner fan-out was removed.
 export type Integration = {
   id: string;
+  // manageable: may the viewer change this credential's secret? False
+  // for a member on a credential other teams' profiles also use.
+  manageable: boolean;
   name: string;
   type: string; // credential plugin type (e.g. "postgres_credential")
   has_oauth: boolean;
@@ -469,31 +472,6 @@ export type Whoami = {
   profiles?: string[];
   approver?: string;
 };
-
-type MeResp = {
-  username: string;
-  role: DashboardRole;
-  auth_kind: "dashboard_password" | "tailnet";
-  profiles: string[];
-  approver: string;
-};
-
-// getMe is the one identity call a member may make; the SPA falls
-// back to it when /api/state is refused.
-export async function getMe(): Promise<Whoami> {
-  const r = await fetch("/api/me", { credentials: "same-origin" });
-  if (!r.ok) throw new Error(await r.text());
-  const me = (await r.json()) as MeResp;
-  return {
-    user: me.username,
-    device: "",
-    host: "",
-    auth_method: me.auth_kind === "dashboard_password" ? "password" : "tailscale",
-    role: me.role,
-    profiles: me.profiles,
-    approver: me.approver,
-  };
-}
 
 export async function changeOwnPassword(current: string, next: string): Promise<void> {
   const r = await api("/api/me/password", {

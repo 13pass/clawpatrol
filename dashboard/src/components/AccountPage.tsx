@@ -14,7 +14,7 @@ export function AccountPage({ whoami }: { whoami: Whoami | null }) {
   return (
     <Main>
       <PageTitle trail={[{ label: "Account" }]} />
-      {whoami?.role === "member" && <MemberNotice />}
+      {whoami?.role === "member" && <MemberNotice profiles={whoami.profiles ?? []} />}
       <section className="bg-canvas border-1.5 border-navy p-4 space-y-4">
         {whoami?.user ? <Identity whoami={whoami} /> : <NotLoggedIn />}
       </section>
@@ -27,14 +27,20 @@ export function AccountPage({ whoami }: { whoami: Whoami | null }) {
   );
 }
 
-// MemberNotice explains the empty dashboard a member sees until the
-// gateway's APIs are scoped to their own profiles.
-function MemberNotice() {
+// MemberNotice tells a member what their account covers.
+function MemberNotice({ profiles }: { profiles: string[] }) {
   return (
     <section className="bg-butter-100 border-1.5 border-butter-300 p-4 text-sm text-text">
-      Your account has the <span className="font-bold">member</span> role. Devices, requests and
-      credentials of your own profiles are not available to members yet; ask an admin for anything
-      you need in the meantime.
+      Your account has the <span className="font-bold">member</span> role. You see and manage the
+      devices, requests, approvals and rules of{" "}
+      {profiles.length ? (
+        <>
+          your profiles: <span className="font-mono font-bold">{profiles.join(", ")}</span>
+        </>
+      ) : (
+        "your profiles — none are assigned yet; ask an admin"
+      )}
+      . Credentials shared with other teams are managed by an admin.
     </section>
   );
 }

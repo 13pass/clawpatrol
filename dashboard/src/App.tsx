@@ -1,4 +1,4 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useState } from "react";
 import { AccountPage } from "./components/AccountPage";
 import { AgentsTable, sortAgents } from "./components/AgentsTable";
 import { AnalyticsPage } from "./components/AnalyticsPage";
@@ -17,14 +17,7 @@ import { RequestsPage } from "./components/RequestsPage";
 import { RulesPage } from "./components/RulesPage";
 import { SettingsPage } from "./components/SettingsPage";
 import { UsersPage } from "./components/UsersPage";
-import {
-  getMe,
-  getState,
-  type Agent,
-  type Integration,
-  type UpdateBanner,
-  type Whoami,
-} from "./lib/api";
+import { getState, type Agent, type Integration, type UpdateBanner, type Whoami } from "./lib/api";
 
 type Route =
   | { name: "main" }
@@ -84,26 +77,12 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash);
   }, []);
 
-  // Set once /api/state refuses us: members can't read it, so polling
-  // it would only produce a 403 every 5 s.
-  const stateRefused = useRef(false);
-
   async function refresh() {
-    if (stateRefused.current) {
-      try {
-        const me = await getMe();
-        setWhoami(me);
-        // Promoted while the tab was open: resume the full poll.
-        stateRefused.current = me.role === "member";
-      } catch {
-        /* swallow */
-      }
-      if (stateRefused.current) return;
-    }
     try {
       // Single round-trip; getState ETags so the no-change path is a
       // 304 (no body, no JSON parse). Replaces three parallel fetches
-      // that ran every 3 s — one bundled fetch every 5 s now.
+      // that ran every 3 s — one bundled fetch every 5 s now. For a
+      // member the gateway scopes it to their own profiles.
       const s = await getState();
       setIntegrations(s.integrations || []);
       setAgents(s.agents || []);
@@ -111,14 +90,7 @@ export default function App() {
       setUpdate(s.update ?? null);
       if (s.config_file) setConfigFile(s.config_file);
     } catch {
-      // Members are refused /api/state; /api/me still identifies them.
-      try {
-        const me = await getMe();
-        setWhoami(me);
-        stateRefused.current = me.role === "member";
-      } catch {
-        /* swallow */
-      }
+      /* swallow */
     }
   }
 
@@ -133,12 +105,12 @@ export default function App() {
     setRoute(parseRoute());
   }
 
-  // Members get their account, their requests (and a request's page,
-  // to turn it into a rule) and their rules; every other route is
-  // refused to them by the gateway, so it lands on the account page.
+  // Members get every page, scoped by the gateway to their own
+  // profiles, except user management and plugins, which stay with
+  // admins; those routes land on the account page.
   const isMember = whoami?.role === "member";
-  const memberRoutes = ["account", "requests", "request", "rules"];
-  const shown = isMember && !memberRoutes.includes(route.name) ? "account" : route.name;
+  const adminOnlyRoutes = ["users", "plugins"];
+  const shown = isMember && adminOnlyRoutes.includes(route.name) ? "account" : route.name;
 
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
@@ -178,6 +150,7 @@ export default function App() {
         <OnboardPage code={route.code} />
       ) : route.name === "settings" ? (
         <SettingsPage
+          isAdmin={!isMember}
           integrations={integrations}
           onConnect={(id) => setConnectId(id)}
           onRefresh={refresh}

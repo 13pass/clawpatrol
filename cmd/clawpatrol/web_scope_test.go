@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -252,4 +253,57 @@ func boolMark(b bool) string {
 		return "+"
 	}
 	return "-"
+}
+
+// TestEveryOtherOperatorRouteRefusesMembers: any operator route not
+// opened to members — including routes added later — is refused by
+// the role gate, before its handler runs.
+func TestEveryOtherOperatorRouteRefusesMembers(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	reg := newOnboardRegistry()
+	env.w.onboard, env.w.g.onboard = reg, reg
+	for _, route := range env.w.routes() {
+		// authTailnetOperator routes (device-code lookup) carry no
+		// dashboard session: in WireGuard mode upstream serves them
+		// without one, so no member identity ever reaches the gate.
+		if !needsOperatorGate(route.Auth) || route.Auth == authTailnetOperator || env.w.isMemberRoute(route.Path) {
+			continue
+		}
+		rw := serveAs(t, env.h, env.alice, route.Method, route.Path, "")
+		if rw.Code != http.StatusForbidden || !strings.Contains(rw.Body.String(), "requires the admin role") {
+			t.Errorf("member %s %s = %d %q, want the role gate's 403", route.Method, route.Path, rw.Code, rw.Body.String())
+		}
+	}
+}
+
+// TestMemberRoutesAreReviewed pins the routes members may call. Each
+// one scopes what it does to the member's profiles (see the handler or
+// its guard); adding one here is a reviewed decision.
+func TestMemberRoutesAreReviewed(t *testing.T) {
+	reviewed := []string{
+		"/__logout",
+		"/api/agents/delete", "/api/agents/profile", // guardDevice
+		"/api/analytics",                                 // profile filter
+		"/api/credentials/clear", "/api/credentials/set", // guardCredential
+		"/api/events",                           // per-event filter
+		"/api/facets",                           // static schema
+		"/api/hitl/decide", "/api/hitl/pending", // decidesPending
+		"/api/me", "/api/me/password",
+		"/api/my/actions", "/api/my/rules", "/api/my/rules/delete", "/api/my/rules/update",
+		"/api/oauth/device-poll", "/api/oauth/exchange", "/api/oauth/revoke", "/api/oauth/start", // guardCredential
+		"/api/onboard/approve",                                     // guardOnboardApprove
+		"/api/profiles", "/api/rules", "/api/state", "/api/status", // viewer filters
+		"/api/rules/create", "/api/rules/preview",
+		"/api/tailscale/connect", "/api/tailscale/disconnect", "/api/tailscale/status", // guardCredential
+		"/oauth/callback", // static page
+	}
+	var got []string
+	for path := range memberRoutes {
+		got = append(got, path)
+	}
+	sort.Strings(got)
+	sort.Strings(reviewed)
+	if strings.Join(got, "\n") != strings.Join(reviewed, "\n") {
+		t.Fatalf("member routes changed; review each new one, then update this list.\ngot:\n%s", strings.Join(got, "\n"))
+	}
 }

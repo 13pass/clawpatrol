@@ -272,7 +272,8 @@ function Card({
 }) {
   const connected = isConnected(i);
   const hasSlots = (i.slots?.length ?? 0) > 0;
-  const clickable = i.has_oauth || hasSlots || (i.has_tailscale_auth && !connected);
+  const clickable =
+    i.manageable && (i.has_oauth || hasSlots || (i.has_tailscale_auth && !connected));
   // Tailscale identities can persist while the live node is *not*
   // running (rejected machine key, expired auth, etc.) — the gateway
   // exposes has_state in that window so the card can offer a Reset
@@ -287,8 +288,11 @@ function Card({
   // tokens stored: keep the disconnect affordance so they can be
   // dropped, not only overwritten by a fresh flow.
   const needsReauth = !!i.needs_reauth;
-  const showDisconnect = connected || canReset || verifyFailed || needsReauth || !!i.refresh_error;
-  const status = connected ? connectedStatusLabel(i) : disconnectedStatusLabel(i, hasSlots);
+  const showDisconnect =
+    i.manageable && (connected || canReset || verifyFailed || needsReauth || !!i.refresh_error);
+  const status =
+    (connected ? connectedStatusLabel(i) : disconnectedStatusLabel(i, hasSlots)) +
+    (i.manageable ? "" : " · managed by an admin");
   // Plugin display name (e.g. "GitHub", "Postgres"). Falls back to the
   // raw HCL type key for unrecognised plugins.
   const label = credentialTypeLabel(i.type, i.type);

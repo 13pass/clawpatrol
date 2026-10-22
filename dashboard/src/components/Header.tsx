@@ -4,9 +4,9 @@ import type { Whoami } from "../lib/api";
 // Global header — rendered above every route. Logo links home; the
 // nav cluster on the right is circular icon buttons for the
 // dashboard's top-level sections (devices, analytics, plugins,
-// settings, users, account). Identity + log-out moved to the account
-// page. Members only get the account button: every other section is
-// refused to them by the gateway.
+// settings, users, requests, rules, account). Identity + log-out moved
+// to the account page. Members don't get plugins or users, which stay
+// with admins.
 export function Header({ whoami, currentRoute }: { whoami: Whoami | null; currentRoute?: string }) {
   // Single-device pages are part of the Devices section, so the nav
   // button stays lit when drilling into a device.
@@ -28,24 +28,24 @@ export function Header({ whoami, currentRoute }: { whoami: Whoami | null; curren
           />
         </a>
         <nav className="ml-auto flex items-center gap-1">
+          <NavLink href="#/devices" label="Devices" active={devicesActive}>
+            <DesktopNavIcon />
+          </NavLink>
+          <NavLink href="#/analytics" label="Analytics" active={currentRoute === "analytics"}>
+            <Icon paths={["M3 3v18h18", "m7 16 4-8 4 4 4-6"]} />
+          </NavLink>
           {!isMember && (
-            <>
-              <NavLink href="#/devices" label="Devices" active={devicesActive}>
-                <DesktopNavIcon />
-              </NavLink>
-              <NavLink href="#/analytics" label="Analytics" active={currentRoute === "analytics"}>
-                <Icon paths={["M3 3v18h18", "m7 16 4-8 4 4 4-6"]} />
-              </NavLink>
-              <NavLink href="#/plugins" label="Plugins" active={currentRoute === "plugins"}>
-                <PluginsIcon />
-              </NavLink>
-              <NavLink href="#/settings" label="Settings" active={currentRoute === "settings"}>
-                <SettingsIcon />
-              </NavLink>
-              <NavLink href="#/users" label="Users" active={currentRoute === "users"}>
-                <UsersIcon />
-              </NavLink>
-            </>
+            <NavLink href="#/plugins" label="Plugins" active={currentRoute === "plugins"}>
+              <PluginsIcon />
+            </NavLink>
+          )}
+          <NavLink href="#/settings" label="Settings" active={currentRoute === "settings"}>
+            <SettingsIcon />
+          </NavLink>
+          {!isMember && (
+            <NavLink href="#/users" label="Users" active={currentRoute === "users"}>
+              <UsersIcon />
+            </NavLink>
           )}
           <NavLink
             href="#/requests"

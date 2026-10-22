@@ -11,10 +11,12 @@ import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
 
 export function SettingsPage({
+  isAdmin,
   integrations,
   onConnect,
   onRefresh,
 }: {
+  isAdmin: boolean;
   integrations: Integration[];
   onConnect: (id: string) => void;
   onRefresh: () => void;
@@ -37,7 +39,7 @@ export function SettingsPage({
         )}
       </section>
 
-      <ConfigSection />
+      {isAdmin && <ConfigSection />}
     </Main>
   );
 }

@@ -149,8 +149,8 @@ func TestRoleGateDeniesMembersOperatorRoutes(t *testing.T) {
 	if rw := serveAs(t, h, member, http.MethodPost, "/api/actions/rule-preview", `{"action_id":"123"}`); !refusedByRoleGate(rw) {
 		t.Errorf("member POST /api/actions/rule-preview = %d, want the role gate's 403", rw.Code)
 	}
-	if rw := serveAs(t, h, member, http.MethodPost, "/api/credentials/set", `{"id":"x","slots":{}}`); !refusedByRoleGate(rw) {
-		t.Errorf("member POST /api/credentials/set = %d %q, want the role gate's 403", rw.Code, rw.Body.String())
+	if rw := serveAs(t, h, member, http.MethodPost, "/api/plugins/approve", `{"name":"x"}`); !refusedByRoleGate(rw) {
+		t.Errorf("member POST /api/plugins/approve = %d %q, want the role gate's 403", rw.Code, rw.Body.String())
 	}
 
 	rw := serveAs(t, h, member, http.MethodGet, "/api/me", "")
@@ -277,7 +277,7 @@ func TestAuditRecordsStateChangesAndLogins(t *testing.T) {
 
 	serveAs(t, h, root, http.MethodGet, "/api/users", "")
 	serveAs(t, h, root, http.MethodPost, "/api/users/create", `{"username":"bob","password":"bob-passphrase-1234"}`)
-	serveAs(t, h, member, http.MethodPost, "/api/credentials/clear", `{"id":"x"}`)
+	serveAs(t, h, member, http.MethodPost, "/api/plugins/approve", `{"name":"x"}`)
 	postLogin(t, w, "username=mallory&password=guess-guess-guess")
 
 	records, err := listDashboardAudit(w.g.db, 0, 0)
@@ -303,7 +303,7 @@ func TestAuditRecordsStateChangesAndLogins(t *testing.T) {
 			t.Errorf("missing audit record %+v; have %+v", want, records)
 		}
 	}
-	if !got[key{"alice", "/api/credentials/clear", auditTargetRoleRefused, http.StatusForbidden}] {
+	if !got[key{"alice", "/api/plugins/approve", auditTargetRoleRefused, http.StatusForbidden}] {
 		t.Errorf("member request refused by the role gate was not audited; have %+v", records)
 	}
 

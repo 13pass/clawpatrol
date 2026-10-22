@@ -118,6 +118,7 @@ func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc)
 			r.Body = io.NopCloser(bytes.NewReader(body))
 		}
 		id, owner := target(w, r, body)
+		setAuditTarget(r, id)
 		if !v.managesCredential(w.g.Policy(), id) {
 			http.Error(rw, "only an admin can change this credential: it is not used by your profiles alone", http.StatusForbidden)
 			return
@@ -126,7 +127,6 @@ func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc)
 			http.Error(rw, "this sign-in was started by someone else", http.StatusForbidden)
 			return
 		}
-		setAuditTarget(r, id)
 		next(rw, r)
 	}
 }

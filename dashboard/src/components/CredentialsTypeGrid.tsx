@@ -412,8 +412,10 @@ function DetailsRow({
   // tokens stored: keep the disconnect affordance so they can be
   // dropped, not only overwritten by a fresh flow.
   const needsReauth = !!i.needs_reauth;
-  const canConnect = !connected && (i.has_oauth || hasSlots || i.has_tailscale_auth);
-  const canDisconnect = connected || canReset || verifyFailed || needsReauth || !!i.refresh_error;
+  const canConnect =
+    i.manageable && !connected && (i.has_oauth || hasSlots || i.has_tailscale_auth);
+  const canDisconnect =
+    i.manageable && (connected || canReset || verifyFailed || needsReauth || !!i.refresh_error);
   const status = rowStatus(i, connected, hasSlots);
   const subtitle = rowSubtitle(i, connected);
   const profiles = i.profiles ?? [];
@@ -455,7 +457,7 @@ function DetailsRow({
             Connect
           </button>
         )}
-        {connected && hasSlots && (
+        {i.manageable && connected && hasSlots && (
           <button
             onClick={onEdit}
             className="text-text hover:text-rust-700 underline underline-offset-2 ml-3"
@@ -471,7 +473,13 @@ function DetailsRow({
             Disconnect
           </button>
         )}
-        {!canConnect && !canDisconnect && <span className="text-text-subtle">—</span>}
+        {!i.manageable ? (
+          <span className="text-text-subtle" title="Shared with other teams' profiles">
+            Managed by an admin
+          </span>
+        ) : (
+          !canConnect && !canDisconnect && <span className="text-text-subtle">—</span>
+        )}
       </td>
     </tr>
   );
