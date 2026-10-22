@@ -1,10 +1,13 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestMemberStateIsScopedToOwnProfiles(t *testing.T) {
@@ -73,5 +76,45 @@ func TestMemberProfilesAndRulesAreScoped(t *testing.T) {
 		if s.Profile != "team-b" {
 			t.Errorf("bob sees a rule summary of profile %q", s.Profile)
 		}
+	}
+}
+
+func TestMemberEventStreamIsScoped(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	sink, err := NewSink(nil, 16)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env.w.g.sink = sink
+	sink.Emit(Event{ID: "ev-a", Profile: "team-a", Host: "gitlab.com", Action: "allow"})
+	sink.Emit(Event{ID: "ev-b", Profile: "team-b", Host: "gitlab.com", Action: "allow"})
+	sink.Emit(Event{ID: "ev-none", Host: "gitlab.com", Action: "allow"})
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		backlog, _, cancel := sink.RecentAndSubscribe()
+		cancel()
+		if len(backlog) == 3 || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	stream := func(c *http.Cookie) string {
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		req := httptest.NewRequest(http.MethodGet, "/api/events", nil).WithContext(ctx)
+		req.Host = "localhost"
+		req.AddCookie(c)
+		rw := httptest.NewRecorder()
+		env.h.ServeHTTP(rw, req)
+		return rw.Body.String()
+	}
+	alice := stream(env.alice)
+	if !strings.Contains(alice, `"ev-a"`) || strings.Contains(alice, `"ev-b"`) || strings.Contains(alice, `"ev-none"`) {
+		t.Errorf("alice's stream: %s", alice)
+	}
+	root := stream(env.root)
+	if !strings.Contains(root, `"ev-b"`) || !strings.Contains(root, `"ev-none"`) {
+		t.Errorf("root's stream: %s", root)
 	}
 }

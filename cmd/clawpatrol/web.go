@@ -247,6 +247,7 @@ var memberRoutes = map[string]bool{
 	"/api/status":          true,
 	"/api/profiles":        true,
 	"/api/rules":           true,
+	"/api/events":          true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -1954,6 +1955,17 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 	}
 
 	wantIP := r.URL.Query().Get("agent")
+	// A member sees the events of their own profiles only. The viewer
+	// is re-read on every keepalive, so a profile taken away or an
+	// account deleted stops the stream within one tick.
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	shows := func(ev Event) bool {
+		return (wantIP == "" || ev.AgentIP == wantIP) && v.ownsProfile(ev.Profile)
+	}
 
 	if w.g.sink == nil {
 		_, _ = fmt.Fprintf(rw, ": no sink\n\n")
@@ -1969,13 +1981,10 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 	// per-event rAF flood), then switches to per-event live streaming.
 	// Default event channel = live only.
 	if len(backlog) > 0 {
-		filtered := backlog
-		if wantIP != "" {
-			filtered = filtered[:0]
-			for _, ev := range backlog {
-				if ev.AgentIP == wantIP {
-					filtered = append(filtered, ev)
-				}
+		filtered := make([]Event, 0, len(backlog))
+		for _, ev := range backlog {
+			if shows(ev) {
+				filtered = append(filtered, ev)
 			}
 		}
 		if len(filtered) > 0 {
@@ -1995,13 +2004,21 @@ func (w *webMux) apiEventsSSE(rw http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
+			if !v.admin {
+				if _, stillMember := w.lookupSessionUserFromRequest(r); stillMember == "" {
+					return
+				}
+				if v, err = w.viewerFor(r); err != nil {
+					return
+				}
+			}
 			_, _ = fmt.Fprint(rw, ": ka\n\n")
 			flusher.Flush()
 		case pkt, ok := <-ch:
 			if !ok {
 				return
 			}
-			if wantIP != "" && pkt.ev.AgentIP != wantIP {
+			if !shows(pkt.ev) {
 				continue
 			}
 			_, _ = fmt.Fprintf(rw, "data: %s\n\n", pkt.raw)
