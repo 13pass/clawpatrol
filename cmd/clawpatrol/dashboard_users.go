@@ -67,8 +67,8 @@ type dashboardUser struct {
 	// OIDC lists the provider accounts an admin linked.
 	OIDC        []oidcLink `json:"oidc"`
 	HasPassword bool       `json:"has_password"`
-	CreatedNs    int64  `json:"created_ns"`
-	UpdatedNs    int64  `json:"updated_ns"`
+	CreatedNs   int64      `json:"created_ns"`
+	UpdatedNs   int64      `json:"updated_ns"`
 }
 
 // lookupDashboardUser returns the stored bcrypt hash for the given
