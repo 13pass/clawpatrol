@@ -1220,6 +1220,9 @@ type oauthSession struct {
 	// Stamped onto the credential row at exchange time so refresh can
 	// replay it.
 	dynClientID string
+	// owner is the dashboard user who started the flow; only they may
+	// finish it.
+	owner string
 }
 
 // mergeExtraScopes appends user-selected scopes from the connect-time
@@ -1318,7 +1321,7 @@ func (w *webMux) apiOAuthStart(rw http.ResponseWriter, r *http.Request) {
 		oauth2.SetAuthURLParam("code_challenge_method", "S256"),
 	)
 	w.mu.Lock()
-	w.sessions[state] = &oauthSession{verifier: verifier, state: state, cfg: cfg, id: id, created: time.Now()}
+	w.sessions[state] = &oauthSession{verifier: verifier, state: state, cfg: cfg, id: id, created: time.Now(), owner: principalOwner(r)}
 	for k, s := range w.sessions {
 		if time.Since(s.created) > 10*time.Minute {
 			delete(w.sessions, k)
@@ -1364,6 +1367,7 @@ func (w *webMux) startDynamicMCPFlow(rw http.ResponseWriter, r *http.Request, id
 	)
 	w.mu.Lock()
 	w.sessions[state] = &oauthSession{
+		owner:       principalOwner(r),
 		verifier:    verifier,
 		state:       state,
 		cfg:         cfg,
@@ -1594,6 +1598,7 @@ func (w *webMux) startDeviceFlow(rw http.ResponseWriter, r *http.Request, id str
 	state := randomString(32)
 	w.mu.Lock()
 	w.sessions[state] = &oauthSession{
+		owner:    principalOwner(r),
 		state:    state,
 		id:       id,
 		created:  time.Now(),
@@ -1659,6 +1664,7 @@ func (w *webMux) startOpenAIDeviceFlow(rw http.ResponseWriter, r *http.Request, 
 	state := randomString(32)
 	w.mu.Lock()
 	w.sessions[state] = &oauthSession{
+		owner:   principalOwner(r),
 		state:   state,
 		id:      id,
 		created: time.Now(),

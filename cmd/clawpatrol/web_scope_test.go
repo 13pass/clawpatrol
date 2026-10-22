@@ -118,3 +118,43 @@ func TestMemberEventStreamIsScoped(t *testing.T) {
 		t.Errorf("root's stream: %s", root)
 	}
 }
+
+func TestMemberCredentialChangesNeedExclusiveCredentials(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	forbidden := func(rw *httptest.ResponseRecorder) bool {
+		return rw.Code == http.StatusForbidden && strings.Contains(rw.Body.String(), "only an admin can change this credential")
+	}
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/credentials/set",
+		`{"id":"sentry-a","slots":{"token":"t0ken-value"}}`); forbidden(rw) || rw.Code >= http.StatusInternalServerError {
+		t.Errorf("alice setting her own credential = %d %s", rw.Code, rw.Body.String())
+	}
+	for name, tc := range map[string]struct {
+		c    *http.Cookie
+		path string
+		body string
+	}{
+		"alice sets shared gl":     {env.alice, "/api/credentials/set", `{"id":"gl","slots":{"token":"x"}}`},
+		"alice clears ops-slack":   {env.alice, "/api/credentials/clear", `{"id":"ops-slack"}`},
+		"bob clears sentry-a":      {env.bob, "/api/credentials/clear", `{"id":"sentry-a"}`},
+		"bob starts oauth on gl":   {env.bob, "/api/oauth/start?id=gl", ""},
+		"alice revokes unknown id": {env.alice, "/api/oauth/revoke", `{"id":"nope"}`},
+	} {
+		if rw := serveAs(t, env.h, tc.c, http.MethodPost, tc.path, tc.body); !forbidden(rw) {
+			t.Errorf("%s = %d %s, want 403", name, rw.Code, rw.Body.String())
+		}
+	}
+}
+
+func TestMemberCannotFinishSomeoneElsesOAuthFlow(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	env.w.sessions = map[string]*oauthSession{
+		"root-state": {id: "sentry-a", state: "root-state", owner: dashboardRootUsername, created: time.Now()},
+	}
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/oauth/exchange", `{"state":"root-state","code":"c"}`)
+	if rw.Code != http.StatusForbidden || !strings.Contains(rw.Body.String(), "started by someone else") {
+		t.Fatalf("alice finishing root's flow = %d %s", rw.Code, rw.Body.String())
+	}
+	if env.w.sessions["root-state"] == nil {
+		t.Fatal("refused exchange consumed the session")
+	}
+}

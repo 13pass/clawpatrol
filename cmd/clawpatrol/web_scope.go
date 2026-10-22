@@ -1,6 +1,11 @@
 package main
 
 import (
+	"bytes"
+	"encoding/json"
+	"io"
+	"net/http"
+
 	"github.com/denoland/clawpatrol/internal/config"
 )
 
@@ -48,4 +53,80 @@ func (v viewer) managesCredential(policy *config.CompiledPolicy, name string) bo
 		}
 	}
 	return true
+}
+
+// credentialRequestMaxBytes bounds a credential request body, read in
+// full by guardCredential before the handler decodes it again.
+const credentialRequestMaxBytes = 1 << 20
+
+func principalOwner(r *http.Request) string {
+	p, _ := principalFromContext(r.Context())
+	return p.Owner
+}
+
+// credentialTarget names the credential a request acts on and, for an
+// OAuth flow already started, the user who started it.
+type credentialTarget func(w *webMux, r *http.Request, body []byte) (id, owner string)
+
+func credentialFromBodyOrQuery(_ *webMux, r *http.Request, body []byte) (string, string) {
+	var b struct {
+		ID string `json:"id"`
+	}
+	_ = json.Unmarshal(body, &b)
+	if b.ID == "" {
+		b.ID = r.URL.Query().Get("id")
+	}
+	return b.ID, ""
+}
+
+func credentialFromOAuthSession(w *webMux, r *http.Request, body []byte) (string, string) {
+	var b struct {
+		State string `json:"state"`
+	}
+	_ = json.Unmarshal(body, &b)
+	if b.State == "" {
+		b.State = r.URL.Query().Get("state")
+	}
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	if sess := w.sessions[b.State]; sess != nil {
+		return sess.id, sess.owner
+	}
+	return "", ""
+}
+
+// guardCredential lets a member through only to a credential they
+// manage (viewer.managesCredential), and only into an OAuth flow they
+// started. Admins pass unchecked.
+func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		v, err := w.viewerFor(r)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if v.admin {
+			next(rw, r)
+			return
+		}
+		var body []byte
+		if r.Body != nil {
+			if body, err = io.ReadAll(http.MaxBytesReader(rw, r.Body, credentialRequestMaxBytes)); err != nil {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(body))
+		}
+		id, owner := target(w, r, body)
+		if !v.managesCredential(w.g.Policy(), id) {
+			http.Error(rw, "only an admin can change this credential: it is not used by your profiles alone", http.StatusForbidden)
+			return
+		}
+		if owner != "" && owner != v.username {
+			http.Error(rw, "this sign-in was started by someone else", http.StatusForbidden)
+			return
+		}
+		setAuditTarget(r, id)
+		next(rw, r)
+	}
 }
