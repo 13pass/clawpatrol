@@ -33,7 +33,11 @@ func buildPending(req runtime.ApproveRequest) runtime.HITLPending {
 		BodySample:  req.BodySample,
 		Reason:      req.Reason,
 		Approvers:   []string{req.ApproverName},
+		Profile:     req.Profile,
 		CreatedAt:   now,
+	}
+	if req.Rule != nil {
+		pending.Rule = req.Rule.Name
 	}
 	runtime.NormalizeHITLPendingApproval(&pending)
 	return pending

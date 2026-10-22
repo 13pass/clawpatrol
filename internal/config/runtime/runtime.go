@@ -754,13 +754,17 @@ type HITLPending struct {
 	// Family is the endpoint family ("http" | "sql" | "k8s") so the
 	// dashboard can pick a matching label for Path ("Query" /
 	// "Resource" / "Path"). Empty when no endpoint metadata is set.
-	Family     string    `json:"family,omitempty"`
-	UA         string    `json:"ua,omitempty"`
-	BodySample string    `json:"body_sample,omitempty"`
-	Reason     string    `json:"reason,omitempty"`
-	Approvers  []string  `json:"approvers,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	ExpiresAt  time.Time `json:"expires_at"`
+	Family     string   `json:"family,omitempty"`
+	UA         string   `json:"ua,omitempty"`
+	BodySample string   `json:"body_sample,omitempty"`
+	Reason     string   `json:"reason,omitempty"`
+	Approvers  []string `json:"approvers,omitempty"`
+	// Profile and Rule say whose request this is and which rule asked
+	// for approval; the dashboard scopes pending approvals by them.
+	Profile   string    `json:"profile,omitempty"`
+	Rule      string    `json:"rule,omitempty"`
+	CreatedAt time.Time `json:"created_at"`
+	ExpiresAt time.Time `json:"expires_at"`
 }
 
 // NormalizeHITLPendingApproval fills safety copy defaults for a pending

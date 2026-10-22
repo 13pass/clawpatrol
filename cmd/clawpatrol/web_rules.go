@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -542,6 +543,31 @@ func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, n
 // pinned to.
 func (v viewer) ownsRule(r *rules.Rule) bool {
 	return v.admin || (r.Profile != "" && v.profiles[r.Profile])
+}
+
+// decidesPending reports whether the viewer may see and decide a
+// pending approval. A member may only for one raised by a rule of
+// their own file, pinned to a profile they still own: approvals raised
+// by an admin's rules stay with the approver the admin chose.
+func (w *webMux) decidesPending(v viewer, p runtime.HITLPending) bool {
+	if v.admin {
+		return true
+	}
+	if p.Rule == "" || !v.ownsProfile(p.Profile) {
+		return false
+	}
+	path := w.memberRulesPath(v.username)
+	gw := w.g.cfg.Load()
+	if path == "" || gw == nil || gw.Policy == nil {
+		return false
+	}
+	ent := gw.Policy.Rules[p.Rule]
+	if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil ||
+		filepath.Clean(ent.Symbol.Block.DefRange.Filename) != filepath.Clean(path) {
+		return false
+	}
+	body, ok := ent.Body.(*rules.Rule)
+	return ok && v.ownsRule(body)
 }
 
 // memberRulesPath is the rules file of username in a directory config,

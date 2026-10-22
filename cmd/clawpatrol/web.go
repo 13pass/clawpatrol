@@ -265,6 +265,10 @@ var memberRoutes = map[string]bool{
 	"/api/agents/delete":   true,
 	"/api/agents/profile":  true,
 	"/api/onboard/approve": true,
+	// Approvals: a member sees and decides only those raised by their
+	// own rules (webMux.decidesPending).
+	"/api/hitl/pending": true,
+	"/api/hitl/decide":  true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -1920,8 +1924,19 @@ func writeJSONError(rw http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(rw).Encode(v)
 }
 
-func (w *webMux) apiHITLPending(rw http.ResponseWriter, _ *http.Request) {
-	writeJSON(rw, w.g.hitl.List())
+func (w *webMux) apiHITLPending(rw http.ResponseWriter, r *http.Request) {
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	out := []runtime.HITLPending{}
+	for _, p := range w.g.hitl.List() {
+		if w.decidesPending(v, p) {
+			out = append(out, p)
+		}
+	}
+	writeJSON(rw, out)
 }
 
 func (w *webMux) apiHITLDecide(rw http.ResponseWriter, r *http.Request) {
@@ -1941,6 +1956,23 @@ func (w *webMux) apiHITLDecide(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		http.Error(rw, "decision requires an authenticated operator", http.StatusForbidden)
 		return
+	}
+	if v, err := w.viewerFor(r); err != nil {
+		http.Error(rw, err.Error(), http.StatusUnauthorized)
+		return
+	} else if !v.admin {
+		visible := false
+		for _, p := range w.g.hitl.List() {
+			if p.ID == body.ID && w.decidesPending(v, p) {
+				visible = true
+				break
+			}
+		}
+		if !visible {
+			http.Error(rw, "not found", http.StatusNotFound)
+			return
+		}
+		setAuditTarget(r, body.ID)
 	}
 	result := runtime.HITLResolveResult{State: runtime.HITLStateUnknown, Reason: "unknown or expired HITL request"}
 	decision := runtime.HITLDecision{Allow: body.Allow, By: principal.Owner}

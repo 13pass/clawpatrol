@@ -8,6 +8,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 func TestMemberStateIsScopedToOwnProfiles(t *testing.T) {
@@ -181,5 +183,42 @@ func TestMemberDevicesAndJoinsAreScoped(t *testing.T) {
 		if rw := serveAs(t, env.h, env.alice, http.MethodPost, tc.path, tc.body); rw.Code != tc.want {
 			t.Errorf("%s = %d %s, want %d", name, rw.Code, rw.Body.String(), tc.want)
 		}
+	}
+}
+
+func TestMemberDecidesOnlyApprovalsOfTheirOwnRules(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"approve"}`)
+	var created struct {
+		RuleName string `json:"rule_name"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &created); err != nil || created.RuleName == "" {
+		t.Fatalf("create approval rule: %d %s", rw.Code, rw.Body.String())
+	}
+	env.w.g.hitl = newHITLRegistry(nil)
+	own, _ := env.w.g.hitl.Add(runtime.HITLPending{Profile: "team-a", Rule: created.RuleName, Host: "gitlab.com"})
+	admins, _ := env.w.g.hitl.Add(runtime.HITLPending{Profile: "team-a", Rule: "gitlab-writes", Host: "gitlab.com"})
+	bobs, _ := env.w.g.hitl.Add(runtime.HITLPending{Profile: "team-b", Rule: created.RuleName, Host: "gitlab.com"})
+
+	rw = serveAs(t, env.h, env.alice, http.MethodGet, "/api/hitl/pending", "")
+	var pending []runtime.HITLPending
+	if err := json.Unmarshal(rw.Body.Bytes(), &pending); err != nil {
+		t.Fatal(err)
+	}
+	if len(pending) != 1 || pending[0].ID != own {
+		t.Fatalf("alice's pending = %+v, want only %s", pending, own)
+	}
+	for _, id := range []string{admins, bobs} {
+		if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/hitl/decide", `{"id":"`+id+`","allow":true}`); rw.Code != http.StatusNotFound {
+			t.Errorf("alice deciding %s = %d, want 404", id, rw.Code)
+		}
+	}
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/hitl/decide", `{"id":"`+own+`","allow":false}`); rw.Code == http.StatusNotFound || rw.Code == http.StatusForbidden {
+		t.Errorf("alice deciding her own approval = %d %s", rw.Code, rw.Body.String())
+	}
+	rw = serveAs(t, env.h, env.root, http.MethodGet, "/api/hitl/pending", "")
+	if !strings.Contains(rw.Body.String(), admins) || !strings.Contains(rw.Body.String(), bobs) {
+		t.Errorf("root's pending list lacks some: %s", rw.Body.String())
 	}
 }
