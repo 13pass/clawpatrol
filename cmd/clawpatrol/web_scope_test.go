@@ -222,3 +222,34 @@ func TestMemberDecidesOnlyApprovalsOfTheirOwnRules(t *testing.T) {
 		t.Errorf("root's pending list lacks some: %s", rw.Body.String())
 	}
 }
+
+func TestMemberAnalyticsAreScoped(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	ids := func(c *http.Cookie) string {
+		rw := serveAs(t, env.h, c, http.MethodGet, "/api/analytics?range=24h", "")
+		var body struct {
+			Events []Event `json:"events"`
+		}
+		if err := json.Unmarshal(rw.Body.Bytes(), &body); err != nil {
+			t.Fatalf("analytics: %d %s", rw.Code, rw.Body.String())
+		}
+		seen := map[string]bool{}
+		for _, ev := range body.Events {
+			seen[ev.ID] = true
+		}
+		return strings.Join([]string{boolMark(seen["a-notes-45"]), boolMark(seen["b-notes-45"])}, "")
+	}
+	if got := ids(env.alice); got != "+-" {
+		t.Errorf("alice's analytics (a-notes-45, b-notes-45) = %s, want +-", got)
+	}
+	if got := ids(env.root); got != "++" {
+		t.Errorf("root's analytics = %s, want ++", got)
+	}
+}
+
+func boolMark(b bool) string {
+	if b {
+		return "+"
+	}
+	return "-"
+}

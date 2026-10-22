@@ -269,6 +269,7 @@ var memberRoutes = map[string]bool{
 	// own rules (webMux.decidesPending).
 	"/api/hitl/pending": true,
 	"/api/hitl/decide":  true,
+	"/api/analytics":    true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -2634,6 +2635,19 @@ func (w *webMux) apiAnalytics(
 	if agent != "" {
 		where += " AND agent_ip = ?"
 		whereArgs = append(whereArgs, agent)
+	}
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusUnauthorized)
+		return
+	}
+	if !v.admin {
+		// No profiles: a condition that matches nothing keeps the
+		// response's usual shape.
+		where += " AND profile IN (NULL" + strings.Repeat(",?", len(v.profiles)) + ")"
+		for _, p := range v.sortedProfiles() {
+			whereArgs = append(whereArgs, p)
+		}
 	}
 
 	// Sort by the random suffix of action_id (UUIDv7, so the last
