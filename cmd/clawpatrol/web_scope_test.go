@@ -158,3 +158,28 @@ func TestMemberCannotFinishSomeoneElsesOAuthFlow(t *testing.T) {
 		t.Fatal("refused exchange consumed the session")
 	}
 }
+
+func TestMemberDevicesAndJoinsAreScoped(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	reg := newOnboardRegistry()
+	env.w.onboard, env.w.g.onboard = reg, reg
+	reg.AssignProfile("10.68.0.5", "team-a")
+	reg.AssignProfile("10.68.0.6", "team-b")
+
+	for name, tc := range map[string]struct {
+		path, body string
+		want       int
+	}{
+		"delete bob's device":           {"/api/agents/delete?ip=10.68.0.6", "", http.StatusNotFound},
+		"move own device to team-b":     {"/api/agents/profile?ip=10.68.0.5&profile=team-b", "", http.StatusForbidden},
+		"move bob's device to team-a":   {"/api/agents/profile?ip=10.68.0.6&profile=team-a", "", http.StatusNotFound},
+		"approve a join into team-b":    {"/api/onboard/approve", `{"code":"ABCD-EFGH","profile":"team-b"}`, http.StatusForbidden},
+		"approve a join, no profile":    {"/api/onboard/approve", `{"code":"ABCD-EFGH"}`, http.StatusForbidden},
+		"approve a join into team-a":    {"/api/onboard/approve", `{"code":"ABCD-EFGH","profile":"team-a"}`, http.StatusNotFound},
+		"move own device within team-a": {"/api/agents/profile?ip=10.68.0.5&profile=team-a", "", http.StatusOK},
+	} {
+		if rw := serveAs(t, env.h, env.alice, http.MethodPost, tc.path, tc.body); rw.Code != tc.want {
+			t.Errorf("%s = %d %s, want %d", name, rw.Code, rw.Body.String(), tc.want)
+		}
+	}
+}

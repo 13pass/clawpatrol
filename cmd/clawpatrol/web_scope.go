@@ -130,3 +130,67 @@ func (w *webMux) guardCredential(target credentialTarget, next http.HandlerFunc)
 		next(rw, r)
 	}
 }
+
+// guardDevice lets a member act only on a device of a profile they
+// own, and move it only into another profile they own.
+func (w *webMux) guardDevice(next http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		v, err := w.viewerFor(r)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		if !v.admin {
+			ip := r.URL.Query().Get("ip")
+			current := w.onboard.ProfileForIP(ip)
+			if !v.ownsProfile(current) {
+				http.Error(rw, "not found", http.StatusNotFound)
+				return
+			}
+			if target := r.URL.Query().Get("profile"); target != "" && !v.ownsProfile(target) {
+				http.Error(rw, "you can only move a device into a profile you own", http.StatusForbidden)
+				return
+			}
+			setAuditTarget(r, ip)
+		}
+		next(rw, r)
+	}
+}
+
+// guardOnboardApprove lets a member approve a joining device only into
+// a profile they own, named explicitly: no fallback to the device's
+// suggestion or to the default profile.
+func (w *webMux) guardOnboardApprove(next http.HandlerFunc) http.HandlerFunc {
+	return func(rw http.ResponseWriter, r *http.Request) {
+		p, ok := principalFromContext(r.Context())
+		if !ok || principalRole(p) == dashboardRoleAdmin {
+			next(rw, r)
+			return
+		}
+		v, err := w.viewerFor(r)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusUnauthorized)
+			return
+		}
+		var raw []byte
+		if r.Body != nil {
+			if raw, err = io.ReadAll(http.MaxBytesReader(rw, r.Body, credentialRequestMaxBytes)); err != nil {
+				http.Error(rw, err.Error(), http.StatusBadRequest)
+				return
+			}
+			r.Body = io.NopCloser(bytes.NewReader(raw))
+		}
+		var body struct {
+			Profile string `json:"profile"`
+		}
+		_ = json.Unmarshal(raw, &body)
+		if body.Profile == "" {
+			body.Profile = r.URL.Query().Get("profile")
+		}
+		if body.Profile == "" || !v.ownsProfile(body.Profile) {
+			http.Error(rw, "choose one of your profiles for this device", http.StatusForbidden)
+			return
+		}
+		next(rw, r)
+	}
+}

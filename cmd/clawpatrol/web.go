@@ -260,6 +260,11 @@ var memberRoutes = map[string]bool{
 	"/api/tailscale/connect":    true,
 	"/api/tailscale/status":     true,
 	"/api/tailscale/disconnect": true,
+	// Devices: guardDevice / guardOnboardApprove keep a member to
+	// devices and joins of their own profiles.
+	"/api/agents/delete":   true,
+	"/api/agents/profile":  true,
+	"/api/onboard/approve": true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -308,8 +313,8 @@ func (w *webMux) routes() []webRoute {
 		// when the JSON hash matches If-None-Match. Replaces the three
 		// parallel per-3s fetches App.refresh used to fire.
 		{Method: http.MethodGet, Path: "/api/state", Auth: authDashboard, Handler: w.apiState},
-		{Method: http.MethodPost, Path: "/api/agents/delete", Auth: authDashboard, Handler: w.apiAgentDelete},
-		{Method: http.MethodPost, Path: "/api/agents/profile", Auth: authDashboard, Handler: w.apiAgentProfile},
+		{Method: http.MethodPost, Path: "/api/agents/delete", Auth: authDashboard, Handler: w.guardDevice(w.apiAgentDelete)},
+		{Method: http.MethodPost, Path: "/api/agents/profile", Auth: authDashboard, Handler: w.guardDevice(w.apiAgentProfile)},
 		{Method: http.MethodGet, Path: "/api/profiles", Auth: authDashboard, Handler: w.apiProfiles},
 		{Method: http.MethodGet, Path: "/api/plugins", Auth: authDashboard, Handler: w.apiPlugins},
 		{Method: http.MethodPost, Path: "/api/plugins/approve", Auth: authDashboard, Handler: w.apiPluginApprove},
@@ -350,7 +355,7 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/rules/create", Auth: authDashboard, Handler: w.apiRuleCreate},
 		{Method: http.MethodPost, Path: "/api/onboard/start", Auth: authPublic, Handler: w.apiOnboardStart},
 		{Method: http.MethodPost, Path: "/api/onboard/poll", Auth: authPublic, Handler: w.apiOnboardPoll},
-		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.apiOnboardApprove},
+		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.guardOnboardApprove(w.apiOnboardApprove)},
 		{Method: http.MethodGet, Path: "/api/onboard/lookup", Auth: authTailnetOperator, Handler: w.apiOnboardLookup},
 		{Method: http.MethodPost, Path: "/api/onboard/claim", Auth: authPublic, Handler: w.apiOnboardClaim},
 		{Method: http.MethodGet, Path: "/api/env-pushdown", Auth: authSelfAuthenticating, Handler: w.apiEnvPushdown},
