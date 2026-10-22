@@ -32,3 +32,12 @@ rule "team-a-allow-reads" {
   condition  = "http.method == 'GET'"
   verdict    = "allow"
 }
+
+rule "team-a-preapprove-notes" {
+  endpoint      = https.gitlab
+  priority      = 50
+  profile       = profile.team-a
+  yield_to_deny = true
+  condition     = "http.path.endsWith('/notes')"
+  verdict       = "allow"
+}

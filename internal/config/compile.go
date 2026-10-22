@@ -261,8 +261,11 @@ type CompiledRule struct {
 	// Profile, when set, is the bare-name profile the requesting peer
 	// must be bound to, checked like Credential.
 	Profile string
-	Matcher match.Matcher
-	Outcome Outcome
+	// YieldToDeny, on an allow rule: a deny the later rules reach on
+	// their own still wins (see runtime.MatchRequest).
+	YieldToDeny bool
+	Matcher     match.Matcher
+	Outcome     Outcome
 }
 
 // Outcome captures a rule's verdict + (when applicable) approve chain.

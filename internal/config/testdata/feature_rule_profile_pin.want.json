@@ -53,6 +53,20 @@
           "profile": "team-a",
           "verdict": "allow"
         }
+      },
+      "team-a-preapprove-notes": {
+        "body": {
+          "name": "team-a-preapprove-notes",
+          "family": "http",
+          "endpoints": [
+            "gitlab"
+          ],
+          "priority": 50,
+          "condition": "http.path.endsWith('/notes')",
+          "profile": "team-a",
+          "yield_to_deny": true,
+          "verdict": "allow"
+        }
       }
     }
   }

@@ -3,6 +3,7 @@ package runtime_test
 import (
 	"encoding/base64"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -1689,5 +1690,75 @@ rule "team-a-deny" {
 		if got := runtime.MatchRequest(ep, req) != nil; got != tc.want {
 			t.Errorf("profile %q: matched = %v, want %v", tc.profile, got, tc.want)
 		}
+	}
+}
+
+// TestMatchRequestYieldToDeny: a member pre-approval (allow at 50 with
+// yield_to_deny) skips the admin's approval and allow rules, but never
+// a deny the admin rules reach on their own, catch-all included.
+func TestMatchRequestYieldToDeny(t *testing.T) {
+	cp := compileFixture(t, `
+endpoint "https" "gitlab" { hosts = ["gitlab.com"] }
+credential "bearer_token" "gl" { endpoint = https.gitlab }
+profile "default" { credentials = [bearer_token.gl] }
+approver "human_approver" "ops" { channel = "#ops" }
+
+rule "member-preapprove-notes" {
+  endpoint      = https.gitlab
+  priority      = 50
+  condition     = "http.path.endsWith('/notes')"
+  yield_to_deny = true
+  verdict       = "allow"
+}
+rule "admin-reads" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'GET'"
+  verdict   = "allow"
+}
+rule "admin-writes-need-approval" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'POST'"
+  approve   = [human_approver.ops]
+}
+rule "admin-no-deletes" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'DELETE'"
+  verdict   = "deny"
+}
+rule "admin-default-deny" {
+  endpoint = https.gitlab
+  priority = -100
+  verdict  = "deny"
+}
+`)
+	ep := cp.Endpoints["gitlab"]
+	for _, tc := range []struct {
+		method, path, want string
+	}{
+		{"POST", "/api/v4/projects/1/issues/2/notes", "member-preapprove-notes"},
+		{"GET", "/api/v4/projects/1/issues/2/notes", "member-preapprove-notes"},
+		{"DELETE", "/api/v4/projects/1/issues/2/notes", "admin-no-deletes"},
+		{"PATCH", "/api/v4/projects/1/issues/2/notes", "admin-default-deny"},
+		{"POST", "/api/v4/projects/1/issues", "admin-writes-need-approval"},
+	} {
+		req := &match.Request{Family: "http", Method: tc.method, URL: &url.URL{Path: tc.path}}
+		r := runtime.MatchRequest(ep, req)
+		if r == nil || r.Name != tc.want {
+			t.Errorf("%s %s matched %v, want %s", tc.method, tc.path, r, tc.want)
+		}
+	}
+}
+
+func TestYieldToDenyOnlyOnAllowRules(t *testing.T) {
+	_, diags := config.LoadBytes([]byte(testGatewayPrefix+`
+endpoint "https" "gitlab" { hosts = ["gitlab.com"] }
+rule "bad" {
+  endpoint      = https.gitlab
+  yield_to_deny = true
+  verdict       = "deny"
+}
+`), "in.hcl")
+	if !diags.HasErrors() {
+		t.Fatal("yield_to_deny on a deny rule was accepted")
 	}
 }

@@ -391,8 +391,33 @@ A request on the dashboard can be turned into a rule — deny,
 pre-approve, or require approval. An admin's go to the dashboard file
 at priority 100. A member's go to the member's own file at priority
 50, pinned with `profile` and `credential` to the request's profile
-and credential. To keep an admin rule above every member rule, give it
-priority 100 or more.
+and credential, and a member's pre-approval carries `yield_to_deny`:
+it can skip an admin's approval, never undo an admin's deny. A member's
+deny or require-approval only tightens, so it needs no such flag.
+
+### `yield_to_deny = true`
+
+On an `allow` rule only. When the rule matches, the rules after it
+(lower priority, or later at the same priority) are evaluated as if it
+were absent. If that yields a deny — a `verdict = "deny"` rule, a
+catch-all deny, or a deny synthesized for an unevaluable condition —
+the deny stands. Any other outcome (an approval, an allow, no match)
+is replaced by this allow.
+
+```hcl
+rule "team-a-preapprove-notes" {
+  endpoint      = https.gitlab
+  priority      = 50
+  profile       = profile.team-a
+  yield_to_deny = true
+  condition     = "http.path.endsWith('/notes')"
+  verdict       = "allow"
+}
+```
+
+With an admin `approve` rule for writes and a `-100` catch-all deny,
+this pre-approves note writes for `team-a` without review, while a
+`DELETE` the admin rules deny stays denied.
 
 ### `profile = X`
 

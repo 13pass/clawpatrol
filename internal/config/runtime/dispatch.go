@@ -78,11 +78,32 @@ func HostEndpoint(policy *config.CompiledPolicy, profile, host string) *config.C
 // `unknown && false == false` and cleanly falls through to the next
 // rule. Rules keyed only on always-available facets (credential,
 // peer IP, sql.statement on an unparseable query) are unaffected.
+//
+// An allow rule with YieldToDeny does not end the walk outright: the
+// rules after it are matched as if it were absent, and if their
+// outcome is a deny (declared or synthesized) the deny is returned;
+// otherwise the allow is.
 func MatchRequest(ep *config.CompiledEndpoint, req *match.Request) *config.CompiledRule {
 	if ep == nil {
 		return nil
 	}
-	for _, r := range ep.Rules {
+	return matchFrom(ep.Rules, req)
+}
+
+func matchFrom(rules []*config.CompiledRule, req *match.Request) *config.CompiledRule {
+	r, i := firstMatch(rules, req)
+	if r == nil || !r.YieldToDeny || r.Outcome.Verdict != "allow" {
+		return r
+	}
+	if rest := matchFrom(rules[i+1:], req); rest != nil && rest.Outcome.Verdict == "deny" {
+		return rest
+	}
+	return r
+}
+
+// firstMatch returns the first rule that fires, and its index.
+func firstMatch(rules []*config.CompiledRule, req *match.Request) (*config.CompiledRule, int) {
+	for i, r := range rules {
 		if r.Disabled {
 			continue
 		}
@@ -108,16 +129,16 @@ func MatchRequest(ep *config.CompiledEndpoint, req *match.Request) *config.Compi
 			// reads no facets, so it can't be poisoned by
 			// truncation — fire it as written even when
 			// req.Truncated.
-			return r
+			return r, i
 		}
 		switch d := r.Matcher.Match(req); d.Result {
 		case match.Matched:
-			return r
+			return r, i
 		case match.Unevaluable:
-			return synthesizeUnevaluableDeny(r, req, d.Detail)
+			return synthesizeUnevaluableDeny(r, req, d.Detail), i
 		}
 	}
-	return nil
+	return nil, len(rules)
 }
 
 // MatchRequestFailClosed wraps MatchRequest for wire frontends whose

@@ -62,6 +62,14 @@ type RuleBody struct {
 	// several profiles; this is what keeps a rule to one of them.
 	Profile string `hcl:"profile,optional"`
 
+	// YieldToDeny, on an allow rule, lets a deny that would apply
+	// without it still win: when the rule matches, the rules after it
+	// are evaluated as if it were absent, and if that yields a deny the
+	// deny stands. Any other outcome (approval, allow, no match) is
+	// replaced by this allow. Dashboard member pre-approvals carry it:
+	// they can skip an approval, never undo a deny.
+	YieldToDeny bool `hcl:"yield_to_deny,optional"`
+
 	// Verdict is the outcome when the rule matches. Set exactly one
 	// of `verdict` (`"allow"` / `"deny"`) or `approve`.
 	Verdict string `hcl:"verdict,optional"`
@@ -77,17 +85,18 @@ type RuleBody struct {
 // Rule is the canonical, family-stamped record stored in
 // Policy.Rules[name].Body.
 type Rule struct {
-	Name       string                `json:"name"`
-	Family     string                `json:"family"` // "http" | "sql" | "k8s"
-	Endpoints  []string              `json:"endpoints"`
-	Priority   int                   `json:"priority,omitempty"`
-	Disabled   bool                  `json:"disabled,omitempty"`
-	Condition  string                `json:"condition,omitempty"`
-	Credential string                `json:"credential,omitempty"`
-	Profile    string                `json:"profile,omitempty"`
-	Verdict    string                `json:"verdict,omitempty"` // "allow" | "deny" | "" (when Approve is set)
-	Reason     string                `json:"reason,omitempty"`
-	Approve    []config.ApproveStage `json:"approve,omitempty"`
+	Name        string                `json:"name"`
+	Family      string                `json:"family"` // "http" | "sql" | "k8s"
+	Endpoints   []string              `json:"endpoints"`
+	Priority    int                   `json:"priority,omitempty"`
+	Disabled    bool                  `json:"disabled,omitempty"`
+	Condition   string                `json:"condition,omitempty"`
+	Credential  string                `json:"credential,omitempty"`
+	Profile     string                `json:"profile,omitempty"`
+	YieldToDeny bool                  `json:"yield_to_deny,omitempty"`
+	Verdict     string                `json:"verdict,omitempty"` // "allow" | "deny" | "" (when Approve is set)
+	Reason      string                `json:"reason,omitempty"`
+	Approve     []config.ApproveStage `json:"approve,omitempty"`
 }
 
 // Compile lowers a built rule into the runtime-friendly *CompiledRule
@@ -103,13 +112,14 @@ func (r *Rule) Compile() (*config.CompiledRule, []string, error) {
 		return nil, nil, fmt.Errorf("condition: %w", err)
 	}
 	return &config.CompiledRule{
-		Name:       r.Name,
-		Priority:   r.Priority,
-		Disabled:   r.Disabled,
-		Condition:  r.Condition,
-		Credential: r.Credential,
-		Profile:    r.Profile,
-		Matcher:    matcher,
+		Name:        r.Name,
+		Priority:    r.Priority,
+		Disabled:    r.Disabled,
+		Condition:   r.Condition,
+		Credential:  r.Credential,
+		Profile:     r.Profile,
+		YieldToDeny: r.YieldToDeny,
+		Matcher:     matcher,
 		Outcome: config.Outcome{
 			Verdict: r.Verdict,
 			Reason:  r.Reason,
@@ -211,6 +221,15 @@ func validate(body any, name string, ctx *config.BuildCtx) hcl.Diagnostics {
 		}
 	}
 
+	if rb.YieldToDeny && rb.Verdict != "allow" {
+		diags = append(diags, &hcl.Diagnostic{
+			Severity: hcl.DiagError,
+			Summary:  fmt.Sprintf("yield_to_deny on a non-allow rule %q", name),
+			Detail:   "`yield_to_deny = true` only applies to `verdict = \"allow\"`.",
+			Subject:  &ctx.Block.DefRange,
+		})
+	}
+
 	// Outcome: exactly one of verdict / approve.
 	hasVerdict := rb.Verdict != ""
 	hasApprove := !rb.Approve.IsNull() && rb.Approve.LengthInt() > 0
@@ -254,16 +273,17 @@ func build(body any, name string, ctx *config.BuildCtx) (any, hcl.Diagnostics) {
 	}
 
 	r := &Rule{
-		Name:       name,
-		Family:     fam,
-		Endpoints:  endpoints,
-		Priority:   rb.Priority,
-		Disabled:   rb.Disabled,
-		Condition:  rb.Condition,
-		Credential: rb.Credential,
-		Profile:    rb.Profile,
-		Verdict:    rb.Verdict,
-		Reason:     rb.Reason,
+		Name:        name,
+		Family:      fam,
+		Endpoints:   endpoints,
+		Priority:    rb.Priority,
+		Disabled:    rb.Disabled,
+		Condition:   rb.Condition,
+		Credential:  rb.Credential,
+		Profile:     rb.Profile,
+		YieldToDeny: rb.YieldToDeny,
+		Verdict:     rb.Verdict,
+		Reason:      rb.Reason,
 	}
 
 	// Approve chain.
@@ -351,6 +371,9 @@ func emitRule(body any, _ string, b *hclwrite.Body) {
 	}
 	if r.Profile != "" {
 		config.SetIdent(b, "profile", ri.Ref(config.KindProfile, r.Profile))
+	}
+	if r.YieldToDeny {
+		b.SetAttributeValue("yield_to_deny", cty.True)
 	}
 	if r.Condition != "" {
 		b.SetAttributeValue("condition", cty.StringVal(r.Condition))
