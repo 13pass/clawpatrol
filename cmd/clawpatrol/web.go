@@ -243,6 +243,10 @@ var memberRoutes = map[string]bool{
 	"/api/rules/preview":   true,
 	"/api/rules/create":    true,
 	"/api/facets":          true,
+	"/api/state":           true,
+	"/api/status":          true,
+	"/api/profiles":        true,
+	"/api/rules":           true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -1274,10 +1278,26 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 	}
 	w.stateCacheMu.RUnlock()
 
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), 500)
+		return
+	}
+	integrations, err := w.statusList(r)
+	if err != nil {
+		http.Error(rw, err.Error(), 500)
+		return
+	}
+	agents := []*Agent{}
+	for _, a := range w.agentsList() {
+		if v.ownsProfile(a.Profile) {
+			agents = append(agents, a)
+		}
+	}
 	state := map[string]any{
 		"whoami":                  w.whoamiData(r),
-		"integrations":            w.statusList(r),
-		"agents":                  w.agentsList(),
+		"integrations":            integrations,
+		"agents":                  agents,
 		"update":                  currentUpdateBanner.Load(),
 		"config_file":             filepath.Base(w.g.cfgPath),
 		"dashboard_config_writes": w.g.cfg.Load().DashboardConfigWrites(),

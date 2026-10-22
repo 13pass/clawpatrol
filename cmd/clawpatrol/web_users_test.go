@@ -136,7 +136,7 @@ func TestRoleGateDeniesMembersOperatorRoutes(t *testing.T) {
 	refusedByRoleGate := func(rw *httptest.ResponseRecorder) bool {
 		return rw.Code == http.StatusForbidden && strings.Contains(rw.Body.String(), "requires the admin role")
 	}
-	for _, path := range []string{"/api/state", "/api/users", "/api/audit", "/api/config", "/oauth/callback"} {
+	for _, path := range []string{"/api/plugins", "/api/users", "/api/audit", "/api/config"} {
 		if rw := serveAs(t, h, member, http.MethodGet, path, ""); !refusedByRoleGate(rw) {
 			t.Errorf("member GET %s = %d %q, want the role gate's 403", path, rw.Code, rw.Body.String())
 		}

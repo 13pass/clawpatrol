@@ -605,7 +605,10 @@ func shortHash(s string) string {
 }
 
 type IntegrationRow struct {
-	ID               string                 `json:"id"`
+	ID string `json:"id"`
+	// Manageable is whether the viewer may change this credential's
+	// secret (see viewer.managesCredential).
+	Manageable       bool                   `json:"manageable"`
 	Name             string                 `json:"name"`
 	Type             string                 `json:"type"` // credential plugin type
 	HasOAuth         bool                   `json:"has_oauth"`
@@ -707,24 +710,40 @@ type OAuthIntegrationUI struct {
 }
 
 func (w *webMux) apiStatus(rw http.ResponseWriter, r *http.Request) {
-	writeJSON(rw, w.statusList(r))
+	rows, err := w.statusList(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(rw, rows)
 }
 
 // statusList exposes the apiStatus payload as a Go slice so /api/state
 // can bundle it without going through writeJSON. Same data shape; no
 // behavior change.
-func (w *webMux) statusList(r *http.Request) []IntegrationRow {
+func (w *webMux) statusList(r *http.Request) ([]IntegrationRow, error) {
 	out := []IntegrationRow{}
+	v, err := w.viewerFor(r)
+	if err != nil {
+		return nil, err
+	}
 	policy := w.g.policy.Load()
 	if policy == nil {
-		return out
+		return out, nil
 	}
 	profile := r.URL.Query().Get("profile")
+	if profile != "" && !v.ownsProfile(profile) {
+		return out, nil
+	}
 	allowed := credentialsInProfile(policy, profile)
+	visible := v.visibleCredentials(policy)
 
 	names := make([]string, 0, len(policy.Credentials))
 	for name := range policy.Credentials {
 		if allowed != nil && !allowed[name] {
+			continue
+		}
+		if visible != nil && !visible[name] {
 			continue
 		}
 		names = append(names, name)
@@ -732,7 +751,7 @@ func (w *webMux) statusList(r *http.Request) []IntegrationRow {
 	sort.Strings(names)
 	for _, name := range names {
 		ent := policy.Credentials[name]
-		row := IntegrationRow{ID: name, Name: name, Type: ent.Plugin.Type}
+		row := IntegrationRow{ID: name, Name: name, Type: ent.Plugin.Type, Manageable: v.managesCredential(policy, name)}
 		if op, ok := ent.Body.(config.OAuthFlowProvider); ok {
 			row.HasOAuth = true
 			if flow := op.OAuthFlow(); flow != nil {
@@ -800,7 +819,7 @@ func (w *webMux) statusList(r *http.Request) []IntegrationRow {
 		row.UpdatedAt = credentialUpdatedAt(w.g.db, name)
 		out = append(out, row)
 	}
-	return out
+	return out, nil
 }
 
 // credentialBindings reports every profile + endpoint that references
@@ -1155,8 +1174,19 @@ func (w *webMux) apiAgentProfile(rw http.ResponseWriter, r *http.Request) {
 
 // apiProfiles lists declared profile names so the dashboard can
 // render a profile picker per device.
-func (w *webMux) apiProfiles(rw http.ResponseWriter, _ *http.Request) {
-	writeJSON(rw, orderedProfileNames(w.g.cfg.Load().Policy))
+func (w *webMux) apiProfiles(rw http.ResponseWriter, r *http.Request) {
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	out := []string{}
+	for _, p := range orderedProfileNames(w.g.cfg.Load().Policy) {
+		if v.ownsProfile(p) {
+			out = append(out, p)
+		}
+	}
+	writeJSON(rw, out)
 }
 
 // apiPlugins lists the loaded external plugins with their approved
@@ -1240,7 +1270,18 @@ type RuleSummary struct {
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
-		writeJSON(rw, w.collectRuleSummaries(""))
+		v, err := w.viewerFor(r)
+		if err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		out := []RuleSummary{}
+		for _, s := range w.collectRuleSummaries("") {
+			if v.ownsProfile(s.Profile) {
+				out = append(out, s)
+			}
+		}
+		writeJSON(rw, out)
 	default:
 		http.Error(rw, "edit rules through the gateway.hcl preview/save flow", http.StatusNotImplemented)
 	}

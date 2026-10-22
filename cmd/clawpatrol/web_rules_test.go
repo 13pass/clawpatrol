@@ -15,6 +15,8 @@ import (
 
 const rulesTestBase = `endpoint "https" "gitlab" { hosts = ["gitlab.com"] }
 credential "bearer_token" "gl" { endpoint = https.gitlab }
+endpoint "https" "sentry" { hosts = ["sentry.io"] }
+credential "bearer_token" "sentry-a" { endpoint = https.sentry }
 credential "slack_tokens" "ops-slack" {}
 approver "human_approver" "team-a-review" {
   channel    = "#team-a"
@@ -23,7 +25,7 @@ approver "human_approver" "team-a-review" {
 `
 
 const rulesTestProfiles = `profile "team-a" {
-  credentials = [bearer_token.gl]
+  credentials = [bearer_token.gl, bearer_token.sentry-a]
 }
 
 profile "team-b" {

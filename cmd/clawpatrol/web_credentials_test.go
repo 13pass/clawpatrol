@@ -268,7 +268,11 @@ func TestAPICredentialsClearDropsVerification(t *testing.T) {
 func findIntegrationRow(t *testing.T, w *webMux, id string) IntegrationRow {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, "/api/status", nil)
-	rows := w.statusList(req)
+	req = req.WithContext(contextWithPrincipal(req.Context(), dashboardPasswordPrincipal(dashboardRootUsername, dashboardRoleAdmin)))
+	rows, err := w.statusList(req)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for _, r := range rows {
 		if r.ID == id {
 			return r
