@@ -221,3 +221,33 @@ func TestDeletingAUserDropsTheirChannel(t *testing.T) {
 }
 
 func timeNowForTest() time.Time { return time.Now() }
+
+func TestParallelGuessesShareTheAttemptCap(t *testing.T) {
+	e := newChannelTestEnv(t)
+	wantStatus(t, serveAs(t, e.h, e.alice, http.MethodPost, "/api/my/channel/set", `{"kind":"signal_cli","target":"+41790000001"}`), http.StatusOK)
+	wrong := "000000"
+	if e.code(t) == wrong {
+		wrong = "111111"
+	}
+	const guesses = 20
+	codes := make(chan int, guesses)
+	var wg sync.WaitGroup
+	for i := 0; i < guesses; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			codes <- serveAs(t, e.h, e.alice, http.MethodPost, "/api/my/channel/verify", `{"code":"`+wrong+`"}`).Code
+		}()
+	}
+	wg.Wait()
+	close(codes)
+	tried := 0
+	for c := range codes {
+		if c == http.StatusForbidden {
+			tried++
+		}
+	}
+	if tried != channelCodeMaxAttempts {
+		t.Fatalf("%d guesses were checked, want %d", tried, channelCodeMaxAttempts)
+	}
+}

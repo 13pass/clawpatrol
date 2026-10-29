@@ -19,6 +19,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config/runtime"
@@ -36,6 +37,10 @@ const (
 )
 
 var errNoUserChannel = errors.New("no notification channel is set")
+
+// channelSendMu serializes the throttle check, the send and its record,
+// so parallel requests cannot each pass the throttle.
+var channelSendMu sync.Mutex
 
 type userChannel struct {
 	Kind          string
@@ -109,9 +114,18 @@ func markUserChannelVerified(db *sql.DB, username string, now time.Time) error {
 	return err
 }
 
-func countUserChannelAttempt(db *sql.DB, username string) error {
-	_, err := db.Exec(`UPDATE dashboard_user_channels SET code_attempts = code_attempts + 1 WHERE username = ?`, username)
-	return err
+// claimUserChannelAttempt uses up one code attempt in a single
+// statement, so parallel guesses cannot share one slot.
+func claimUserChannelAttempt(db *sql.DB, username string) (bool, error) {
+	res, err := db.Exec(
+		`UPDATE dashboard_user_channels SET code_attempts = code_attempts + 1 WHERE username = ? AND code_attempts < ?`,
+		username, channelCodeMaxAttempts,
+	)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 func setUserChannelSent(db *sql.DB, username string, now time.Time) error {
@@ -278,6 +292,8 @@ func (w *webMux) apiMyChannelSet(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	channelSendMu.Lock()
+	defer channelSendMu.Unlock()
 	var body struct {
 		Kind   string `json:"kind"`
 		Target string `json:"target"`
@@ -332,6 +348,8 @@ func (w *webMux) apiMyChannelResend(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	channelSendMu.Lock()
+	defer channelSendMu.Unlock()
 	c, ok := w.myChannel(rw, username)
 	if !ok {
 		return
@@ -387,16 +405,18 @@ func (w *webMux) apiMyChannelVerify(rw http.ResponseWriter, r *http.Request) {
 	case c.CodeHash == "" || now.UnixNano() > c.CodeExpiresNs:
 		http.Error(rw, "the code has expired; send a new one", http.StatusBadRequest)
 		return
-	case c.CodeAttempts >= channelCodeMaxAttempts:
+	}
+	claimed, err := claimUserChannelAttempt(w.g.db, username)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !claimed {
 		http.Error(rw, "too many wrong codes; send a new one", http.StatusTooManyRequests)
 		return
 	}
 	got := hashChannelCode(strings.TrimSpace(body.Code))
 	if subtle.ConstantTimeCompare([]byte(got), []byte(c.CodeHash)) != 1 {
-		if err := countUserChannelAttempt(w.g.db, username); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
 		http.Error(rw, "wrong code", http.StatusForbidden)
 		return
 	}
@@ -416,6 +436,8 @@ func (w *webMux) apiMyChannelTest(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	channelSendMu.Lock()
+	defer channelSendMu.Unlock()
 	c, ok := w.myChannel(rw, username)
 	if !ok {
 		return
