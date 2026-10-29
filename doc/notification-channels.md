@@ -108,13 +108,16 @@ the header no longer changes the target.
   to the user's Workflows webhook URL. It escapes template values
   (`HITLMessageValueEscaper`). It has no secret slots of its own: the
   URL is per user.
-- The page accepts a Teams channel by its webhook URL, checked to be
-  HTTPS on a Microsoft host. Verification posts the code to that
-  channel.
-- To confirm with the UN tenant admins: users may create Workflows
-  webhooks ("When a Teams webhook request is received"). Microsoft is
-  retiring the older Office 365 connector webhooks, so we don't build
-  on those.
+- The page accepts a Teams channel by its webhook URL: HTTPS, host
+  `*.environment.api.powerplatform.com` (current Workflows URLs) or
+  `*.logic.azure.com` (older ones), path `.../triggers/manual/paths/invoke`.
+  Office 365 connector URLs (`*.webhook.office.com`) are rejected:
+  Microsoft disabled connectors on 2026-05-22. Verification posts the
+  code to that channel.
+- UN tenant users can create Workflows webhooks themselves: a pilot
+  member made one on 2026-10-29. The URL carries its own signature
+  (`sig=`), so it is a bearer secret: the user pastes it into the page,
+  and it is never sent by chat or email.
 
 ### 4. Optional: approve from Teams
 
@@ -139,7 +142,3 @@ dashboard link turns out to be too slow in practice.
   approval.
 - Migrations stay numbered above ours (0031+): see the rename plan on
   cherry-picks.
-
-## Open questions
-
-1. Can users create Teams Workflows webhooks in the UN tenant?
