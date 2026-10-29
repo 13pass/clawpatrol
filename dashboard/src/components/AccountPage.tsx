@@ -227,7 +227,12 @@ const INPUT_CLASS =
 // TARGET_HINT is the placeholder for a kind's recipient field.
 const TARGET_HINT: Record<string, string> = {
   signal_cli: "+41790000000 or group.<id>",
+  teams_workflow: "my Teams chat",
 };
+
+// SECRET_KINDS take a secret (a webhook URL) besides the target, which
+// is then only a name the dashboard shows.
+const SECRET_KINDS = new Set(["teams_workflow"]);
 
 // NotificationChannel is where the user's approval prompts go: one
 // channel, active once the code sent there is typed back.
@@ -236,6 +241,7 @@ function NotificationChannel() {
   const [kinds, setKinds] = useState<string[]>([]);
   const [kind, setKind] = useState("");
   const [target, setTarget] = useState("");
+  const [secret, setSecret] = useState("");
   const [code, setCode] = useState("");
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   const [busy, setBusy] = useState(false);
@@ -267,8 +273,9 @@ function NotificationChannel() {
   function save(e: FormEvent) {
     e.preventDefault();
     run(async () => {
-      await setMyChannel(kind, target);
+      await setMyChannel(kind, target, SECRET_KINDS.has(kind) ? secret : "");
       setTarget("");
+      setSecret("");
     }, "A code was sent there. Type it below to start receiving approval prompts.");
   }
 
@@ -372,7 +379,7 @@ function NotificationChannel() {
           <label className="flex flex-col gap-1">
             <span className="font-mono text-xs uppercase tracking-wider text-text-muted">
               {channel ? "New " : ""}
-              {label(kind)} recipient
+              {SECRET_KINDS.has(kind) ? "name" : label(kind) + " recipient"}
             </span>
             <input
               value={target}
@@ -382,6 +389,21 @@ function NotificationChannel() {
               className={INPUT_CLASS + " w-72"}
             />
           </label>
+          {SECRET_KINDS.has(kind) && (
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-xs uppercase tracking-wider text-text-muted">
+                Workflows webhook URL
+              </span>
+              <input
+                type="password"
+                value={secret}
+                onChange={(e) => setSecret(e.target.value)}
+                required
+                autoComplete="off"
+                className={INPUT_CLASS + " w-96"}
+              />
+            </label>
+          )}
           <Button type="submit" disabled={busy}>
             {busy ? "Sending…" : "Send code"}
           </Button>

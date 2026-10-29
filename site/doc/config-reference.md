@@ -213,7 +213,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`teams_workflow`](#credential-teamsworkflow), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -485,6 +485,25 @@ _No configurable attributes._
 
 ```hcl
 credential "tailscale_auth" "example" {}
+```
+
+### `credential "teams_workflow" "<name>"`
+
+Delivers approval prompts to Microsoft Teams through a
+Workflows webhook ("When a Teams webhook request is received") that
+each user creates and pastes on the dashboard's Account page. It
+serves per-user channels only: the webhook URL is the user's channel
+secret, so the credential has no secret slots and no settings.
+
+Notification-only, like signal_cli: the card's "Approve or deny"
+button opens the dashboard, where the user decides. Office 365
+connector URLs (webhook.office.com) are refused; Microsoft disabled
+connectors in May 2026.
+
+_No configurable attributes._
+
+```hcl
+credential "teams_workflow" "example" {}
 ```
 
 ### `credential "telegram_bot_token" "<name>"`
