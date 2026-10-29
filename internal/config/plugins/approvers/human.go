@@ -167,10 +167,8 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 		}
 	}
 
+	// Never from the request: an agent must not pick who approves it.
 	notifyChannel := h.Channel
-	if req.NotifyChannel != "" {
-		notifyChannel = req.NotifyChannel
-	}
 	if notifyChannel != "" && h.Credential != "" && req.Policy != nil {
 		ent, ok := req.Policy.Credentials[h.Credential]
 		if ok {
