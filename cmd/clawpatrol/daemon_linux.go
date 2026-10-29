@@ -16,12 +16,6 @@ package main
 // session loop, control protocol, and gVisor stack code stay
 // transport-agnostic.
 //
-// The identity is read once, at startup, so a later `clawpatrol join`
-// (new key, new address, new gateway) would otherwise leave every
-// future `clawpatrol run` on the old device for as long as any session
-// keeps the daemon alive. The daemon therefore fingerprints the files
-// join writes and retires when they change: see retire.
-//
 // Race-control protocol:
 //   - exclusive flock on spawn.lock serializes the connect-or-spawn
 //     path across concurrent clients.
@@ -30,11 +24,9 @@ package main
 //   - the idle-exit goroutine drops back to the lock before unlinking
 //     the socket; a "lost race" recovery path re-binds a fresh
 //     listener when an accept slips in between recheck and close.
-//   - a retiring daemon unlinks the socket only under the lock, since a
-//     client holding it may already have bound a successor there.
-//   - single os.Exit site invariant (d.exit): the main goroutine never
-//     returns from runDaemon on its own, so cleanup placed on the exit
-//     path cannot be skipped.
+//   - single os.Exit site invariant: the main goroutine never returns
+//     from runDaemon on its own, so cleanup placed on the exit path
+//     cannot be skipped.
 
 import (
 	"bufio"
@@ -353,10 +345,7 @@ type daemon struct {
 	// never replaced.
 	transport daemonTransport
 
-	// identity is daemonIdentity() as it was when the transport came
-	// up. A different value at accept time means `clawpatrol join` has
-	// run since, and the daemon retires.
-	identity string
+	identity string // daemonIdentity() at startup; a change means a rejoin
 
 	// lastGoodEnv holds the most recent non-empty env-pushdown response
 	// observed during this daemon's lifetime. freshEnvVars hits the
@@ -389,13 +378,13 @@ type daemon struct {
 	// os.Exit instead; the main goroutine blocks on this channel and
 	// dies with the process.
 	rebindCh chan struct{}
-	// retired: join files changed, the socket is handed over, and the
-	// process exits once its last session ends instead of idling.
-	retired bool
+	retired  bool
+	// lockMu serializes tryExit and retire: flock is per open file, so
+	// it doesn't exclude goroutines sharing lockFile.
+	lockMu sync.Mutex
 }
 
-// daemonIdentityFiles are the files `clawpatrol join` writes that decide
-// which device the transport comes up as, in either mode.
+// daemonIdentityFiles are what `clawpatrol join` writes for either transport.
 func daemonIdentityFiles() []string {
 	caDir := defaultClawpatrolDir()
 	return []string{
@@ -410,8 +399,6 @@ func daemonIdentityFiles() []string {
 	}
 }
 
-// daemonIdentity fingerprints daemonIdentityFiles. A missing file counts
-// as empty, so a join that adds or removes one changes the result too.
 func daemonIdentity() string {
 	h := sha256.New()
 	for _, path := range daemonIdentityFiles() {
@@ -437,9 +424,7 @@ func runDaemon(_ []string) {
 
 	log.Printf("daemon pid=%d starting", os.Getpid())
 
-	// Before the transport boots, so a join racing the boot is seen as
-	// a change at the next accept rather than missed.
-	identity := daemonIdentity()
+	identity := daemonIdentity() // before the boot, so a racing join isn't missed
 
 	// Boot the transport first. We don't bind the control socket
 	// until the daemon is fully usable — that way a parent reading
@@ -551,7 +536,7 @@ func (d *daemon) serve() {
 	for {
 		c, err := ln.Accept()
 		if err != nil {
-			return // listener closed by tryExit or retire
+			return // listener closed by tryExit
 		}
 		if daemonIdentity() != d.identity {
 			d.retire(c)
@@ -851,11 +836,13 @@ func daemonHandshake(c net.Conn) error {
 // tryExit is the race-sensitive bit. The ordering — lock, recheck,
 // unlink, close, recheck, exit-or-rebind — is what makes concurrent
 // connect-or-spawn safe; see the file-header comment for the protocol
-// and the inline comments below for each step's rationale. Exiting
-// through d.exit is load-bearing: allowing the main goroutine to fall
-// out of runDaemon after serve() returns would skip whatever cleanup
-// we add to that path.
+// and the inline comments below for each step's rationale. The
+// single os.Exit site here is load-bearing: allowing the main
+// goroutine to fall out of runDaemon after serve() returns would skip
+// whatever cleanup we add to this path.
 func (d *daemon) tryExit() {
+	d.lockMu.Lock()
+	defer d.lockMu.Unlock()
 	if err := syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		// A client is mid-spawn-check. Back off and rearm.
 		log.Printf("daemon: tryExit: lock contended (%v), rearming", err)
@@ -866,9 +853,7 @@ func (d *daemon) tryExit() {
 	// exit path we hold it through os.Exit (kernel releases at process
 	// death).
 
-	if d.isRetired() {
-		// The socket path may already be a successor's: never unlink it
-		// from here. The last session's close exits instead.
+	if d.isRetired() { // the socket may be a successor's by now
 		_ = syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_UN)
 		return
 	}
@@ -910,13 +895,8 @@ func (d *daemon) tryExit() {
 	d.exit("idle")
 }
 
-// retire hands the control socket over after `clawpatrol join` changed
-// the files this daemon's identity came from. c, the conn that noticed,
-// is closed unanswered: its client's hello fails, it takes the spawn
-// lock, finds no socket and spawns a daemon from the new files. Sessions
-// already attached keep the old tunnel until they end; the gateway may
-// still accept the old key (a rejoin under a new hostname leaves the
-// old device approved), so cutting them off here would be a guess.
+// retire gives up the socket after a rejoin: c's hello fails, so its client
+// spawns a daemon from the new files. Attached sessions keep the old tunnel.
 func (d *daemon) retire(c net.Conn) {
 	log.Printf("daemon pid=%d: `clawpatrol join` files changed since start; retiring (active=%d)", os.Getpid(), d.activeConns.Load())
 	d.mu.Lock()
@@ -930,17 +910,16 @@ func (d *daemon) retire(c net.Conn) {
 	if ul, ok := ln.(*net.UnixListener); ok {
 		ul.SetUnlinkOnClose(false)
 	}
+	d.lockMu.Lock()
+	// Unlink only under the lock: a client holding it may have bound a successor.
 	if err := syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err == nil {
 		if err := os.Remove(d.sockPath); err != nil && !os.IsNotExist(err) {
 			log.Printf("warn: unlink: %v", err)
 		}
-		_ = ln.Close()
 		_ = syscall.Flock(int(d.lockFile.Fd()), syscall.LOCK_UN)
-	} else {
-		// A client is in the spawn path and may have bound a successor
-		// at sockPath already: stop accepting, leave the path alone.
-		_ = ln.Close()
 	}
+	d.lockMu.Unlock()
+	_ = ln.Close()
 	_ = c.Close()
 
 	if d.activeConns.Load() == 0 {
@@ -954,18 +933,18 @@ func (d *daemon) isRetired() bool {
 	return d.retired
 }
 
-// exit is the daemon's single os.Exit(0) site. It closes the transport
-// politely so any upstream state (tsnet control plane registration,
-// wireguard-go device, etc.) can settle first. The retire path can reach
-// it from two goroutines at once; only the first one proceeds.
 func (d *daemon) exit(why string) {
 	d.mu.Lock()
 	if d.exited {
 		d.mu.Unlock()
-		select {} // the other caller is exiting the process
+		return
 	}
 	d.exited = true
 	d.mu.Unlock()
+
+	// Close the transport politely so any upstream state (tsnet
+	// control plane registration, wireguard-go device, etc.) can
+	// settle before we exit.
 
 	if d.transport != nil {
 		_ = d.transport.Close()
@@ -975,5 +954,4 @@ func (d *daemon) exit(why string) {
 	daemonExit(0)
 }
 
-// daemonExit is os.Exit, swapped in tests that drive the exit paths.
-var daemonExit = os.Exit
+var daemonExit = os.Exit // swapped in tests

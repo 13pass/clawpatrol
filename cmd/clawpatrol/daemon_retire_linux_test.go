@@ -10,8 +10,6 @@ import (
 	"time"
 )
 
-// joinFilesForTest points the join files at a fresh HOME and writes a
-// WireGuard-mode join whose wg.conf carries addr.
 func joinFilesForTest(t *testing.T, addr string) {
 	t.Helper()
 	home := t.TempDir()
@@ -38,12 +36,9 @@ func rewriteWGConfForTest(t *testing.T, addr string) {
 	}
 }
 
-// serveDaemonForTest starts a daemon's accept loop on a real socket. The
-// socket lives under os.TempDir rather than t.TempDir, whose long paths
-// can exceed sun_path.
 func serveDaemonForTest(t *testing.T, sessions int32) (d *daemon, served chan struct{}, exits chan int) {
 	t.Helper()
-	dir, err := os.MkdirTemp("", "cpd")
+	dir, err := os.MkdirTemp("", "cpd") // t.TempDir paths can exceed sun_path
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,9 +77,7 @@ func serveDaemonForTest(t *testing.T, sessions int32) (d *daemon, served chan st
 
 func TestDaemonRetiresAfterRejoin(t *testing.T) {
 	joinFilesForTest(t, "10.55.0.2")
-	// One `clawpatrol run` is attached: it keeps the old tunnel, and the
-	// daemon must outlive the retirement for it.
-	d, served, exits := serveDaemonForTest(t, 1)
+	d, served, exits := serveDaemonForTest(t, 1) // one attached session
 
 	c, ok := daemonDialAndHello(d.sockPath)
 	if !ok {
