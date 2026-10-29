@@ -80,7 +80,7 @@ type HumanApprover struct {
 	// mentions.
 	// Classifier (if also set) still runs; Message takes display precedence.
 	Message string `hcl:"message,optional"`
-	// Route = "profile_owner" sends each prompt to the verified channels
+	// Route "profile_owner" sends each prompt to the verified channels
 	// of the requesting profile's owners, who may then decide it. The
 	// approver's own channel is used only when no owner has one.
 	Route string `hcl:"route,optional" json:"route,omitempty"`
