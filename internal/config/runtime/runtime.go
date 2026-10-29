@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
@@ -619,6 +620,26 @@ type ProfileOwner struct {
 	Username   string
 	Credential string
 	Channel    UserChannel
+}
+
+// routedMessageRefPrefix marks a message ref recorded by a notifier
+// other than the approver's own credential (a profile owner's channel).
+const routedMessageRefPrefix = "routed:"
+
+// RoutedMessageRef tags ref with the credential that posted it.
+func RoutedMessageRef(credential, ref string) string {
+	return routedMessageRefPrefix + credential + "\n" + ref
+}
+
+// SplitRoutedMessageRef undoes RoutedMessageRef; ok is false for a ref
+// posted through the approver's own credential.
+func SplitRoutedMessageRef(ref string) (credential, inner string, ok bool) {
+	rest, found := strings.CutPrefix(ref, routedMessageRefPrefix)
+	if !found {
+		return "", ref, false
+	}
+	credential, inner, ok = strings.Cut(rest, "\n")
+	return credential, inner, ok
 }
 
 // ApproveDecisionAsyncPending is the ApproveVerdict.Decision value an

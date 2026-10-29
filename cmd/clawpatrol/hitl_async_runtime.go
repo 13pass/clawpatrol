@@ -206,13 +206,15 @@ func (g *Gateway) updateHITLOperationMessage(ctx context.Context, op HITLOperati
 	if policy == nil {
 		return
 	}
-	approver := policy.Approvers[op.ApproverID]
-	if approver == nil {
-		return
-	}
-	credName := ""
-	if h, ok := approver.Body.(runtime.HITLHumanCredentialer); ok {
-		credName = h.HumanApproverCredential()
+	credName, ref, routed := runtime.SplitRoutedMessageRef(op.ApproverMessageRef)
+	if !routed {
+		approver := policy.Approvers[op.ApproverID]
+		if approver == nil {
+			return
+		}
+		if h, ok := approver.Body.(runtime.HITLHumanCredentialer); ok {
+			credName = h.HumanApproverCredential()
+		}
 	}
 	if credName == "" {
 		return
@@ -229,7 +231,7 @@ func (g *Gateway) updateHITLOperationMessage(ctx context.Context, op HITLOperati
 		ctx = context.Background()
 	}
 	if err := updater.UpdateHITLMessage(ctx, g.secrets, runtime.HITLMessageUpdate{
-		MessageRef:     op.ApproverMessageRef,
+		MessageRef:     ref,
 		OperationID:    op.ID,
 		State:          runtime.HITLOperationState(op.State),
 		Method:         op.Method,
@@ -255,8 +257,11 @@ func (g *Gateway) updatePendingHITLMessage(ctx context.Context, pending runtime.
 	if policy == nil {
 		return
 	}
-	credName := ""
+	credName, ref, routed := runtime.SplitRoutedMessageRef(ref)
 	for _, approverName := range pending.Approvers {
+		if routed {
+			break
+		}
 		approver := policy.Approvers[approverName]
 		if approver == nil {
 			continue

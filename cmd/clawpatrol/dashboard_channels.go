@@ -176,6 +176,7 @@ func (g *Gateway) profileOwners(profile string) []runtime.ProfileOwner {
 	}
 	defer rows.Close()
 	var out []runtime.ProfileOwner
+	senders := map[string]string{}
 	for rows.Next() {
 		var o runtime.ProfileOwner
 		var c userChannel
@@ -184,7 +185,12 @@ func (g *Gateway) profileOwners(profile string) []runtime.ProfileOwner {
 			return nil
 		}
 		if c.VerifiedNs > 0 {
-			if cred, _, ok := g.channelSender(c.Kind); ok {
+			cred, seen := senders[c.Kind]
+			if !seen {
+				cred, _, _ = g.channelSender(c.Kind)
+				senders[c.Kind] = cred
+			}
+			if cred != "" {
 				o.Credential, o.Channel = cred, c.runtime()
 			}
 		}

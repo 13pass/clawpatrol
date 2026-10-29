@@ -182,15 +182,7 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 	}
 
 	// Never from the request: an agent must not pick who approves it.
-	notified := false
-	for _, o := range owners {
-		if o.Credential != "" && h.notify(ctx, req, o.Credential, o.Channel.Target, o.Channel.Secret, id, pending, summary) {
-			notified = true
-		}
-	}
-	if !notified && h.Channel != "" && h.Credential != "" {
-		h.notify(ctx, req, h.Credential, h.Channel, "", id, pending, summary)
-	}
+	go h.deliver(ctx, req, owners, id, pending, summary)
 
 	timer := time.NewTimer(timeout)
 	defer timer.Stop()
@@ -234,21 +226,39 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 	}
 }
 
-// notify posts the prompt to one channel in the background and reports
-// whether a notifier took it.
-func (h *HumanApprover) notify(ctx context.Context, req runtime.ApproveRequest, credential, channel, secret, id string, pending runtime.HITLPending, summary *runtime.HITLSummary) bool {
+// deliver sends the prompt to the owners' channels, and to the
+// approver's own channel when none of those sends succeeded.
+func (h *HumanApprover) deliver(ctx context.Context, req runtime.ApproveRequest, owners []runtime.ProfileOwner, id string, pending runtime.HITLPending, summary *runtime.HITLSummary) {
+	delivered := false
+	for _, o := range owners {
+		if o.Credential == "" {
+			continue
+		}
+		if err := h.notify(ctx, req, o.Credential, o.Channel.Target, o.Channel.Secret, id, pending, summary); err != nil {
+			log.Printf("human approver %s: notify %s: %v", req.ApproverName, o.Username, err)
+		} else {
+			delivered = true
+		}
+	}
+	if delivered || h.Channel == "" || h.Credential == "" {
+		return
+	}
+	if err := h.notify(ctx, req, h.Credential, h.Channel, "", id, pending, summary); err != nil {
+		log.Printf("human approver %s: notify: %v", req.ApproverName, err)
+	}
+}
+
+func (h *HumanApprover) notify(ctx context.Context, req runtime.ApproveRequest, credential, channel, secret, id string, pending runtime.HITLPending, summary *runtime.HITLSummary) error {
 	if req.Policy == nil {
-		return false
+		return errors.New("no policy")
 	}
 	ent, ok := req.Policy.Credentials[credential]
 	if !ok {
-		log.Printf("human approver %s: credential %q not declared", req.ApproverName, credential)
-		return false
+		return fmt.Errorf("credential %q not declared", credential)
 	}
 	notifier, ok := ent.Body.(runtime.HITLNotifier)
 	if !ok {
-		log.Printf("human approver %s: credential %q does not implement HITLNotifier", req.ApproverName, credential)
-		return false
+		return fmt.Errorf("credential %q does not implement HITLNotifier", credential)
 	}
 	var msg string
 	if h.Message != "" {
@@ -275,12 +285,25 @@ func (h *HumanApprover) notify(ctx context.Context, req runtime.ApproveRequest, 
 		MessageUpdateSink:        req.MessageUpdateSink,
 		PendingMessageUpdateSink: req.PendingMessageUpdateSink,
 	}
-	go func() {
-		if err := notifier.NotifyHITL(ctx, req, target); err != nil {
-			log.Printf("human approver %s: notify: %v", req.ApproverName, err)
+	if credential != h.Credential {
+		routeMessageRefs(&target, credential)
+	}
+	return notifier.NotifyHITL(ctx, req, target)
+}
+
+// routeMessageRefs tags the refs a notifier records with its credential,
+// so the decision update reaches that notifier, not the approver's.
+func routeMessageRefs(t *runtime.HITLTarget, credential string) {
+	if sink := t.MessageUpdateSink; sink != nil {
+		t.MessageUpdateSink = func(ctx context.Context, id, ref string) error {
+			return sink(ctx, id, runtime.RoutedMessageRef(credential, ref))
 		}
-	}()
-	return true
+	}
+	if sink := t.PendingMessageUpdateSink; sink != nil {
+		t.PendingMessageUpdateSink = func(ctx context.Context, id, ref string) error {
+			return sink(ctx, id, runtime.RoutedMessageRef(credential, ref))
+		}
+	}
 }
 
 func (h *HumanApprover) approvalTimeout(policy *config.CompiledPolicy) time.Duration {

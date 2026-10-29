@@ -464,3 +464,59 @@ func TestHumanApproverWithoutRouteIgnoresOwners(t *testing.T) {
 		t.Fatalf("targets = %+v, deciders = %v; want today's behaviour", targets, pending.Deciders)
 	}
 }
+
+type failingNotifier struct{}
+
+func (failingNotifier) NotifyHITL(context.Context, runtime.ApproveRequest, runtime.HITLTarget) error {
+	return errors.New("webhook gone")
+}
+
+func TestHumanApproverFallsBackWhenOwnerDeliveryFails(t *testing.T) {
+	pool := newCaptureHITLPool()
+	notifier := &captureNotifier{notified: make(chan runtime.HITLTarget, 2)}
+	refs := make(chan string, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	go func() {
+		_, _ = h.Approve(ctx, runtime.ApproveRequest{
+			Pool: pool,
+			Policy: &config.CompiledPolicy{Credentials: map[string]*config.Entity{
+				"ops": {Body: notifier}, "teams": {Body: failingNotifier{}},
+			}},
+			ApproverName: "operator",
+			ProfileOwners: func() []runtime.ProfileOwner {
+				return []runtime.ProfileOwner{{Username: "alice", Credential: "teams", Channel: runtime.UserChannel{Target: "chat", Secret: "https://x"}}}
+			},
+			PendingMessageUpdateSink: func(_ context.Context, _, ref string) error { refs <- ref; return nil },
+		})
+	}()
+	select {
+	case target := <-notifier.notified:
+		if target.Channel != "+10000000000" {
+			t.Fatalf("fallback went to %q", target.Channel)
+		}
+		if err := target.PendingMessageUpdateSink(ctx, "p", "ref-1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-refs; got != "ref-1" {
+			t.Fatalf("the approver's own ref was tagged: %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no fallback after the owner's channel failed")
+	}
+}
+
+func TestOwnerChannelRefsNameTheirCredential(t *testing.T) {
+	var got string
+	target := runtime.HITLTarget{PendingMessageUpdateSink: func(_ context.Context, _, ref string) error { got = ref; return nil }}
+	routeMessageRefs(&target, "teams")
+	_ = target.PendingMessageUpdateSink(context.Background(), "p", "msg-1")
+	cred, inner, ok := runtime.SplitRoutedMessageRef(got)
+	if !ok || cred != "teams" || inner != "msg-1" {
+		t.Fatalf("SplitRoutedMessageRef(%q) = %q, %q, %v", got, cred, inner, ok)
+	}
+	if _, inner, ok := runtime.SplitRoutedMessageRef("plain"); ok || inner != "plain" {
+		t.Fatal("a plain ref was taken for a routed one")
+	}
+}
