@@ -2,7 +2,8 @@
 
 Status: draft (2026-10-25). Decision: hard fork of
 [denoland/clawpatrol](https://github.com/denoland/clawpatrol); upstream
-changes are no longer merged wholesale.
+changes are no longer merged wholesale. Done so far: telemetry off in
+our gateway config (uninfo-agent-ops #59), and phase 1 step 2.
 
 Constraint: the running gateway (`gateway.13pass.com`), the
 uninfo-agent-ops scripts and the joined agent hosts keep working at every
@@ -34,12 +35,9 @@ infrastructure.
    because they report version `dev`, and our gateway config sets
    `telemetry = false` (uninfo-agent-ops PR #59). This must land before
    phase 1 step 4: a version-stamped build pings by default.
-2. **`integration` is what we run.** Feature branches (from
-   `integration`) are merged into it, and the gateway host builds from
-   it. `main` stays identical to upstream's `main`, the base for
-   cherry-picks. `integration` started at `6bc3967`, already holding
-   `feat/multi-user-dashboard`, `feat/config-dir-writes` and
-   `feat/approver-message-headers`.
+2. **`integration` is what we run** (done). Feature branches start
+   from it and merge back into it; the gateway host builds it. `main`
+   mirrors upstream's `main`, the base for cherry-picks.
 3. **Upstream fixes by cherry-pick.** Security fixes (like upstream
    #862) are picked one by one. Upstream's new migrations are renumbered
    above ours: the migrator applies only files numbered above the
@@ -55,10 +53,10 @@ infrastructure.
      amd64 and arm64, checksums), version-stamped.
    - Keep `ci.yml`.
 5. **Our own client.** Agent hosts install the official client from
-   `clawpatrol.dev/install.sh` today (`upgrade-agent.sh`). Point
-   `upgrade-agent.sh` (and `install.sh`) at our releases, so client and
-   gateway come from the same source. Same for the reinstall hints in
-   `setup.go` and `run_darwin.go`.
+   `clawpatrol.dev/install.sh` today (`upgrade-agent.sh`), so client
+   fixes such as `fix/daemon-retires-after-rejoin` never reach them.
+   Point `upgrade-agent.sh` (and `install.sh`) at our releases, and the
+   reinstall hints in `setup.go` and `run_darwin.go`.
 
 Gate: `deploy-gateway.sh` deploys unchanged, an agent host upgrades to
 the fork client and `clawpatrol run -- claude` works, policy tests pass.
@@ -107,13 +105,3 @@ or stored state, for no user benefit:
 | Plugin protocol package `clawpatrol.plugin.v1` | Wire compatibility with external plugins. |
 | Kubernetes label keys `clawpatrol.dev/*` | Cleanup of tunnel resources created under the old keys. |
 | macOS bundle ids `dev.clawpatrol.app*` | We don't ship the macOS app; untouched. |
-
-## Order and owners
-
-| Step | Repo | Breaks anything? |
-|---|---|---|
-| Telemetry off in our config | uninfo-agent-ops #59 | no |
-| Phase 0 | n/a | no |
-| Phase 1 | fork | no (gate above) |
-| Phase 2 | fork | no |
-| Phase 3 | fork | no; costs cherry-pick friction |
