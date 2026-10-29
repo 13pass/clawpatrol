@@ -31,6 +31,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -156,29 +157,10 @@ func (*SignalCLI) SecretSlots() []config.SecretSlot {
 // SecretStore so dashboard rotations apply); the recipient is the
 // approver block's channel.
 func (s *SignalCLI) NotifyHITL(ctx context.Context, req runtime.ApproveRequest, target runtime.HITLTarget) error {
-	if req.Secrets == nil {
-		return fmt.Errorf("no secret store on request")
-	}
-	sec, err := req.Secrets.Get(target.CredentialName)
-	if err != nil {
-		return fmt.Errorf("fetch credential %s: %w", target.CredentialName, err)
-	}
-	apiURL := strings.TrimRight(sec.Extras["api_url"], "/")
-	number := strings.TrimSpace(sec.Extras["number"])
-	if apiURL == "" || number == "" {
-		return fmt.Errorf("credential %s missing api_url or number (paste them via the dashboard)", target.CredentialName)
-	}
 	if strings.TrimSpace(target.Channel) == "" {
 		return fmt.Errorf("human approver %s has no channel (set it to a Signal recipient number or group.<id>)", target.CredentialName)
 	}
-
-	body := map[string]any{
-		"number":     number,
-		"recipients": []string{target.Channel},
-		"message":    signalHITLMessage(req, target),
-	}
-	buf, _ := json.Marshal(body)
-	sentTS, err := signalPostSend(ctx, apiURL+signalSendPath, sec.Extras["auth"], buf)
+	sentTS, err := signalSend(ctx, req.Secrets, target.CredentialName, target.Channel, signalHITLMessage(req, target))
 	if err != nil {
 		return err
 	}
@@ -196,6 +178,50 @@ func (s *SignalCLI) NotifyHITL(ctx context.Context, req runtime.ApproveRequest, 
 		}
 	}
 	return nil
+}
+
+// signalSend posts text to one recipient from the credential's sender
+// number and returns the sent message's timestamp.
+func signalSend(ctx context.Context, secrets runtime.SecretStore, credential, recipient, text string) (int64, error) {
+	if secrets == nil {
+		return 0, fmt.Errorf("no secret store on request")
+	}
+	sec, err := secrets.Get(credential)
+	if err != nil {
+		return 0, fmt.Errorf("fetch credential %s: %w", credential, err)
+	}
+	apiURL := strings.TrimRight(sec.Extras["api_url"], "/")
+	number := strings.TrimSpace(sec.Extras["number"])
+	if apiURL == "" || number == "" {
+		return 0, fmt.Errorf("credential %s missing api_url or number (paste them via the dashboard)", credential)
+	}
+	buf, _ := json.Marshal(map[string]any{
+		"number":     number,
+		"recipients": []string{recipient},
+		"message":    text,
+	})
+	return signalPostSend(ctx, apiURL+signalSendPath, sec.Extras["auth"], buf)
+}
+
+// signalRecipient is an E.164 number or a signal-cli group id.
+var signalRecipient = regexp.MustCompile(`^(\+[1-9][0-9]{6,14}|group\.[A-Za-z0-9+/=_-]{8,256})$`)
+
+// ValidateChannel accepts a recipient number or group id as a user's
+// channel. A Signal channel has no secret: the sender is the credential.
+func (*SignalCLI) ValidateChannel(ch runtime.UserChannel) error {
+	if !signalRecipient.MatchString(ch.Target) {
+		return fmt.Errorf("enter a number in international form (+41...) or a group id (group.<id>)")
+	}
+	if ch.Secret != "" {
+		return fmt.Errorf("a Signal channel takes no secret")
+	}
+	return nil
+}
+
+// SendChannelText sends a verification code or test message.
+func (*SignalCLI) SendChannelText(ctx context.Context, secrets runtime.SecretStore, credential string, ch runtime.UserChannel, text string) error {
+	_, err := signalSend(ctx, secrets, credential, ch.Target, text)
+	return err
 }
 
 // signalHITLMessage renders the plain-text prompt. Signal has no rich
@@ -444,6 +470,7 @@ func signalRemoteDelete(ctx context.Context, apiURL, number, auth string, ref si
 func init() {
 	var _ runtime.HITLNotifier = (*SignalCLI)(nil)
 	var _ runtime.HITLMessageUpdater = (*SignalCLI)(nil)
+	var _ runtime.HITLChannelSender = (*SignalCLI)(nil)
 	config.Register(&config.Plugin{
 		Kind: config.KindCredential,
 		Type: "signal_cli",

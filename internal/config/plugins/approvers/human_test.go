@@ -390,3 +390,133 @@ func assertPendingLifetime(t *testing.T, pending runtime.HITLPending, want time.
 		t.Fatalf("pending lifetime = %s, want %s", got, want)
 	}
 }
+
+// approveForTargets runs Approve until it has notified, then returns
+// every target it posted to and the pending entry it raised.
+func approveForTargets(t *testing.T, h *HumanApprover, owners []runtime.ProfileOwner) ([]runtime.HITLTarget, runtime.HITLPending) {
+	t.Helper()
+	pool := newCaptureHITLPool()
+	notifier := &captureNotifier{notified: make(chan runtime.HITLTarget, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = h.Approve(ctx, runtime.ApproveRequest{
+			Pool:          pool,
+			Policy:        &config.CompiledPolicy{Credentials: map[string]*config.Entity{"ops": {Body: notifier}}},
+			ApproverName:  "operator",
+			Profile:       "team-a",
+			ProfileOwners: func() []runtime.ProfileOwner { return owners },
+		})
+		close(done)
+	}()
+	var targets []runtime.HITLTarget
+	timeout := time.After(time.Second)
+	for len(targets) == 0 {
+		select {
+		case target := <-notifier.notified:
+			targets = append(targets, target)
+		case <-timeout:
+			t.Fatal("human approver did not notify")
+		}
+	}
+	// Let any other notification land before stopping.
+	time.Sleep(50 * time.Millisecond)
+	for len(notifier.notified) > 0 {
+		targets = append(targets, <-notifier.notified)
+	}
+	pending := pool.capturedPending()
+	cancel()
+	<-done
+	return targets, pending
+}
+
+func TestHumanApproverRoutesToProfileOwners(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{
+		{Username: "alice", Credential: "ops", Channel: runtime.UserChannel{Target: "+41790000001"}},
+		{Username: "bob"},
+	})
+	if len(targets) != 1 || targets[0].Channel != "+41790000001" {
+		t.Fatalf("targets = %+v, want alice's channel only", targets)
+	}
+	if strings.Join(pending.Deciders, ",") != "alice,bob" {
+		t.Fatalf("deciders = %v, want every owner", pending.Deciders)
+	}
+}
+
+func TestHumanApproverFallsBackWithoutAVerifiedOwnerChannel(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{{Username: "bob"}})
+	if len(targets) != 1 || targets[0].Channel != "+10000000000" {
+		t.Fatalf("targets = %+v, want the approver's own channel", targets)
+	}
+	if strings.Join(pending.Deciders, ",") != "bob" {
+		t.Fatalf("deciders = %v, want bob", pending.Deciders)
+	}
+}
+
+func TestHumanApproverWithoutRouteIgnoresOwners(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{
+		{Username: "alice", Credential: "ops", Channel: runtime.UserChannel{Target: "+41790000001"}},
+	})
+	if len(targets) != 1 || targets[0].Channel != "+10000000000" || len(pending.Deciders) != 0 {
+		t.Fatalf("targets = %+v, deciders = %v; want today's behaviour", targets, pending.Deciders)
+	}
+}
+
+type failingNotifier struct{}
+
+func (failingNotifier) NotifyHITL(context.Context, runtime.ApproveRequest, runtime.HITLTarget) error {
+	return errors.New("webhook gone")
+}
+
+func TestHumanApproverFallsBackWhenOwnerDeliveryFails(t *testing.T) {
+	pool := newCaptureHITLPool()
+	notifier := &captureNotifier{notified: make(chan runtime.HITLTarget, 2)}
+	refs := make(chan string, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	go func() {
+		_, _ = h.Approve(ctx, runtime.ApproveRequest{
+			Pool: pool,
+			Policy: &config.CompiledPolicy{Credentials: map[string]*config.Entity{
+				"ops": {Body: notifier}, "teams": {Body: failingNotifier{}},
+			}},
+			ApproverName: "operator",
+			ProfileOwners: func() []runtime.ProfileOwner {
+				return []runtime.ProfileOwner{{Username: "alice", Credential: "teams", Channel: runtime.UserChannel{Target: "chat", Secret: "https://x"}}}
+			},
+			PendingMessageUpdateSink: func(_ context.Context, _, ref string) error { refs <- ref; return nil },
+		})
+	}()
+	select {
+	case target := <-notifier.notified:
+		if target.Channel != "+10000000000" {
+			t.Fatalf("fallback went to %q", target.Channel)
+		}
+		if err := target.PendingMessageUpdateSink(ctx, "p", "ref-1"); err != nil {
+			t.Fatal(err)
+		}
+		if got := <-refs; got != "ref-1" {
+			t.Fatalf("the approver's own ref was tagged: %q", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("no fallback after the owner's channel failed")
+	}
+}
+
+func TestOwnerChannelRefsNameTheirCredential(t *testing.T) {
+	var got string
+	target := runtime.HITLTarget{PendingMessageUpdateSink: func(_ context.Context, _, ref string) error { got = ref; return nil }}
+	routeMessageRefs(&target, "teams")
+	_ = target.PendingMessageUpdateSink(context.Background(), "p", "msg-1")
+	cred, inner, ok := runtime.SplitRoutedMessageRef(got)
+	if !ok || cred != "teams" || inner != "msg-1" {
+		t.Fatalf("SplitRoutedMessageRef(%q) = %q, %q, %v", got, cred, inner, ok)
+	}
+	if _, inner, ok := runtime.SplitRoutedMessageRef("plain"); ok || inner != "plain" {
+		t.Fatal("a plain ref was taken for a routed one")
+	}
+}

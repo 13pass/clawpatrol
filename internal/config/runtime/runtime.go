@@ -12,6 +12,7 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
@@ -424,6 +425,25 @@ type HITLNotifier interface {
 	NotifyHITL(ctx context.Context, req ApproveRequest, target HITLTarget) error
 }
 
+// UserChannel is where one dashboard user receives their approval
+// prompts, set and verified by the user (doc/notification-channels.md).
+// Secret is the part that must never reach a browser, such as a Teams
+// webhook URL; Target is what may be shown.
+type UserChannel struct {
+	Target string
+	Secret string
+}
+
+// HITLChannelSender is implemented by notifiers that can deliver to a
+// per-user channel: the gateway checks what a user enters with
+// ValidateChannel and sends verification codes and test messages with
+// SendChannelText. The credential (its secret slots) is the sender.
+type HITLChannelSender interface {
+	HITLNotifier
+	ValidateChannel(ch UserChannel) error
+	SendChannelText(ctx context.Context, secrets SecretStore, credential string, ch UserChannel, text string) error
+}
+
 // HITLMessageValueEscaper is implemented by notifiers whose message
 // format gives some characters meaning (Slack mrkdwn turns `<url|x>`
 // into a link and `<!channel>` into a mention). Values substituted
@@ -508,6 +528,9 @@ type HITLTarget struct {
 	// PendingMessageUpdateSink records a notifier-specific, non-secret
 	// message ref for synchronous pending HITL terminal updates.
 	PendingMessageUpdateSink HITLPendingMessageUpdateSink
+	// Secret is the per-user channel's secret (a webhook URL), "" for an
+	// approver's own channel. Never log it.
+	Secret string
 }
 
 // ApproverRuntime evaluates one stage of an approve = [...] chain.
@@ -585,6 +608,38 @@ type ApproveRequest struct {
 	// synchronous HITL prompts so terminal timeout/disconnect states can be
 	// reflected back to the original operator-facing message.
 	PendingMessageUpdateSink HITLPendingMessageUpdateSink
+	// ProfileOwners lists the dashboard users who own Profile, for
+	// approvers that route prompts to them. Nil without a user store.
+	ProfileOwners func() []ProfileOwner
+}
+
+// ProfileOwner is a dashboard user who owns the requesting profile.
+// Credential names the notifier for their verified channel, "" when
+// they have none the gateway can send to.
+type ProfileOwner struct {
+	Username   string
+	Credential string
+	Channel    UserChannel
+}
+
+// routedMessageRefPrefix marks a message ref recorded by a notifier
+// other than the approver's own credential (a profile owner's channel).
+const routedMessageRefPrefix = "routed:"
+
+// RoutedMessageRef tags ref with the credential that posted it.
+func RoutedMessageRef(credential, ref string) string {
+	return routedMessageRefPrefix + credential + "\n" + ref
+}
+
+// SplitRoutedMessageRef undoes RoutedMessageRef; ok is false for a ref
+// posted through the approver's own credential.
+func SplitRoutedMessageRef(ref string) (credential, inner string, ok bool) {
+	rest, found := strings.CutPrefix(ref, routedMessageRefPrefix)
+	if !found {
+		return "", ref, false
+	}
+	credential, inner, ok = strings.Cut(rest, "\n")
+	return credential, inner, ok
 }
 
 // ApproveDecisionAsyncPending is the ApproveVerdict.Decision value an
@@ -758,8 +813,11 @@ type HITLPending struct {
 	Approvers  []string `json:"approvers,omitempty"`
 	// Profile and Rule say whose request this is and which rule asked
 	// for approval; the dashboard scopes pending approvals by them.
-	Profile   string    `json:"profile,omitempty"`
-	Rule      string    `json:"rule,omitempty"`
+	Profile string `json:"profile,omitempty"`
+	Rule    string `json:"rule,omitempty"`
+	// Deciders are the members who may decide besides admins: the
+	// profile's owners, when the approver routes to them.
+	Deciders  []string  `json:"deciders,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 }

@@ -68,8 +68,10 @@ type dashboardUser struct {
 	// OIDC lists the provider accounts an admin linked.
 	OIDC        []oidcLink `json:"oidc"`
 	HasPassword bool       `json:"has_password"`
-	CreatedNs   int64      `json:"created_ns"`
-	UpdatedNs   int64      `json:"updated_ns"`
+	// Channel is where the user gets approval prompts, nil if unset.
+	Channel   *channelStatus `json:"channel"`
+	CreatedNs int64          `json:"created_ns"`
+	UpdatedNs int64          `json:"updated_ns"`
 }
 
 // lookupDashboardUser returns the stored bcrypt hash for the given
@@ -146,6 +148,9 @@ func deleteDashboardUser(db *sql.DB, username string) error {
 		return err
 	}
 	if _, err := db.Exec(`DELETE FROM dashboard_user_oidc WHERE username = ?`, username); err != nil {
+		return err
+	}
+	if err := deleteUserChannel(db, username); err != nil {
 		return err
 	}
 	return revokeAllDashboardSessionsFor(db, username)
@@ -358,9 +363,16 @@ func listDashboardUsers(db *sql.DB) ([]dashboardUser, error) {
 	if err != nil {
 		return nil, err
 	}
+	channels, err := allUserChannelStatuses(db)
+	if err != nil {
+		return nil, err
+	}
 	for i := range out {
 		out[i].Profiles = append([]string{}, profiles[out[i].Username]...)
 		out[i].OIDC = append([]oidcLink{}, links[out[i].Username]...)
+		if c, ok := channels[out[i].Username]; ok {
+			out[i].Channel = &c
+		}
 	}
 	return out, nil
 }

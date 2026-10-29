@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"slices"
 	"sort"
 	"strconv"
 	"strings"
@@ -546,14 +547,20 @@ func (v viewer) ownsRule(r *rules.Rule) bool {
 }
 
 // decidesPending reports whether the viewer may see and decide a
-// pending approval. A member may only for one raised by a rule of
-// their own file, pinned to a profile they still own: approvals raised
-// by an admin's rules stay with the approver the admin chose.
+// pending approval. A member may for a profile they still own, when
+// the approver routed it to the profile's owners, or when a rule of
+// their own file raised it; other approvals stay with the admins.
 func (w *webMux) decidesPending(v viewer, p runtime.HITLPending) bool {
 	if v.admin {
 		return true
 	}
-	if p.Rule == "" || !v.ownsProfile(p.Profile) {
+	if !v.ownsProfile(p.Profile) {
+		return false
+	}
+	if slices.Contains(p.Deciders, v.username) {
+		return true
+	}
+	if p.Rule == "" {
 		return false
 	}
 	path := w.memberRulesPath(v.username)

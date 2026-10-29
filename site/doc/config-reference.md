@@ -181,6 +181,7 @@ operator clicks approve/deny on the dashboard).
 | `interactive` | `bool` | no | Toggles in-channel approve/deny buttons. Requires the referenced credential's signing_secret slot pasted via the dashboard AND Slack's Interactivity URL pointed at the gateway. Default false: message includes only an "Open dashboard" link. |
 | `classifier` | `ref(approver)` | no | Optionally references an llm_approver by name. When set, the approver calls the classifier's Summarize method before posting the HITL notification, enriching the Slack card with request summary metadata. Classifier failures are non-fatal — the generic card is used as fallback. |
 | `message` | `string` | no | An optional Go-template-style string with {{var}} placeholders. When set, the expanded text replaces the default section body in the Slack (or other notifier) card. Supported vars mirror the CEL facet namespace: {{http.method}}, {{http.path}}, {{http.headers.X-Caller-Id}}, {{k8s.verb}}, {{sql.tables}}, {{body_json.resource_id}}, {{profile}}, {{endpoint}}, {{reason}}, etc. Headers that may carry a credential (auth, token, secret, key, password, cookie) render as "***". Substituted values come from the request, so they are escaped for the notifier: on Slack they cannot add links or mentions. Classifier (if also set) still runs; Message takes display precedence. |
+| `route` | `string` | no | "profile_owner" sends each prompt to the verified channels of the requesting profile's owners, who may then decide it. The approver's own channel is used only when no owner has one. |
 
 ```hcl
 approver "human_approver" "example" {
@@ -212,7 +213,7 @@ approver "llm_approver" "example" {
 
 Block syntax: `credential "<type>" "<name>" { ... }`
 
-Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`telegram_bot_token`](#credential-telegrambottoken).
+Registered types: [`anthropic_manual_key`](#credential-anthropicmanualkey), [`anthropic_oauth_subscription`](#credential-anthropicoauthsubscription), [`aws_credential`](#credential-awscredential), [`basic_auth`](#credential-basicauth), [`bearer_token`](#credential-bearertoken), [`clickhouse_credential`](#credential-clickhousecredential), [`cookie_token`](#credential-cookietoken), [`discord_bot_token`](#credential-discordbottoken), [`gemini_api_key`](#credential-geminiapikey), [`github_oauth`](#credential-githuboauth), [`google_gke_credential`](#credential-googlegkecredential), [`header_token`](#credential-headertoken), [`mtls_credential`](#credential-mtlscredential), [`notion_mcp_oauth`](#credential-notionmcpoauth), [`notion_oauth`](#credential-notionoauth), [`openai_codex_oauth`](#credential-openaicodexoauth), [`passthrough`](#credential-passthrough), [`postgres_credential`](#credential-postgrescredential), [`signal_cli`](#credential-signalcli), [`slack_tokens`](#credential-slacktokens), [`ssh_key`](#credential-sshkey), [`tailscale_auth`](#credential-tailscaleauth), [`teams_workflow`](#credential-teamsworkflow), [`telegram_bot_token`](#credential-telegrambottoken).
 
 ### `credential "anthropic_manual_key" "<name>"`
 
@@ -484,6 +485,25 @@ _No configurable attributes._
 
 ```hcl
 credential "tailscale_auth" "example" {}
+```
+
+### `credential "teams_workflow" "<name>"`
+
+Delivers approval prompts to Microsoft Teams through a
+Workflows webhook ("When a Teams webhook request is received") that
+each user creates and pastes on the dashboard's Account page. It
+serves per-user channels only: the webhook URL is the user's channel
+secret, so the credential has no secret slots and no settings.
+
+Notification-only, like signal_cli: the card's "Approve or deny"
+button opens the dashboard, where the user decides. Office 365
+connector URLs (webhook.office.com) are refused; Microsoft disabled
+connectors in May 2026.
+
+_No configurable attributes._
+
+```hcl
+credential "teams_workflow" "example" {}
 ```
 
 ### `credential "telegram_bot_token" "<name>"`

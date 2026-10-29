@@ -292,6 +292,8 @@ func TestMemberRoutesAreReviewed(t *testing.T) {
 		"/api/hitl/decide", "/api/hitl/pending", // decidesPending
 		"/api/me", "/api/me/password",
 		"/api/my/actions", "/api/my/rules", "/api/my/rules/delete", "/api/my/rules/update",
+		"/api/my/channel", "/api/my/channel/delete", "/api/my/channel/resend", // the caller's own channel
+		"/api/my/channel/set", "/api/my/channel/test", "/api/my/channel/verify",
 		"/api/oauth/device-poll", "/api/oauth/exchange", "/api/oauth/revoke", "/api/oauth/start", // guardCredential
 		"/api/onboard/approve",                                     // guardOnboardApprove
 		"/api/profiles", "/api/rules", "/api/state", "/api/status", // viewer filters
