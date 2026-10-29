@@ -553,7 +553,8 @@ type ApproveRequest struct {
 	Reason     string
 	// ThreadTS, when set, asks HITL notifiers to post the approval
 	// prompt as a reply in this Slack thread rather than top-level.
-	// Populated from the X-HITL-Thread-TS request header.
+	// The gateway never takes it from the request: an agent must not
+	// bury its own prompt in an old thread.
 	ThreadTS string
 	// AsyncOperationID binds the prompt to a durable async operation.
 	// If AsyncPendingOnSyncTimeout is true and ctx hits DeadlineExceeded,
