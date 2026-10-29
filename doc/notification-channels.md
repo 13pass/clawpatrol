@@ -36,13 +36,12 @@ member's included (Simon's on 2026-10-29).
    owner's channel only, and the owner decides it. The operator isn't
    notified; they still see every pending approval in the dashboard and
    can decide any of them. Channels are never shared: one per user.
-   Two cases still go to the approver block's own `channel`:
-   - **The profile has no owner** (`default`, or a profile no user is
-     assigned to), or its owner hasn't verified a channel yet. Only
-     admins decide these.
-   - **Admin-only rules:** `route = "operator"` on an approver keeps its
-     prompts with the operator for every profile (e.g. writes on shared
-     credentials). The admin chooses which rules use it.
+   This holds for every rule: each person approves everything their own
+   agent does (merges, CI/CD variable reads and shared-credential
+   requests included). A prompt goes to the approver block's own
+   `channel`, and only admins decide it, only when the profile has no
+   owner (`default`, or a profile no user is assigned to) or its owner
+   hasn't verified a channel yet.
 3. **One sender, many recipients.** Signal prompts still go out from
    `signal_cli.ops`; a user only sets the recipient (E.164 number or
    `group.<id>`). A channel becomes active only after a verification
@@ -80,10 +79,10 @@ the header no longer changes the target.
 
 ### 2. Route approvals to profile owners
 
-- `human_approver` gets `route` (`"profile_owner"`, the default once
-  this ships, or `"operator"`) and `credentials = [...]` (one notifier
-  per channel kind, e.g. `[signal_cli.ops, teams_workflow.users]`).
-  `channel` / `credential` stay as the fallback.
+- `human_approver` gets `route = "profile_owner"` and `credentials =
+  [...]` (one notifier per channel kind, e.g. `[signal_cli.ops,
+  teams_workflow.users]`). `channel` / `credential` stay as the
+  fallback. Without `route`, an approver behaves as today.
 - `Approve()` resolves the owners of `req.Profile`
   (`dashboard_user_profiles`), takes their verified channels, and
   notifies each through the notifier matching its kind. Several owners:
@@ -91,17 +90,16 @@ the header no longer changes the target.
 - `HITLTarget` gets the per-channel secret (the Teams webhook URL), so
   a notifier doesn't look it up itself.
 - `decidesPending`: a member also decides a pending approval for a
-  profile they own, unless its approver is `route = "operator"`. The
+  profile they own, when its approver routes to profile owners. The
   `delete_on_decision` and message-update hooks must handle several
   messages per prompt.
 - Tests: an owner with a verified channel is notified and can decide;
   a member who doesn't own the profile can't see the prompt; a profile
   with no verified channel falls back to the operator.
-- Our config: `human_approver "operator"` routes to profile owners, so
-  every member's prompts (their GitLab and Fabric writes, with their own
-  tokens) go to their own channel, and the operator's to `vincenth`'s.
-  A second approver with `route = "operator"` is only for rules the
-  operator must keep for everyone (see open question 1).
+- Our config: `human_approver "operator"` gets `route =
+  "profile_owner"`; it is our only approver, so every rule routes to the
+  profile's owner. Each member's prompts go to their own channel, the
+  maintainer's to `vincenth`'s.
 
 ### 3. Teams, notification-only
 
@@ -134,16 +132,14 @@ dashboard link turns out to be too slow in practice.
 - A Teams webhook URL is a bearer secret: write-only in the API, stored
   in the state DB like credential secrets (covered by the planned
   encrypted backups of the state dir).
-- Routing to owners widens who decides: a member approves their own
-  agent's writes. That is the point (their tokens, their accountability),
-  and decisions are audited (`actions.approver_by`). Rules that must
-  stay with the operator use `route = "operator"`.
+- Routing to owners widens who decides: a member approves everything
+  their own agent does, merges included, so no request gets a second
+  person's check by default (decided 2026-10-29). Decisions are audited
+  (`actions.approver_by`), and an admin can still decide any pending
+  approval.
 - Migrations stay numbered above ours (0031+): see the rename plan on
   cherry-picks.
 
 ## Open questions
 
-1. Which rules stay with the operator for everyone (`route =
-   "operator"`)? Candidates: MR merges, CI/CD variable reads, and
-   anything on a shared credential (Kubernetes, Sentry).
-2. Can users create Teams Workflows webhooks in the UN tenant?
+1. Can users create Teams Workflows webhooks in the UN tenant?
