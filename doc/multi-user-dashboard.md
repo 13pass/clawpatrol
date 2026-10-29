@@ -252,7 +252,8 @@ password. Setup: `site/doc/configure-gateway.md`.
 ### Notification channels (done)
 
 Each user sets one channel on the Account page (a Signal number or
-`group.<id>`) and verifies it with a code sent there
+`group.<id>`, or a Microsoft Teams Workflows webhook URL) and verifies
+it with a code sent there
 (`dashboard_user_channels`, migration 0031). A `human_approver` with
 `route = "profile_owner"` sends each prompt to the verified channels of
 the requesting profile's owners, and those owners may decide it from
@@ -260,7 +261,10 @@ the dashboard, whichever rule raised it. Its own `channel` and
 `credential` are the fallback, used when no owner has a verified
 channel; admins still see and decide everything. The sender for a
 channel kind is the first declared credential of that type
-(`signal_cli`). Plan: `doc/notification-channels.md`.
+(`signal_cli`, `teams_workflow`): users can pick Teams once the config
+declares `credential "teams_workflow" "<name>" {}`. A `teams_workflow`
+credential only serves users' channels, never an approver's own.
+Plan: `doc/notification-channels.md`.
 
 ### Later
 

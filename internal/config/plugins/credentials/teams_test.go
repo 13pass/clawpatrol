@@ -50,7 +50,9 @@ func teamsTestServer(t *testing.T, status int) (*httptest.Server, string, chan m
 	t.Cleanup(srv.Close)
 	u, _ := url.Parse(srv.URL)
 	hosts, client, backoff := teamsWebhookHosts, teamsHTTPClient, teamsRetryBackoff
-	teamsWebhookHosts, teamsHTTPClient, teamsRetryBackoff = []string{u.Hostname()}, srv.Client(), 0
+	tlsClient := srv.Client()
+	tlsClient.CheckRedirect = teamsNoRedirect
+	teamsWebhookHosts, teamsHTTPClient, teamsRetryBackoff = []string{u.Hostname()}, tlsClient, 0
 	t.Cleanup(func() { teamsWebhookHosts, teamsHTTPClient, teamsRetryBackoff = hosts, client, backoff })
 	return srv, srv.URL + "/workflows/abc/triggers/manual/paths/invoke?sig=s3cret", got
 }

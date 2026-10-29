@@ -31,7 +31,7 @@ import (
 type TeamsWorkflow struct{}
 
 var (
-	teamsHTTPClient   = &http.Client{Timeout: 10 * time.Second}
+	teamsHTTPClient   = &http.Client{Timeout: 10 * time.Second, CheckRedirect: teamsNoRedirect}
 	teamsRetryBackoff = 500 * time.Millisecond
 	// teamsWebhookHosts are the hosts Workflows webhook URLs live on.
 	teamsWebhookHosts = []string{".environment.api.powerplatform.com", ".logic.azure.com"}
@@ -44,6 +44,8 @@ const (
 	// Teams card markdown; request values are escaped so they cannot.
 	teamsMarkdown = "\\`*[]<>"
 )
+
+func teamsNoRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 // ValidateChannel checks a Workflows webhook URL and the label the
 // dashboard shows for it.
@@ -76,6 +78,9 @@ func teamsCheckURL(raw string) error {
 
 // NotifyHITL posts the approval card to the user's webhook.
 func (*TeamsWorkflow) NotifyHITL(ctx context.Context, req runtime.ApproveRequest, target runtime.HITLTarget) error {
+	if target.Secret == "" {
+		return errors.New("teams_workflow only delivers to users' own channels; it cannot be a human_approver's credential")
+	}
 	if err := teamsCheckURL(target.Secret); err != nil {
 		return err
 	}
@@ -180,9 +185,7 @@ func teamsPost(ctx context.Context, webhook string, card map[string]any) error {
 			return errors.New("teams webhook: bad URL")
 		}
 		req.Header.Set("Content-Type", "application/json")
-		c := *teamsHTTPClient
-		c.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-		resp, err := c.Do(req)
+		resp, err := teamsHTTPClient.Do(req)
 		retry := true
 		if err != nil {
 			var uerr *url.Error
