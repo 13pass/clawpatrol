@@ -390,3 +390,77 @@ func assertPendingLifetime(t *testing.T, pending runtime.HITLPending, want time.
 		t.Fatalf("pending lifetime = %s, want %s", got, want)
 	}
 }
+
+// approveForTargets runs Approve until it has notified, then returns
+// every target it posted to and the pending entry it raised.
+func approveForTargets(t *testing.T, h *HumanApprover, owners []runtime.ProfileOwner) ([]runtime.HITLTarget, runtime.HITLPending) {
+	t.Helper()
+	pool := newCaptureHITLPool()
+	notifier := &captureNotifier{notified: make(chan runtime.HITLTarget, 4)}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		_, _ = h.Approve(ctx, runtime.ApproveRequest{
+			Pool:          pool,
+			Policy:        &config.CompiledPolicy{Credentials: map[string]*config.Entity{"ops": {Body: notifier}}},
+			ApproverName:  "operator",
+			Profile:       "team-a",
+			ProfileOwners: func() []runtime.ProfileOwner { return owners },
+		})
+		close(done)
+	}()
+	var targets []runtime.HITLTarget
+	timeout := time.After(time.Second)
+	for len(targets) == 0 {
+		select {
+		case target := <-notifier.notified:
+			targets = append(targets, target)
+		case <-timeout:
+			t.Fatal("human approver did not notify")
+		}
+	}
+	// Let any other notification land before stopping.
+	time.Sleep(50 * time.Millisecond)
+	for len(notifier.notified) > 0 {
+		targets = append(targets, <-notifier.notified)
+	}
+	pending := pool.capturedPending()
+	cancel()
+	<-done
+	return targets, pending
+}
+
+func TestHumanApproverRoutesToProfileOwners(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{
+		{Username: "alice", Credential: "ops", Channel: runtime.UserChannel{Target: "+41790000001"}},
+		{Username: "bob"},
+	})
+	if len(targets) != 1 || targets[0].Channel != "+41790000001" {
+		t.Fatalf("targets = %+v, want alice's channel only", targets)
+	}
+	if strings.Join(pending.Deciders, ",") != "alice,bob" {
+		t.Fatalf("deciders = %v, want every owner", pending.Deciders)
+	}
+}
+
+func TestHumanApproverFallsBackWithoutAVerifiedOwnerChannel(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60, Route: RouteProfileOwner}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{{Username: "bob"}})
+	if len(targets) != 1 || targets[0].Channel != "+10000000000" {
+		t.Fatalf("targets = %+v, want the approver's own channel", targets)
+	}
+	if strings.Join(pending.Deciders, ",") != "bob" {
+		t.Fatalf("deciders = %v, want bob", pending.Deciders)
+	}
+}
+
+func TestHumanApproverWithoutRouteIgnoresOwners(t *testing.T) {
+	h := &HumanApprover{Credential: "ops", Channel: "+10000000000", Timeout: 60}
+	targets, pending := approveForTargets(t, h, []runtime.ProfileOwner{
+		{Username: "alice", Credential: "ops", Channel: runtime.UserChannel{Target: "+41790000001"}},
+	})
+	if len(targets) != 1 || targets[0].Channel != "+10000000000" || len(pending.Deciders) != 0 {
+		t.Fatalf("targets = %+v, deciders = %v; want today's behaviour", targets, pending.Deciders)
+	}
+}

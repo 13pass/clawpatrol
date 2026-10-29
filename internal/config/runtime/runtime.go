@@ -527,6 +527,9 @@ type HITLTarget struct {
 	// PendingMessageUpdateSink records a notifier-specific, non-secret
 	// message ref for synchronous pending HITL terminal updates.
 	PendingMessageUpdateSink HITLPendingMessageUpdateSink
+	// Secret is the per-user channel's secret (a webhook URL), "" for an
+	// approver's own channel. Never log it.
+	Secret string
 }
 
 // ApproverRuntime evaluates one stage of an approve = [...] chain.
@@ -604,6 +607,18 @@ type ApproveRequest struct {
 	// synchronous HITL prompts so terminal timeout/disconnect states can be
 	// reflected back to the original operator-facing message.
 	PendingMessageUpdateSink HITLPendingMessageUpdateSink
+	// ProfileOwners lists the dashboard users who own Profile, for
+	// approvers that route prompts to them. Nil without a user store.
+	ProfileOwners func() []ProfileOwner
+}
+
+// ProfileOwner is a dashboard user who owns the requesting profile.
+// Credential names the notifier for their verified channel, "" when
+// they have none the gateway can send to.
+type ProfileOwner struct {
+	Username   string
+	Credential string
+	Channel    UserChannel
 }
 
 // ApproveDecisionAsyncPending is the ApproveVerdict.Decision value an
@@ -777,8 +792,11 @@ type HITLPending struct {
 	Approvers  []string `json:"approvers,omitempty"`
 	// Profile and Rule say whose request this is and which rule asked
 	// for approval; the dashboard scopes pending approvals by them.
-	Profile   string    `json:"profile,omitempty"`
-	Rule      string    `json:"rule,omitempty"`
+	Profile string `json:"profile,omitempty"`
+	Rule    string `json:"rule,omitempty"`
+	// Deciders are the members who may decide besides admins: the
+	// profile's owners, when the approver routes to them.
+	Deciders  []string  `json:"deciders,omitempty"`
 	CreatedAt time.Time `json:"created_at"`
 	ExpiresAt time.Time `json:"expires_at"`
 }

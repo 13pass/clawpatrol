@@ -80,7 +80,14 @@ type HumanApprover struct {
 	// mentions.
 	// Classifier (if also set) still runs; Message takes display precedence.
 	Message string `hcl:"message,optional"`
+	// Route = "profile_owner" sends each prompt to the verified channels
+	// of the requesting profile's owners, who may then decide it. The
+	// approver's own channel is used only when no owner has one.
+	Route string `hcl:"route,optional" json:"route,omitempty"`
 }
+
+// RouteProfileOwner is the Route that sends prompts to profile owners.
+const RouteProfileOwner = "profile_owner"
 
 // HumanApproverChannel + HumanApproverCredential expose the fields
 // the gateway's HITL wiring needs without main importing this package
@@ -146,6 +153,13 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 	timeout := h.approvalTimeout(req.Policy)
 	pending := buildPending(req)
 	pending.ExpiresAt = pending.CreatedAt.Add(timeout)
+	var owners []runtime.ProfileOwner
+	if h.Route == RouteProfileOwner && req.ProfileOwners != nil {
+		owners = req.ProfileOwners()
+		for _, o := range owners {
+			pending.Deciders = append(pending.Deciders, o.Username)
+		}
+	}
 	id, ch := req.Pool.Add(pending)
 	discardOnReturn := true
 	defer func() {
@@ -168,46 +182,14 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 	}
 
 	// Never from the request: an agent must not pick who approves it.
-	notifyChannel := h.Channel
-	if notifyChannel != "" && h.Credential != "" && req.Policy != nil {
-		ent, ok := req.Policy.Credentials[h.Credential]
-		if ok {
-			if notifier, ok := ent.Body.(runtime.HITLNotifier); ok {
-				var msg string
-				if h.Message != "" {
-					var escape func(string) string
-					if e, ok := notifier.(runtime.HITLMessageValueEscaper); ok {
-						escape = e.EscapeHITLMessageValue
-					}
-					msg = expandMessage(h.Message, req, escape)
-				}
-				target := runtime.HITLTarget{
-					CredentialName:           h.Credential,
-					Channel:                  notifyChannel,
-					Interactive:              h.Interactive,
-					PendingID:                id,
-					DashboardURL:             req.DashboardURL,
-					ThreadTS:                 req.ThreadTS,
-					OperationState:           pending.OperationState,
-					ApprovalEffect:           pending.ApprovalEffect,
-					UpstreamCalled:           pending.UpstreamCalled,
-					ApprovalMessage:          pending.ApprovalMessage,
-					Summary:                  summary,
-					Message:                  msg,
-					MessageUpdateSink:        req.MessageUpdateSink,
-					PendingMessageUpdateSink: req.PendingMessageUpdateSink,
-				}
-				go func() {
-					if err := notifier.NotifyHITL(ctx, req, target); err != nil {
-						log.Printf("human approver %s: notify: %v", req.ApproverName, err)
-					}
-				}()
-			} else {
-				log.Printf("human approver %s: credential %q does not implement HITLNotifier", req.ApproverName, h.Credential)
-			}
-		} else {
-			log.Printf("human approver %s: credential %q not declared", req.ApproverName, h.Credential)
+	notified := false
+	for _, o := range owners {
+		if o.Credential != "" && h.notify(ctx, req, o.Credential, o.Channel.Target, o.Channel.Secret, id, pending, summary) {
+			notified = true
 		}
+	}
+	if !notified && h.Channel != "" && h.Credential != "" {
+		h.notify(ctx, req, h.Credential, h.Channel, "", id, pending, summary)
 	}
 
 	timer := time.NewTimer(timeout)
@@ -252,6 +234,55 @@ func (h *HumanApprover) Approve(ctx context.Context, req runtime.ApproveRequest)
 	}
 }
 
+// notify posts the prompt to one channel in the background and reports
+// whether a notifier took it.
+func (h *HumanApprover) notify(ctx context.Context, req runtime.ApproveRequest, credential, channel, secret, id string, pending runtime.HITLPending, summary *runtime.HITLSummary) bool {
+	if req.Policy == nil {
+		return false
+	}
+	ent, ok := req.Policy.Credentials[credential]
+	if !ok {
+		log.Printf("human approver %s: credential %q not declared", req.ApproverName, credential)
+		return false
+	}
+	notifier, ok := ent.Body.(runtime.HITLNotifier)
+	if !ok {
+		log.Printf("human approver %s: credential %q does not implement HITLNotifier", req.ApproverName, credential)
+		return false
+	}
+	var msg string
+	if h.Message != "" {
+		var escape func(string) string
+		if e, ok := notifier.(runtime.HITLMessageValueEscaper); ok {
+			escape = e.EscapeHITLMessageValue
+		}
+		msg = expandMessage(h.Message, req, escape)
+	}
+	target := runtime.HITLTarget{
+		CredentialName:           credential,
+		Channel:                  channel,
+		Secret:                   secret,
+		Interactive:              h.Interactive,
+		PendingID:                id,
+		DashboardURL:             req.DashboardURL,
+		ThreadTS:                 req.ThreadTS,
+		OperationState:           pending.OperationState,
+		ApprovalEffect:           pending.ApprovalEffect,
+		UpstreamCalled:           pending.UpstreamCalled,
+		ApprovalMessage:          pending.ApprovalMessage,
+		Summary:                  summary,
+		Message:                  msg,
+		MessageUpdateSink:        req.MessageUpdateSink,
+		PendingMessageUpdateSink: req.PendingMessageUpdateSink,
+	}
+	go func() {
+		if err := notifier.NotifyHITL(ctx, req, target); err != nil {
+			log.Printf("human approver %s: notify: %v", req.ApproverName, err)
+		}
+	}()
+	return true
+}
+
 func (h *HumanApprover) approvalTimeout(policy *config.CompiledPolicy) time.Duration {
 	timeout := time.Duration(h.Timeout) * time.Second
 	if timeout <= 0 && policy != nil {
@@ -275,7 +306,15 @@ func init() {
 		},
 		Validate: func(d any, name string, _ *config.BuildCtx) hcl.Diagnostics {
 			a := d.(*HumanApprover)
-			return config.ValidateHITLAsyncGrant(name, a.SyncWaitTimeout, a.AsyncGrant)
+			diags := config.ValidateHITLAsyncGrant(name, a.SyncWaitTimeout, a.AsyncGrant)
+			if a.Route != "" && a.Route != RouteProfileOwner {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "invalid route",
+					Detail:   fmt.Sprintf("human_approver %q: route must be %q or unset, got %q", name, RouteProfileOwner, a.Route),
+				})
+			}
+			return diags
 		},
 		Build: func(d any, _ string, _ *config.BuildCtx) (any, hcl.Diagnostics) { return d, nil },
 		Emit: func(body any, _ string, b *hclwrite.Body) {
@@ -317,6 +356,9 @@ func init() {
 			}
 			if a.Message != "" {
 				b.SetAttributeValue("message", cty.StringVal(a.Message))
+			}
+			if a.Route != "" {
+				b.SetAttributeValue("route", cty.StringVal(a.Route))
 			}
 		},
 	})

@@ -3467,6 +3467,7 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			Policy:                    policy,
 			MessageUpdateSink:         g.recordHITLOperationMessageRef,
 			PendingMessageUpdateSink:  g.hitl.RecordMessageRef,
+			ProfileOwners:             func() []runtime.ProfileOwner { return g.profileOwners(c.Profile) },
 		}
 		v, err := ar.Approve(stageCtx, req)
 		stageCancel()

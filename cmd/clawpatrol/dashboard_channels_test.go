@@ -251,3 +251,63 @@ func TestParallelGuessesShareTheAttemptCap(t *testing.T) {
 		t.Fatalf("%d guesses were checked, want %d", tried, channelCodeMaxAttempts)
 	}
 }
+
+func TestProfileOwnersCarryOnlyVerifiedChannels(t *testing.T) {
+	e := newChannelTestEnv(t)
+	db := e.w.g.db
+	for _, u := range []string{"bob", "carol"} {
+		if err := createDashboardUser(db, u, usersTestMemberPassword, dashboardRoleMember); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, u := range []string{"alice", "bob"} {
+		if err := setDashboardUserProfiles(db, u, []string{"team-a"}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	now := time.Now()
+	for u, target := range map[string]string{"alice": "+41790000001", "bob": "+41790000002", "carol": "+41790000003"} {
+		if err := saveUnverifiedUserChannel(db, u, userChannel{Kind: "signal_cli", Target: target}, "h", now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := markUserChannelVerified(db, "alice", now); err != nil {
+		t.Fatal(err)
+	}
+	owners := e.w.g.profileOwners("team-a")
+	if len(owners) != 2 {
+		t.Fatalf("owners = %+v, want alice and bob", owners)
+	}
+	if o := owners[0]; o.Username != "alice" || o.Credential != "ops" || o.Channel.Target != "+41790000001" {
+		t.Fatalf("alice = %+v, want her verified channel via ops", o)
+	}
+	if o := owners[1]; o.Username != "bob" || o.Credential != "" {
+		t.Fatalf("bob = %+v, want no channel until verified", o)
+	}
+}
+
+func TestOwnersDecideApprovalsRoutedToThem(t *testing.T) {
+	e := newChannelTestEnv(t)
+	if err := setDashboardUserProfiles(e.w.g.db, "alice", []string{"team-a"}); err != nil {
+		t.Fatal(err)
+	}
+	routed := runtime.HITLPending{Profile: "team-a", Rule: "shared-rule", Deciders: []string{"alice"}}
+	alice, err := e.w.viewerForPrincipal(principal{Owner: "alice", Role: dashboardRoleMember})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !e.w.decidesPending(alice, routed) {
+		t.Fatal("alice cannot decide an approval routed to her")
+	}
+	unrouted := routed
+	unrouted.Deciders = nil
+	if e.w.decidesPending(alice, unrouted) {
+		t.Fatal("alice decides an approval of an admin's rule that was not routed to her")
+	}
+	if err := setDashboardUserProfiles(e.w.g.db, "alice", nil); err != nil {
+		t.Fatal(err)
+	}
+	if alice, _ = e.w.viewerForPrincipal(principal{Owner: "alice", Role: dashboardRoleMember}); e.w.decidesPending(alice, routed) {
+		t.Fatal("alice still decides after losing the profile")
+	}
+}

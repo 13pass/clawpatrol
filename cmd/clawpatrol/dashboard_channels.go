@@ -14,6 +14,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"sort"
@@ -154,6 +155,45 @@ func allUserChannelStatuses(db *sql.DB) (map[string]channelStatus, error) {
 		out[username] = c.status()
 	}
 	return out, rows.Err()
+}
+
+// profileOwners lists the users who own profile, each with their
+// verified channel when a declared credential can deliver it.
+func (g *Gateway) profileOwners(profile string) []runtime.ProfileOwner {
+	if g.db == nil || profile == "" {
+		return nil
+	}
+	rows, err := g.db.Query(
+		`SELECT p.username, COALESCE(c.kind, ''), COALESCE(c.target, ''), COALESCE(c.secret, ''), COALESCE(c.verified_ns, 0)
+		 FROM dashboard_user_profiles p
+		 JOIN dashboard_users u ON u.username = p.username
+		 LEFT JOIN dashboard_user_channels c ON c.username = p.username
+		 WHERE p.profile = ? ORDER BY p.username`, profile,
+	)
+	if err != nil {
+		log.Printf("profile owners of %s: %v", profile, err)
+		return nil
+	}
+	defer rows.Close()
+	var out []runtime.ProfileOwner
+	for rows.Next() {
+		var o runtime.ProfileOwner
+		var c userChannel
+		if err := rows.Scan(&o.Username, &c.Kind, &c.Target, &c.Secret, &c.VerifiedNs); err != nil {
+			log.Printf("profile owners of %s: %v", profile, err)
+			return nil
+		}
+		if c.VerifiedNs > 0 {
+			if cred, _, ok := g.channelSender(c.Kind); ok {
+				o.Credential, o.Channel = cred, c.runtime()
+			}
+		}
+		out = append(out, o)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("profile owners of %s: %v", profile, err)
+	}
+	return out
 }
 
 func newChannelCode() (string, string, error) {
