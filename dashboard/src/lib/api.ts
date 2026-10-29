@@ -491,9 +491,52 @@ export type DashboardUser = {
   // linked is whether the first sign-in has bound it for good.
   oidc: { provider: string; account: string; linked: boolean }[];
   has_password: boolean;
+  channel: UserChannel | null;
   created_ns: number;
   updated_ns: number;
 };
+
+// UserChannel is where a user gets the approval prompts of their
+// profiles. kind is the notifier credential type (signal_cli); a
+// channel's secret, such as a webhook URL, is never sent back.
+export type UserChannel = {
+  kind: string;
+  target: string;
+  verified: boolean;
+  verified_ns?: number;
+  updated_ns: number;
+};
+
+export async function getMyChannel(): Promise<{ channel: UserChannel | null; kinds: string[] }> {
+  const r = await api("/api/my/channel");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// setMyChannel replaces the caller's channel and sends it a code.
+export function setMyChannel(kind: string, target: string, secret = "") {
+  return postUsers("/api/my/channel/set", { kind, target, secret });
+}
+
+export function resendMyChannelCode() {
+  return postUsers("/api/my/channel/resend", {});
+}
+
+export function verifyMyChannel(code: string) {
+  return postUsers("/api/my/channel/verify", { code });
+}
+
+export function testMyChannel() {
+  return postUsers("/api/my/channel/test", {});
+}
+
+export function deleteMyChannel() {
+  return postUsers("/api/my/channel/delete", {});
+}
+
+export function clearUserChannel(username: string) {
+  return postUsers("/api/users/channel/clear", { username });
+}
 
 // listUsers also returns what the config declares, for assignment:
 // every profile, and every human_approver a user's rules may route to.

@@ -763,6 +763,7 @@ func TestOIDCMigrationCopiesTheGitLabLinks(t *testing.T) {
 	// Roll the schema back to 0029, where a link lived on the user row.
 	for _, q := range []string{
 		`DROP TABLE dashboard_user_oidc`,
+		`DROP TABLE dashboard_user_channels`,
 		`DELETE FROM _schema WHERE version >= 30`,
 		`UPDATE dashboard_users SET oidc_username = 'Alice-GL', oidc_subject = 'https://gitlab.com|42' WHERE username = 'alice'`,
 	} {

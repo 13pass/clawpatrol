@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
   createUser,
+  clearUserChannel,
   deleteUser,
   getAudit,
   listUsers,
@@ -10,6 +11,7 @@ import {
   type DashboardUser,
   type Whoami,
 } from "../lib/api";
+import { credentialTypeLabel } from "../lib/credentialLabels";
 import { fmtDateTime } from "../lib/format";
 import { Button } from "./Button";
 import { Main } from "./Main";
@@ -226,6 +228,7 @@ function UsersTable({
             <Th>Profiles</Th>
             <Th>Reviewer</Th>
             <Th>Sign-in</Th>
+            <Th>Notifications</Th>
             <Th>Created</Th>
             <Th>Actions</Th>
           </tr>
@@ -330,6 +333,30 @@ function UserRow({
       </Td>
       <Td>
         <SignInCell user={user} providers={declared.oidcProviders} onChanged={onChanged} />
+      </Td>
+      <Td>
+        {user.channel ? (
+          <div className="flex flex-wrap items-center gap-2">
+            <span>
+              {credentialTypeLabel(user.channel.kind, user.channel.kind)}{" "}
+              <span className="font-mono">{user.channel.target}</span>
+              {!user.channel.verified && <span className="text-text-muted"> (unverified)</span>}
+            </span>
+            <Button
+              size="xs"
+              variant="outline"
+              onClick={() => {
+                if (window.confirm(`Remove ${user.username}'s notification channel?`)) {
+                  run(() => clearUserChannel(user.username));
+                }
+              }}
+            >
+              Clear
+            </Button>
+          </div>
+        ) : (
+          <span className="text-text-muted">none</span>
+        )}
       </Td>
       <Td>
         <span className="font-mono">{fmtDateTime(user.created_ns / NS_PER_MS)}</span>

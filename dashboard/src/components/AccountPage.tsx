@@ -1,5 +1,17 @@
-import { useState, type FormEvent } from "react";
-import { changeOwnPassword, logout, type Whoami } from "../lib/api";
+import { useEffect, useState, type FormEvent } from "react";
+import {
+  changeOwnPassword,
+  deleteMyChannel,
+  getMyChannel,
+  logout,
+  resendMyChannelCode,
+  setMyChannel,
+  testMyChannel,
+  verifyMyChannel,
+  type UserChannel,
+  type Whoami,
+} from "../lib/api";
+import { credentialTypeLabel } from "../lib/credentialLabels";
 import { Button } from "./Button";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
@@ -18,6 +30,11 @@ export function AccountPage({ whoami }: { whoami: Whoami | null }) {
       <section className="bg-canvas border-1.5 border-navy p-4 space-y-4">
         {whoami?.user ? <Identity whoami={whoami} /> : <NotLoggedIn />}
       </section>
+      {(whoami?.auth_method === "password" || whoami?.auth_method === "oidc") && (
+        <section className="bg-canvas border-1.5 border-navy p-4 space-y-3">
+          <NotificationChannel />
+        </section>
+      )}
       {/* A single sign-on session changes its password at the provider. */}
       {whoami?.auth_method === "password" && (
         <section className="bg-canvas border-1.5 border-navy p-4">
@@ -201,5 +218,178 @@ function LogoutControl({ whoami }: { whoami: Whoami }) {
     >
       Log out
     </Button>
+  );
+}
+
+const INPUT_CLASS =
+  "border border-canvas-dark rounded px-2 py-1.5 text-xs focus:outline-none focus:border-text";
+
+// TARGET_HINT is the placeholder for a kind's recipient field.
+const TARGET_HINT: Record<string, string> = {
+  signal_cli: "+41790000000 or group.<id>",
+};
+
+// NotificationChannel is where the user's approval prompts go: one
+// channel, active once the code sent there is typed back.
+function NotificationChannel() {
+  const [channel, setChannel] = useState<UserChannel | null>(null);
+  const [kinds, setKinds] = useState<string[]>([]);
+  const [kind, setKind] = useState("");
+  const [target, setTarget] = useState("");
+  const [code, setCode] = useState("");
+  const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  async function load() {
+    const r = await getMyChannel();
+    setChannel(r.channel);
+    setKinds(r.kinds);
+    setKind((k) => k || r.kinds[0] || "");
+  }
+
+  useEffect(() => {
+    load().catch((e) => setMsg({ ok: false, text: String(e instanceof Error ? e.message : e) }));
+  }, []);
+
+  async function run(action: () => Promise<void>, done: string) {
+    setBusy(true);
+    try {
+      await action();
+      await load();
+      setMsg({ ok: true, text: done });
+    } catch (e) {
+      setMsg({ ok: false, text: String(e instanceof Error ? e.message : e) });
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  function save(e: FormEvent) {
+    e.preventDefault();
+    run(async () => {
+      await setMyChannel(kind, target);
+      setTarget("");
+    }, "A code was sent there. Type it below to start receiving approval prompts.");
+  }
+
+  function verify(e: FormEvent) {
+    e.preventDefault();
+    run(async () => {
+      await verifyMyChannel(code);
+      setCode("");
+    }, "Verified. Approval prompts for your agents now come here.");
+  }
+
+  const label = (k: string) => credentialTypeLabel(k, k);
+  return (
+    <>
+      <h2 className="font-mono text-xs uppercase tracking-wider text-text-muted">Notifications</h2>
+      <p className="text-sm text-text">
+        Approval prompts for your agents go to your own channel. Until it is verified they go to an
+        admin.
+      </p>
+      {channel && (
+        <div className="flex flex-wrap items-center gap-3 text-sm">
+          <span>
+            {label(channel.kind)} <span className="font-mono font-bold">{channel.target}</span>{" "}
+            {channel.verified ? (
+              <span className="text-text-muted">verified</span>
+            ) : (
+              <span className="text-danger-500">not verified</span>
+            )}
+          </span>
+          {channel.verified ? (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => run(testMyChannel, "Test message sent.")}
+            >
+              Send a test message
+            </Button>
+          ) : (
+            <Button
+              size="sm"
+              variant="outline"
+              disabled={busy}
+              onClick={() => run(resendMyChannelCode, "A new code was sent.")}
+            >
+              Send a new code
+            </Button>
+          )}
+          <Button
+            size="sm"
+            variant="outline"
+            disabled={busy}
+            onClick={() => run(deleteMyChannel, "Channel removed. Your prompts go to an admin.")}
+          >
+            Remove
+          </Button>
+        </div>
+      )}
+      {channel && !channel.verified && (
+        <form onSubmit={verify} className="flex flex-wrap items-end gap-3">
+          <label className="flex flex-col gap-1">
+            <span className="font-mono text-xs uppercase tracking-wider text-text-muted">Code</span>
+            <input
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              required
+              inputMode="numeric"
+              autoComplete="one-time-code"
+              className={INPUT_CLASS}
+            />
+          </label>
+          <Button type="submit" disabled={busy}>
+            Verify
+          </Button>
+        </form>
+      )}
+      {kinds.length === 0 ? (
+        <p className="text-xs text-text-muted">
+          The gateway has no notifier for personal channels yet; ask an admin.
+        </p>
+      ) : (
+        <form onSubmit={save} className="flex flex-wrap items-end gap-3">
+          {kinds.length > 1 && (
+            <label className="flex flex-col gap-1">
+              <span className="font-mono text-xs uppercase tracking-wider text-text-muted">
+                Via
+              </span>
+              <select
+                value={kind}
+                onChange={(e) => setKind(e.target.value)}
+                className={INPUT_CLASS + " bg-canvas"}
+              >
+                {kinds.map((k) => (
+                  <option key={k} value={k}>
+                    {label(k)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          <label className="flex flex-col gap-1">
+            <span className="font-mono text-xs uppercase tracking-wider text-text-muted">
+              {channel ? "New " : ""}
+              {label(kind)} recipient
+            </span>
+            <input
+              value={target}
+              onChange={(e) => setTarget(e.target.value)}
+              required
+              placeholder={TARGET_HINT[kind] ?? ""}
+              className={INPUT_CLASS + " w-72"}
+            />
+          </label>
+          <Button type="submit" disabled={busy}>
+            {busy ? "Sending…" : "Send code"}
+          </Button>
+        </form>
+      )}
+      {msg && (
+        <div className={"text-xs " + (msg.ok ? "text-text" : "text-danger-500")}>{msg.text}</div>
+      )}
+    </>
   );
 }

@@ -424,6 +424,25 @@ type HITLNotifier interface {
 	NotifyHITL(ctx context.Context, req ApproveRequest, target HITLTarget) error
 }
 
+// UserChannel is where one dashboard user receives their approval
+// prompts, set and verified by the user (doc/notification-channels.md).
+// Secret is the part that must never reach a browser, such as a Teams
+// webhook URL; Target is what may be shown.
+type UserChannel struct {
+	Target string
+	Secret string
+}
+
+// HITLChannelSender is implemented by notifiers that can deliver to a
+// per-user channel: the gateway checks what a user enters with
+// ValidateChannel and sends verification codes and test messages with
+// SendChannelText. The credential (its secret slots) is the sender.
+type HITLChannelSender interface {
+	HITLNotifier
+	ValidateChannel(ch UserChannel) error
+	SendChannelText(ctx context.Context, secrets SecretStore, credential string, ch UserChannel, text string) error
+}
+
 // HITLMessageValueEscaper is implemented by notifiers whose message
 // format gives some characters meaning (Slack mrkdwn turns `<url|x>`
 // into a link and `<!channel>` into a mention). Values substituted
