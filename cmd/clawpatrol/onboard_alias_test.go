@@ -123,3 +123,24 @@ func TestAssignProfilePropagatesAcrossAlias(t *testing.T) {
 		t.Fatalf("ProfileForIP(v4) = %q, want default (canonical must follow alias reassignment)", got)
 	}
 }
+
+// Several users on one host share its hostname. After a restart the
+// in-memory owner is gone and only the persisted profile is left, so
+// that is what must stop one user's join from recycling — and evicting
+// the key of — another profile's device.
+func TestIPForHostnameKeepsAnotherProfilesDevice(t *testing.T) {
+	r := newOnboardRegistry()
+	r.knownDeviceIPs["10.55.0.2"] = true
+	r.hostnameByIP["10.55.0.2"] = "shared-host"
+	r.profileByIP["10.55.0.2"] = "default"
+
+	if got := r.IPForHostname("brennan", "brennan", "shared-host"); got != "" {
+		t.Fatalf("another profile's join recycled %q", got)
+	}
+	if got := r.IPForHostname("default", "default", "shared-host"); got != "10.55.0.2" {
+		t.Fatalf("same-profile rejoin: got %q, want %q", got, "10.55.0.2")
+	}
+	if got := r.IPForHostname("brennan", "brennan", "other-host"); got != "" {
+		t.Fatalf("other hostname: got %q, want empty", got)
+	}
+}
