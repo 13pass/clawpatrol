@@ -2928,9 +2928,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			v := g.runApproveChain(req.Context(), cr.Outcome.Approve, runApproveCtx{
 				AgentIP: agentAddr, Host: host, Method: req.Method, Path: req.URL.RequestURI(),
 				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), Reason: cr.Outcome.Reason,
-				ThreadTS:      req.Header.Get("X-HITL-Thread-TS"),
-				NotifyChannel: req.Header.Get("X-HITL-Channel"),
-				Endpoint:      ep, Rule: cr, Profile: profile, Request: mreq,
+				Endpoint: ep, Rule: cr, Profile: profile, Request: mreq,
 				AsyncOperationID: asyncOp.ID, AsyncPendingOnSyncTimeout: asyncOp.ID != "", AsyncSyncWaitTimeout: asyncSyncWait,
 			})
 			if v.Decision != "allow" {
@@ -3398,8 +3396,6 @@ type runApproveCtx struct {
 	UA                        string
 	BodySample                string
 	Reason                    string
-	ThreadTS                  string
-	NotifyChannel             string
 	Endpoint                  *config.CompiledEndpoint
 	Rule                      *config.CompiledRule
 	Profile                   string
@@ -3463,8 +3459,6 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			UA:                        c.UA,
 			BodySample:                c.BodySample,
 			Reason:                    c.Reason,
-			ThreadTS:                  c.ThreadTS,
-			NotifyChannel:             c.NotifyChannel,
 			AsyncOperationID:          c.AsyncOperationID,
 			AsyncPendingOnSyncTimeout: c.AsyncPendingOnSyncTimeout,
 			Pool:                      g.hitl,
