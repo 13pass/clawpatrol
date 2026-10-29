@@ -441,11 +441,18 @@ func (r *onboardRegistry) HostnameForIP(ip string) string {
 	return r.hostnameByIP[ip]
 }
 
-// IPForHostname returns the wg IP previously bound to (owner, hostname),
-// if any. Lets the approve flow recycle the existing /32 when the same
-// machine re-runs `clawpatrol join` — without it, every rejoin minted
-// a fresh IP and the dashboard accumulated duplicate device rows.
-func (r *onboardRegistry) IPForHostname(owner, hostname string) string {
+// IPForHostname returns the wg IP previously bound to (owner, hostname)
+// in profile, if any. Lets the approve flow recycle the existing /32
+// when the same machine re-runs `clawpatrol join` — without it, every
+// rejoin minted a fresh IP and the dashboard accumulated duplicate
+// device rows.
+//
+// Recycling evicts the old peer's key, so a device of another profile
+// is never recycled: several users on one host share its hostname, and
+// one user's join must not take over another's device. The owner is
+// held in memory only and is gone after a restart; the profile is
+// loaded from the devices table, so it is the check that holds.
+func (r *onboardRegistry) IPForHostname(owner, profile, hostname string) string {
 	if hostname == "" {
 		return ""
 	}
@@ -459,6 +466,9 @@ func (r *onboardRegistry) IPForHostname(owner, hostname string) string {
 			if o, ok := r.ownerByIP[ip]; ok && o != "" && o != owner {
 				continue
 			}
+		}
+		if p, ok := r.profileByIP[ip]; ok && p != "" && p != profile {
+			continue
 		}
 		return ip
 	}
@@ -1145,9 +1155,10 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 	wholeMachine := s.wholeMachine
 	w.onboard.mu.Unlock()
 
-	// Recycle the wg /32 already bound to (owner, hostname) so a rejoin
-	// from the same machine doesn't spawn a duplicate device row.
-	reuseIP := w.onboard.IPForHostname(owner, hostname)
+	// Recycle the wg /32 already bound to (owner, hostname) in this
+	// profile so a rejoin from the same machine doesn't spawn a
+	// duplicate device row.
+	reuseIP := w.onboard.IPForHostname(owner, profile, hostname)
 
 	// Mint key in background so the approve click returns fast.
 	go func() {
