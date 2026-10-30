@@ -596,11 +596,25 @@ export function updateUser(
 export type RuleVerdict = "deny" | "allow" | "approve";
 export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
 export type RuleRequest = {
-  verdict: RuleVerdict;
-  scope: RuleScope;
+  // verdict and scope are ignored for a Postgres request, whose
+  // outcome decides both.
+  verdict?: RuleVerdict;
+  scope?: RuleScope;
   // approver applies to admins only; a member's own approver is used.
   approver?: string;
   pin_header?: string;
+  postgres?: PostgresRuleInput;
+};
+
+// A relayed Postgres connection turned into an inspected endpoint.
+export type PostgresOutcome = "log" | "approve_changes" | "approve_all" | "deny";
+export type PostgresSSLMode = "require" | "prefer" | "disable";
+export type PostgresRuleInput = {
+  // name of the endpoint; empty lets the server generate one.
+  name?: string;
+  user?: string;
+  sslmode?: PostgresSSLMode;
+  outcome: PostgresOutcome;
 };
 
 export type ScopedRule = {
@@ -614,6 +628,8 @@ export type ScopedRule = {
   warnings?: string[];
   new_endpoint?: boolean;
   profile_additions?: string[];
+  // new_credential is a generated credential whose secret is still unset.
+  new_credential?: string;
 };
 
 export type RulePreviewResp = {
@@ -639,8 +655,17 @@ export function previewRule(actionID: string, req: RuleRequest) {
   return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
 }
 
+export type RuleCreated = {
+  ok: boolean;
+  // rule_name is empty when only an endpoint was declared.
+  rule_name: string;
+  endpoint_name?: string;
+  new_credential?: string;
+  file: string;
+};
+
 export function createRule(actionID: string, req: RuleRequest) {
-  return postJSON<{ ok: boolean; rule_name: string; file: string }>("/api/rules/create", {
+  return postJSON<RuleCreated>("/api/rules/create", {
     action_id: actionID,
     ...req,
   });

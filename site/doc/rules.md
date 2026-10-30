@@ -395,6 +395,31 @@ and credential, and a member's pre-approval carries `yield_to_deny`:
 it can skip an admin's approval, never undo an admin's deny. A member's
 deny or require-approval only tightens, so it needs no such flag.
 
+A request no endpoint inspected can still become a rule when the
+gateway knows its protocol. An HTTPS host that was passed through gets
+an `https` endpoint and a `passthrough` credential; pre-approving it
+is not offered, since it already passes through. A Postgres
+connection that was relayed to port 5432 gets:
+
+- an `endpoint "postgres"` for the connection's address, with the
+  chosen `sslmode` (`require` by default; `verify-full` is refused,
+  since the address has no host name to check the certificate
+  against),
+- a `postgres_credential` with the role the gateway logs in as —
+  its password goes to the secret store, never into the config,
+- the profile entries that claim it — every profile for an admin,
+  the request's profile for a member,
+- and one of four outcomes: no rule (statements are allowed and
+  recorded), approval for anything but reads and transaction
+  statements, approval for every statement, or a deny.
+
+Only a relayed connection the gateway allowed qualifies, and only to
+an address its `relay_destinations` policy still allows: a declared
+endpoint is dialled from the gateway host. Agents then connect without
+TLS — the gateway answers `N` to an SSLRequest and encrypts the hop to
+the database itself — with any password. The upstream role must use
+SCRAM-SHA-256; MD5 logins are refused.
+
 ### `yield_to_deny = true`
 
 On an `allow` rule only. When the rule matches, the rules after it

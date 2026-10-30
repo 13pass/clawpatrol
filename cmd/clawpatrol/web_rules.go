@@ -232,6 +232,14 @@ func (w *webMux) scopedRuleFor(rw http.ResponseWriter, r *http.Request) (viewer,
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return viewer{}, nil, nil, false
 	}
+	// The gateway dials a declared Postgres endpoint from its own host,
+	// so an address the relay would refuse today must not become one.
+	if ip, ok := postgresRelayAddr(ev); ok {
+		if err := w.g.relayDestOK(ip.String()); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return viewer{}, nil, nil, false
+		}
+	}
 	rule, err := GenerateScopedRule(w.g.Policy(), ev, body.RuleRequest, v.author())
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -275,8 +283,11 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 // countRecentMatches replays up to rulePreviewSample recent requests
 // the rule could apply to: same endpoint (or, for a new endpoint, same
 // host with no endpoint), and for a member the same profile. One query
-// reads only what the replay needs.
+// reads only what the replay needs. A new Postgres endpoint has no
+// recorded statements to replay: every relayed connection to the
+// address counts, as one the endpoint would now inspect.
 func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int, int, error) {
+	countsConnections := rule.NewEndpoint && rule.Family == "sql"
 	replayRule := *rule
 	if rule.NewEndpoint {
 		// Recorded requests predate the generated credential.
@@ -321,6 +332,11 @@ func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int,
 		if extra.String != "" {
 			_ = json.Unmarshal([]byte(extra.String), &recorded.Facets)
 		}
+		if countsConnections {
+			sampled++
+			matched++
+			continue
+		}
 		if m, ok := replay.matches(recorded); ok {
 			sampled++
 			if m {
@@ -350,8 +366,13 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	setAuditTarget(r, rule.RuleName)
-	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil && gw.Policy.Rules[rule.RuleName] != nil {
+	// A Postgres endpoint that only logs comes with no rule.
+	target := rule.RuleName
+	if target == "" {
+		target = rule.EndpointName
+	}
+	setAuditTarget(r, target)
+	if gw := w.g.cfg.Load(); rule.RuleName != "" && gw != nil && gw.Policy != nil && gw.Policy.Rules[rule.RuleName] != nil {
 		http.Error(rw, "rule "+strconv.Quote(rule.RuleName)+" already exists", http.StatusConflict)
 		return
 	}
@@ -374,7 +395,10 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	w.writeRuleChanges(rw, changes, map[string]any{"ok": true, "rule_name": rule.RuleName, "file": file})
+	w.writeRuleChanges(rw, changes, map[string]any{
+		"ok": true, "rule_name": rule.RuleName, "endpoint_name": rule.EndpointName,
+		"new_credential": rule.NewCredential, "file": file,
+	})
 }
 
 func (w *webMux) writeRuleChanges(rw http.ResponseWriter, changes []configChange, ok map[string]any) {

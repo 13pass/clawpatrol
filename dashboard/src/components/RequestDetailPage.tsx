@@ -20,7 +20,8 @@ import { ApprovalStatusIcon, LockGlyph, rowDescriptors } from "./LiveRequests";
 import { Main } from "./Main";
 import { Modal } from "./Modal";
 import { PageTitle, type Crumb } from "./PageTitle";
-import { RuleBuilderModal } from "./RuleBuilder";
+import { PostgresRuleModal } from "./PostgresRuleModal";
+import { RuleBuilderModal, ruleTarget } from "./RuleBuilder";
 import { Tag } from "./Tag";
 
 // isDenyAction matches every action label the dispatcher emits for a
@@ -238,16 +239,29 @@ export function RequestDetailPage({
 }
 
 // ActionButtons: "Create a rule…" builds a deny / pre-approve /
-// require-approval rule server-side, for anyone. Admins also keep the
-// raw-HCL "Block requests like this" editor and the fixture download.
+// require-approval rule server-side, for anyone; on a Postgres
+// connection that passed through uninspected it declares the database
+// instead. A relayed protocol the gateway can't inspect keeps the
+// button, disabled, with the reason. Admins also keep the raw-HCL
+// "Block requests like this" editor and the fixture download.
 function ActionButtons({ ev, whoami }: { ev: EventRecord; whoami: Whoami | null }) {
   const [ruleOpen, setRuleOpen] = useState(false);
   const [builderOpen, setBuilderOpen] = useState(false);
   const isAdmin = whoami?.role !== "member";
-  const canBlock = !!ev.id && ev.action !== "in_flight" && (!!ev.endpoint || ev.mode === "splice");
+  const target = ruleTarget(ev);
+  const canBlock = target.kind === "endpoint" || target.kind === "https-host";
   return (
     <div className="flex items-center gap-2 flex-wrap justify-end">
-      {canBlock && <Button onClick={() => setBuilderOpen(true)}>Create a rule…</Button>}
+      {(canBlock || target.kind === "postgres") && (
+        <Button onClick={() => setBuilderOpen(true)}>Create a rule…</Button>
+      )}
+      {target.kind === "unsupported" && (
+        <span title={target.reason}>
+          <Button disabled aria-label={`Create a rule… — ${target.reason}`}>
+            Create a rule…
+          </Button>
+        </span>
+      )}
       {canBlock && isAdmin && (
         <Button variant="outline" onClick={() => setRuleOpen(true)}>
           Block requests like this
@@ -255,9 +269,12 @@ function ActionButtons({ ev, whoami }: { ev: EventRecord; whoami: Whoami | null 
       )}
       {isAdmin && <DownloadActionButton ev={ev} />}
       {ruleOpen && <RulePreviewModal ev={ev} onClose={() => setRuleOpen(false)} />}
-      {builderOpen && (
-        <RuleBuilderModal ev={ev} whoami={whoami} onClose={() => setBuilderOpen(false)} />
-      )}
+      {builderOpen &&
+        (target.kind === "postgres" ? (
+          <PostgresRuleModal ev={ev} whoami={whoami} onClose={() => setBuilderOpen(false)} />
+        ) : (
+          <RuleBuilderModal ev={ev} whoami={whoami} onClose={() => setBuilderOpen(false)} />
+        ))}
     </div>
   );
 }

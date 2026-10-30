@@ -316,8 +316,8 @@ into `handlePostgresConn`, which consults the index by the
 connection’s destination IP to pick the matching endpoint. When
 several endpoints share an IP (writer + readonly aimed at the same
 RDS instance) the lookup filters by the device’s profile so the
-right one wins; single-database profiles fall back to "first
-postgres in profile" without needing DNS at all. The postgres
+right one wins. There is no fallback: a destination no endpoint in
+the device's profile claims is relayed verbatim, uninspected. The postgres
 endpoint runtime then performs auth offload and runs the flow
 through `sql`-family rule matching with the right credential.
 

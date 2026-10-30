@@ -64,6 +64,10 @@ type RuleRequest struct {
 	// PinHeader, when set, limits an HTTP rule to requests carrying the
 	// recorded value of this header — e.g. the API service's caller ID.
 	PinHeader string `json:"pin_header,omitempty"`
+	// Postgres carries the settings for a relayed Postgres connection,
+	// which becomes an endpoint rather than a rule on an existing one.
+	// Its outcome replaces Verdict and Scope.
+	Postgres *PostgresRuleInput `json:"postgres,omitempty"`
 }
 
 // RuleAuthor scopes a generated rule to a member. A nil author is an
@@ -89,6 +93,9 @@ type ScopedRule struct {
 	// ProfileAdditions.
 	NewEndpoint      bool     `json:"new_endpoint,omitempty"`
 	ProfileAdditions []string `json:"profile_additions,omitempty"`
+	// NewCredential names a generated credential whose secret the
+	// dashboard sets once the config has loaded it.
+	NewCredential string `json:"new_credential,omitempty"`
 
 	// credentialRef is Credential as a typed HCL reference.
 	credentialRef string
@@ -105,6 +112,22 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	if ev == nil {
 		return nil, fmt.Errorf("event is required")
 	}
+	if author != nil {
+		if ev.Profile == "" {
+			return nil, fmt.Errorf("this request has no recorded profile, so no member rule can be scoped to it")
+		}
+		req.Approver = author.Approver
+	}
+	if ip, ok := postgresRelayAddr(ev); ok {
+		return generateScopedPostgresRule(policy, ev, ip, req, author)
+	}
+	if req.Postgres != nil {
+		return nil, fmt.Errorf("Postgres settings apply only to a relayed Postgres connection")
+	}
+	if ev.Mode == "relay" {
+		_, port, _ := relayHostPort(ev.Host)
+		return nil, fmt.Errorf("Claw Patrol can't inspect this connection (port %d); only HTTPS and Postgres connections can become rules", port)
+	}
 	switch req.Verdict {
 	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
 	default:
@@ -112,12 +135,6 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	}
 	if req.Scope == "" {
 		req.Scope = ruleScopeExact
-	}
-	if author != nil {
-		if ev.Profile == "" {
-			return nil, fmt.Errorf("this request has no recorded profile, so no member rule can be scoped to it")
-		}
-		req.Approver = author.Approver
 	}
 	if ev.Endpoint == "" {
 		return generateScopedHostRule(policy, ev, req, author)
