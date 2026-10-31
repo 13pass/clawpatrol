@@ -593,7 +593,9 @@ export function updateUser(
 }
 
 // A request turned into a rule: what it does and how much it matches.
-export type RuleVerdict = "deny" | "allow" | "approve";
+// "log" applies only to a host no endpoint inspects: it declares the
+// endpoint with no rule.
+export type RuleVerdict = "deny" | "allow" | "approve" | "log";
 export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
 export type RuleRequest = {
   // verdict and scope are ignored for a Postgres request, whose

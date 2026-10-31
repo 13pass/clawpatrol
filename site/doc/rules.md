@@ -397,8 +397,10 @@ deny or require-approval only tightens, so it needs no such flag.
 
 A request no endpoint inspected can still become a rule when the
 gateway knows its protocol. An HTTPS host that was passed through gets
-an `https` endpoint and a `passthrough` credential; pre-approving it
-is not offered, since it already passes through. A Postgres
+an `https` endpoint and a `passthrough` credential, then a deny, an
+approval, or no rule at all: with no rule its requests are allowed
+and recorded. Pre-approving it is not offered, since it already
+passes through. A Postgres
 connection that was relayed to port 5432 gets:
 
 - an `endpoint "postgres"` for the connection's address, with the

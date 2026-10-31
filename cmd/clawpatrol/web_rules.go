@@ -283,11 +283,11 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 // countRecentMatches replays up to rulePreviewSample recent requests
 // the rule could apply to: same endpoint (or, for a new endpoint, same
 // host with no endpoint), and for a member the same profile. One query
-// reads only what the replay needs. A new Postgres endpoint has no
-// recorded statements to replay: every relayed connection to the
-// address counts, as one the endpoint would now inspect.
+// reads only what the replay needs. A new endpoint with no rule, or a
+// new Postgres endpoint, which has no recorded statements to replay,
+// counts every request or connection, as one it would now inspect.
 func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int, int, error) {
-	countsConnections := rule.NewEndpoint && rule.Family == "sql"
+	countsConnections := rule.NewEndpoint && (rule.Family == "sql" || rule.RuleName == "")
 	replayRule := *rule
 	if rule.NewEndpoint {
 		// Recorded requests predate the generated credential.
@@ -366,7 +366,7 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// A Postgres endpoint that only logs comes with no rule.
+	// An endpoint that only logs comes with no rule.
 	target := rule.RuleName
 	if target == "" {
 		target = rule.EndpointName

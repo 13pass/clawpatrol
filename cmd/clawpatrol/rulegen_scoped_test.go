@@ -197,6 +197,7 @@ func TestScopedRuleRefusals(t *testing.T) {
 		{"no profile", noProfile, RuleRequest{Verdict: ruleVerdictDeny}},
 		{"allow unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictAllow}},
 		{"pattern unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopePattern}},
+		{"log inspected request", notesEvent(), RuleRequest{Verdict: ruleVerdictLog}},
 	}
 	for _, tc := range cases {
 		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, &RuleAuthor{Username: "alice"}); err == nil {
@@ -311,5 +312,23 @@ func TestHostRuleRefusedOnceTheHostHasAnEndpoint(t *testing.T) {
 	if _, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictDeny}, &RuleAuthor{Username: "alice"}); err == nil ||
 		!strings.Contains(err.Error(), "now has endpoint") {
 		t.Fatalf("host rule for a claimed host: err = %v", err)
+	}
+}
+
+func TestLogOnUnknownHostDeclaresTheEndpointWithNoRule(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	ev := &Event{ID: "h", Host: "example.org", Method: "GET", Path: "/", Profile: "team-a"}
+	rule, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictLog}, &RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rule.RuleName != "" || strings.Contains(rule.HCL, `rule "`) {
+		t.Fatalf("log wrote a rule:\n%s", rule.HCL)
+	}
+	if !strings.Contains(rule.HCL, `endpoint "https" "alice-`) || !strings.Contains(rule.HCL, `credential "passthrough"`) {
+		t.Fatalf("log did not declare the endpoint:\n%s", rule.HCL)
+	}
+	if len(rule.ProfileAdditions) != 1 || rule.ProfileAdditions[0] != "team-a" {
+		t.Errorf("profiles = %v, want [team-a]", rule.ProfileAdditions)
 	}
 }

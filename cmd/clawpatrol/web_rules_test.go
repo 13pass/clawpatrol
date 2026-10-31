@@ -274,6 +274,27 @@ func TestMemberRuleOnUnknownHostClaimsOnlyTheirProfile(t *testing.T) {
 	}
 }
 
+func TestMemberLogsAnUnknownHost(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	req := `{"action_id":"` + env.aliceHost + `","verdict":"log"}`
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/preview", req)
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"recent_matches":1`) {
+		t.Fatalf("preview = %d %s", rw.Code, rw.Body.String())
+	}
+	rw = serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create", req)
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"rule_name":""`) {
+		t.Fatalf("create = %d %s", rw.Code, rw.Body.String())
+	}
+	policy := env.w.g.Policy()
+	ep := runtime.HostEndpoint(policy, "team-a", "example.org")
+	if ep == nil || len(ep.Rules) != 0 {
+		t.Fatalf("example.org endpoint for team-a = %+v", ep)
+	}
+	if runtime.HostEndpoint(policy, "team-b", "example.org") != nil {
+		t.Error("team-b got an endpoint for example.org")
+	}
+}
+
 func TestAdminRuleGoesToTheDashboardFileUnpinned(t *testing.T) {
 	env := newRulesTestEnv(t, true)
 	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create",

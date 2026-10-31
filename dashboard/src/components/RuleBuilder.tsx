@@ -34,6 +34,11 @@ const VERDICTS: { value: RuleVerdict; label: string; help: string }[] = [
     label: "Require approval",
     help: "Hold matching requests until a human approves.",
   },
+  {
+    value: "log",
+    label: "Inspect and log",
+    help: "Record every request to this host in the history; hold nothing.",
+  },
 ];
 
 // RuleTarget is what "Create a rule…" can do with a recorded request:
@@ -232,8 +237,9 @@ export function RuleBuilderModal({
   const newHost = !ev.endpoint;
   const scopes = scopesFor(ev);
   // A host with no endpoint already passes through: pre-approving it
-  // would change nothing, and the server refuses it.
-  const verdicts = newHost ? VERDICTS.filter((v) => v.value !== "allow") : VERDICTS;
+  // would change nothing, and the server refuses it. Logging applies
+  // only there, since an endpoint already records what it inspects.
+  const verdicts = VERDICTS.filter((v) => v.value !== (newHost ? "allow" : "log"));
   const [verdict, setVerdict] = useState<RuleVerdict>("deny");
   const [scope, setScope] = useState<RuleScope>(scopes[0].value);
   const [pinHeader, setPinHeader] = useState("");
@@ -294,8 +300,17 @@ export function RuleBuilderModal({
         {created ? (
           <div className="space-y-2">
             <p className="text-sm text-text">
-              Rule <code className="font-bold">{created.rule_name}</code> was validated, written to{" "}
-              <code>{created.file}</code> and loaded by the gateway.
+              {created.rule_name ? (
+                <>
+                  Rule <code className="font-bold">{created.rule_name}</code> was
+                </>
+              ) : (
+                <>
+                  The endpoint for <code className="font-bold">{ev.host}</code> was
+                </>
+              )}{" "}
+              validated, written to <code>{created.file}</code> and loaded by the gateway.
+              {!created.rule_name && " New requests to this host appear in the request history."}
             </p>
             <p className="text-xs text-text-muted">
               Manage it on the{" "}
@@ -365,7 +380,7 @@ export function RuleBuilderModal({
             {preview && (
               <div className="space-y-2">
                 <p className="text-xs text-text">
-                  Would have matched{" "}
+                  {verdict === "log" ? "Would have inspected" : "Would have matched"}{" "}
                   <span className="font-bold">
                     {preview.recent_matches} of the last {preview.recent_sampled}
                   </span>{" "}
@@ -404,7 +419,7 @@ export function RuleBuilderModal({
               <CopyHCLButton hcl={preview.rule.hcl} primary />
             ) : (
               <Button disabled={!preview?.writes_enabled || busy} onClick={create}>
-                {busy ? "Creating…" : "Create rule"}
+                {busy ? "Creating…" : verdict === "log" ? "Start inspecting" : "Create rule"}
               </Button>
             )}
           </>

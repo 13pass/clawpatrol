@@ -23,6 +23,9 @@ const (
 	ruleVerdictDeny    = "deny"
 	ruleVerdictAllow   = "allow"
 	ruleVerdictApprove = "approve"
+	// ruleVerdictLog declares an endpoint for a host that passed through,
+	// with no rule: its requests are inspected and recorded, none held.
+	ruleVerdictLog = "log"
 
 	ruleScopeExact     = "exact"      // the request's method and path (or SQL / k8s facets)
 	ruleScopeAnyMethod = "any_method" // HTTP: the path, any method
@@ -129,15 +132,18 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		return nil, fmt.Errorf("Claw Patrol can't inspect this connection (port %d); only HTTPS and Postgres connections can become rules", port)
 	}
 	switch req.Verdict {
-	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
+	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove, ruleVerdictLog:
 	default:
-		return nil, fmt.Errorf("verdict must be deny, allow or approve")
+		return nil, fmt.Errorf("verdict must be deny, allow, approve or log")
 	}
 	if req.Scope == "" {
 		req.Scope = ruleScopeExact
 	}
 	if ev.Endpoint == "" {
 		return generateScopedHostRule(policy, ev, req, author)
+	}
+	if req.Verdict == ruleVerdictLog {
+		return nil, fmt.Errorf("endpoint %q already inspects and records this request; log applies only to a host that passed through", ev.Endpoint)
 	}
 	ep := policy.Endpoints[ev.Endpoint]
 	if ep == nil {
@@ -172,11 +178,12 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 // generateScopedHostRule handles a request no endpoint claimed: it
 // declares an endpoint for the host, a passthrough credential that
 // claims it for the author's profile (every profile, for an admin),
-// and the rule. Such a host already passes through, so only deny and
-// approve make sense.
+// and the rule. Such a host already passes through, so only deny,
+// approve and log make sense; log writes no rule, since a request no
+// rule matches is allowed and recorded.
 func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor) (*ScopedRule, error) {
 	if req.Verdict == ruleVerdictAllow {
-		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny or approve apply")
+		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny, approve or log apply")
 	}
 	if req.Scope != ruleScopeExact {
 		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact)")
@@ -196,10 +203,12 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	}
 	credName := generatedPassthroughCredName(policy, endpointName)
 	rule := &ScopedRule{
-		RuleName:     scopedRuleName(author, req, ev, endpointName),
 		EndpointName: endpointName,
 		Family:       "http",
 		NewEndpoint:  true,
+	}
+	if req.Verdict != ruleVerdictLog {
+		rule.RuleName = scopedRuleName(author, req, ev, endpointName)
 	}
 	rule.ProfileAdditions = hostRuleProfiles(policy, ev, author)
 	if author != nil {
@@ -214,15 +223,17 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	f.Body().AppendNewline()
 	cb := f.Body().AppendNewBlock("credential", []string{"passthrough", credName}).Body()
 	cb.SetAttributeRaw("endpoint", config.TraversalTokens("https."+endpointName))
-	f.Body().AppendNewline()
-	writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
+	if rule.RuleName != "" {
+		f.Body().AppendNewline()
+		writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
+	}
 	for _, profile := range rule.ProfileAdditions {
 		f.Body().AppendNewline()
 		pb := f.Body().AppendNewBlock("profile", []string{profile}).Body()
 		config.SetIdentList(pb, "credentials", []string{"passthrough." + credName})
 	}
 	rule.HCL = string(f.Bytes())
-	rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
+	rule.Warnings = append(rule.Warnings, "This request matched no endpoint: this declares one for "+host+" and a passthrough credential that claims it.")
 	return rule, nil
 }
 
