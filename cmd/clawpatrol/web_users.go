@@ -84,6 +84,7 @@ func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
 		"profiles":        declaredProfiles(policy),
 		"human_approvers": declaredHumanApprovers(policy),
 		"oidc":            oidc,
+		"config_writes":   w.g.cfg.Load().DashboardConfigWrites(),
 	})
 }
 
@@ -146,6 +147,8 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		Role     dashboardRole `json:"role"`
 		// OIDC links provider names to accounts there.
 		OIDC map[string]string `json:"oidc"`
+		// NewProfile also declares a profile for the user and assigns it.
+		NewProfile *newUserProfile `json:"new_profile"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -185,7 +188,27 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if body.NewProfile != nil {
+		if _, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return
+		} else if exists {
+			http.Error(rw, errDashboardUserExists.Error(), http.StatusConflict)
+			return
+		}
+		w.g.configMu.Lock()
+		err := w.g.applyUserProfileLocked(*body.NewProfile)
+		w.g.configMu.Unlock()
+		if err != nil {
+			http.Error(rw, err.Error(), userProfileErrorStatus(err))
+			return
+		}
+		log.Printf("dashboard config: profile %q declared from %q for user %q", body.NewProfile.Name, body.NewProfile.Template, body.Username)
+	}
 	if err := createLinkedDashboardUser(w.g.db, body.Username, body.Password, body.Role, links); err != nil {
+		if body.NewProfile != nil {
+			err = fmt.Errorf("profile %q was declared, but the user was not created: %w", body.NewProfile.Name, err)
+		}
 		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
 			http.Error(rw, err.Error(), http.StatusConflict)
 			return
@@ -194,7 +217,25 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		return
 	}
 	log.Printf("dashboard auth: user %q created with role %s", body.Username, body.Role)
+	if body.NewProfile != nil {
+		if err := setDashboardUserProfiles(w.g.db, body.Username, []string{body.NewProfile.Name}); err != nil {
+			http.Error(rw, "user created, but profile "+body.NewProfile.Name+" was not assigned: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
+		w.bustStateCache()
+	}
 	writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
+}
+
+func userProfileErrorStatus(err error) int {
+	var invalid *configInvalidError
+	switch {
+	case errors.Is(err, errUserProfileConflict):
+		return http.StatusConflict
+	case errors.Is(err, errUserProfileInvalid), errors.As(err, &invalid):
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // apiUsersUpdate changes a user's role and/or resets a member's

@@ -69,7 +69,7 @@ against credential X.
 | Dashboard user, role | admin | `dashboard_users` |
 | User → profiles | admin | `dashboard_user_profiles` (phase 3) |
 | `gateway`, `defaults`, `plugin`, `tunnel`, shared endpoints/approvers, guardrail rules | admin | `00-*.hcl`, Git-managed |
-| Credentials and endpoints of a profile (declaration) | admin | `00-*.hcl` (v1); forms later |
+| Credentials and endpoints of a profile (declaration) | admin | `00-*.hcl`, or the Users page from a template profile |
 | Credential secrets (values, OAuth) of an owned profile | member | DB, existing screens, scoped |
 | Rules generated from owned requests | member | `50-user-<name>.hcl`, dashboard-managed |
 | Devices bound to an owned profile | member | `devices`, scoped |
@@ -265,6 +265,22 @@ channel kind is the first declared credential of that type
 declares `credential "teams_workflow" "<name>" {}`. A `teams_workflow`
 credential only serves users' channels, never an approver's own.
 Plan: `doc/notification-channels.md`.
+
+### Profiles from the Users page (done)
+
+With `dashboard_config_writes`, "Add a user" can also declare a profile
+for the new user, modelled on an existing one, and assign it
+(`new_profile` on `POST /api/users/create`). A credential only the
+template profile lists is its owner's own: it is copied under the new
+profile's name (`gitlab-pat-sean` → `gitlab-pat-frank`, `gitlab-pat` →
+`gitlab-pat-frank`) with an empty secret the new user fills in. A
+credential other profiles list too is reused. A template with inline
+credential entries (`{ credential = ..., placeholder = ... }`) is
+refused. The blocks go to the dashboard's file (`90-dashboard.hcl` in
+directory mode) and the gateway reloads without a restart. The
+dashboard then shows the install and join commands to send the user,
+with `--profile` set and an optional `--hostname`, which the Add device
+dialog also offers now.
 
 ### Later
 

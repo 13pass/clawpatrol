@@ -9,11 +9,13 @@ import {
   type AuditRecord,
   type DashboardRole,
   type DashboardUser,
+  type NewUserProfile,
   type Whoami,
 } from "../lib/api";
 import { credentialTypeLabel } from "../lib/credentialLabels";
 import { fmtDateTime } from "../lib/format";
 import { Button } from "./Button";
+import { JoinSteps } from "./JoinSteps";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
 
@@ -37,6 +39,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
     profiles: [],
     approvers: [],
     oidcProviders: [],
+    configWrites: false,
   });
   const [err, setErr] = useState("");
 
@@ -48,6 +51,7 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
         profiles: list.profiles,
         approvers: list.human_approvers,
         oidcProviders: list.oidc.map((p) => ({ name: p.name, displayName: p.display_name })),
+        configWrites: list.config_writes,
       });
       setErr("");
     } catch (e) {
@@ -63,7 +67,11 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
     <Main>
       <PageTitle trail={[{ label: "Users" }]} />
       <Section title="Add a user">
-        <CreateUserForm onCreated={refresh} oidcProviders={declared.oidcProviders} />
+        <CreateUserForm
+          onCreated={refresh}
+          declared={declared}
+          url={whoami?.public_url || window.location.origin}
+        />
       </Section>
       <Section title="Users">
         {err && <div className="text-xs text-danger-500 px-4 py-2">{err}</div>}
@@ -84,7 +92,19 @@ export function UsersPage({ whoami }: { whoami: Whoami | null }) {
 // Declared is what the config offers for assignment, and the sign-in
 // providers (gateway.dashboard_oidc blocks).
 type OIDCProvider = { name: string; displayName: string };
-type Declared = { profiles: string[]; approvers: string[]; oidcProviders: OIDCProvider[] };
+type Declared = {
+  profiles: string[];
+  approvers: string[];
+  oidcProviders: OIDCProvider[];
+  // configWrites: the gateway may declare a profile for a new user.
+  configWrites: boolean;
+};
+
+// defaultTemplate prefers a teammate's profile over "default", which
+// holds only what a device gets before anyone picks a profile.
+function defaultTemplate(profiles: string[]): string {
+  return profiles.find((p) => p !== "default") ?? profiles[0] ?? "";
+}
 
 function Section({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -99,28 +119,45 @@ function Section({ title, children }: { title: string; children: ReactNode }) {
 
 function CreateUserForm({
   onCreated,
-  oidcProviders,
+  declared,
+  url,
 }: {
   onCreated: () => void;
-  oidcProviders: OIDCProvider[];
+  declared: Declared;
+  url: string;
 }) {
+  const oidcProviders = declared.oidcProviders;
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [links, setLinks] = useState<Record<string, string>>({});
   const linked = Object.values(links).some((a) => a.trim() !== "");
   const [role, setRole] = useState<DashboardRole>("member");
+  const [withProfile, setWithProfile] = useState(false);
+  // profileName stays the username until edited.
+  const [profileName, setProfileName] = useState<string | null>(null);
+  const [template, setTemplate] = useState("");
+  const [created, setCreated] = useState<{ username: string; profile: string } | null>(null);
   const [err, setErr] = useState("");
   const [saving, setSaving] = useState(false);
+  const canCreateProfile = declared.configWrites && declared.profiles.length > 0;
+  const chosenTemplate = template || defaultTemplate(declared.profiles);
 
   async function submit(e: FormEvent) {
     e.preventDefault();
     setSaving(true);
+    const newProfile: NewUserProfile | undefined =
+      withProfile && canCreateProfile
+        ? { name: profileName ?? username, template: chosenTemplate }
+        : undefined;
     try {
-      await createUser(username, password, role, links);
+      await createUser(username, password, role, links, newProfile);
+      setCreated(newProfile ? { username, profile: newProfile.name } : null);
       setUsername("");
       setPassword("");
       setLinks({});
       setRole("member");
+      setWithProfile(false);
+      setProfileName(null);
       setErr("");
       onCreated();
     } catch (e) {
@@ -131,48 +168,142 @@ function CreateUserForm({
   }
 
   return (
-    <form onSubmit={submit} className="p-4 flex flex-wrap items-end gap-3">
-      <Field label="Username">
-        <input
-          value={username}
-          onChange={(e) => setUsername(e.target.value)}
-          required
-          pattern={USERNAME_PATTERN}
-          title="Lowercase letters, digits and dashes; starts with a letter"
-          autoComplete="off"
-          className={INPUT_CLASS}
-        />
-      </Field>
-      {oidcProviders.map((p) => (
-        <Field key={p.name} label={`${p.displayName} account`}>
+    <>
+      <form onSubmit={submit} className="p-4 flex flex-wrap items-end gap-3">
+        <Field label="Username">
           <input
-            value={links[p.name] ?? ""}
-            onChange={(e) => setLinks({ ...links, [p.name]: e.target.value })}
-            placeholder="username or email"
+            value={username}
+            onChange={(e) => setUsername(e.target.value)}
+            required
+            pattern={USERNAME_PATTERN}
+            title="Lowercase letters, digits and dashes; starts with a letter"
             autoComplete="off"
             className={INPUT_CLASS}
           />
         </Field>
-      ))}
-      <Field label={linked ? "Password (optional)" : "Initial password"}>
-        <input
-          type="password"
-          value={password}
-          onChange={(e) => setPassword(e.target.value)}
-          required={!linked}
-          minLength={MIN_PASSWORD_LEN}
-          autoComplete="new-password"
-          className={INPUT_CLASS}
-        />
-      </Field>
-      <Field label="Role">
-        <RoleSelect value={role} onChange={setRole} />
-      </Field>
-      <Button type="submit" disabled={saving}>
-        {saving ? "Adding…" : "Add user"}
-      </Button>
-      {err && <div className="basis-full text-xs text-danger-500">{err}</div>}
-    </form>
+        {oidcProviders.map((p) => (
+          <Field key={p.name} label={`${p.displayName} account`}>
+            <input
+              value={links[p.name] ?? ""}
+              onChange={(e) => setLinks({ ...links, [p.name]: e.target.value })}
+              placeholder="username or email"
+              autoComplete="off"
+              className={INPUT_CLASS}
+            />
+          </Field>
+        ))}
+        <Field label={linked ? "Password (optional)" : "Initial password"}>
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required={!linked}
+            minLength={MIN_PASSWORD_LEN}
+            autoComplete="new-password"
+            className={INPUT_CLASS}
+          />
+        </Field>
+        <Field label="Role">
+          <RoleSelect value={role} onChange={setRole} />
+        </Field>
+        <label
+          className="flex items-center gap-2 self-center text-xs text-text-muted"
+          title={
+            canCreateProfile
+              ? "Declare a profile for this user in the gateway config"
+              : "Needs gateway.dashboard_config_writes = true"
+          }
+        >
+          <input
+            type="checkbox"
+            checked={withProfile && canCreateProfile}
+            onChange={(e) => setWithProfile(e.target.checked)}
+            disabled={!canCreateProfile}
+          />
+          Create a profile
+        </label>
+        {withProfile && canCreateProfile && (
+          <>
+            <Field label="Profile name">
+              <input
+                value={profileName ?? username}
+                onChange={(e) => setProfileName(e.target.value)}
+                required
+                pattern={USERNAME_PATTERN}
+                title="Lowercase letters, digits and dashes; starts with a letter"
+                autoComplete="off"
+                className={INPUT_CLASS}
+              />
+            </Field>
+            <Field label="Based on">
+              <select
+                value={chosenTemplate}
+                onChange={(e) => setTemplate(e.target.value)}
+                className={INPUT_CLASS + " bg-canvas"}
+              >
+                {declared.profiles.map((p) => (
+                  <option key={p} value={p}>
+                    {p}
+                  </option>
+                ))}
+              </select>
+            </Field>
+          </>
+        )}
+        <Button type="submit" disabled={saving}>
+          {saving ? "Adding…" : "Add user"}
+        </Button>
+        {withProfile && canCreateProfile && (
+          <div className="basis-full text-xs text-text-muted">
+            Credentials only {chosenTemplate} uses get an empty copy that the new user fills in;
+            credentials shared with other profiles are reused.
+          </div>
+        )}
+        {err && <div className="basis-full text-xs text-danger-500">{err}</div>}
+      </form>
+      {created && (
+        <div className="px-4 pb-4">
+          <CreatedUserJoin
+            username={created.username}
+            profile={created.profile}
+            url={url}
+            onDismiss={() => setCreated(null)}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+// CreatedUserJoin is what to send a user just created with a profile:
+// how to join their agent host on that profile.
+function CreatedUserJoin({
+  username,
+  profile,
+  url,
+  onDismiss,
+}: {
+  username: string;
+  profile: string;
+  url: string;
+  onDismiss: () => void;
+}) {
+  return (
+    <div className="border-1.5 border-navy p-4 space-y-3">
+      <div className="flex items-center justify-between gap-2">
+        <span className="text-sm text-text font-mono">
+          Send {username} the commands for their agent host, on profile {profile}:
+        </span>
+        <Button variant="outline" type="button" onClick={onDismiss}>
+          done
+        </Button>
+      </div>
+      <JoinSteps url={url} profile={profile} />
+      <div className="text-xs text-text-muted">
+        After signing in, {username} pastes their own tokens into the profile's empty credentials,
+        then approves the device once it joins.
+      </div>
+    </div>
   );
 }
 

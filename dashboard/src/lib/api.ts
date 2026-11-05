@@ -546,6 +546,9 @@ export async function listUsers(): Promise<{
   human_approvers: string[];
   // oidc lists the sign-in providers (gateway.dashboard_oidc blocks).
   oidc: { name: string; display_name: string; label: string }[];
+  // config_writes is gateway.dashboard_config_writes: whether creating
+  // a user may also declare a profile for them.
+  config_writes: boolean;
 }> {
   const r = await api("/api/users");
   if (!r.ok) throw new Error(await r.text());
@@ -561,16 +564,29 @@ async function postUsers(path: string, body: object): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
+// NewUserProfile declares a profile for a new user, modelled on the
+// template profile: the template's own credentials are copied for the
+// user, its shared ones are reused.
+export type NewUserProfile = { name: string; template: string };
+
 // createUser adds an account; with an account linked at a provider
 // (oidc: provider name → account) the password may be empty, and the
-// user signs in through the provider only.
+// user signs in through the provider only. With newProfile the gateway
+// also declares that profile and assigns it to the user.
 export function createUser(
   username: string,
   password: string,
   role: DashboardRole,
   oidc: Record<string, string> = {},
+  newProfile?: NewUserProfile,
 ) {
-  return postUsers("/api/users/create", { username, password, role, oidc });
+  return postUsers("/api/users/create", {
+    username,
+    password,
+    role,
+    oidc,
+    ...(newProfile ? { new_profile: newProfile } : {}),
+  });
 }
 
 // updateUser changes the role, resets a member's password, or sets the
