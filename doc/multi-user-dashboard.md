@@ -276,7 +276,13 @@ profile's name (`gitlab-pat-sean` → `gitlab-pat-frank`, `gitlab-pat` →
 `gitlab-pat-frank`) with an empty secret the new user fills in. A
 credential other profiles list too is reused. A template with inline
 credential entries (`{ credential = ..., placeholder = ... }`) is
-refused. The blocks go to the dashboard's file (`90-dashboard.hcl` in
+refused. Rules that name the template profile or its own credentials
+are not copied, and a copied credential keeps its whole body, so a
+field naming the template's owner (a database `user`, say) needs
+editing by hand. A secret or a profile assignment left in the database
+under one of the new names, from an earlier config, is dropped so the
+new user starts clean. The profile is checked before the user is
+created, and the user is removed again if the config write fails. The blocks go to the dashboard's file (`90-dashboard.hcl` in
 directory mode) and the gateway reloads without a restart. The
 dashboard then shows the install and join commands to send the user,
 with `--profile` set and an optional `--hostname`, which the Add device

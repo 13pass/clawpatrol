@@ -198,3 +198,93 @@ func TestCloneCredentialName(t *testing.T) {
 		}
 	}
 }
+
+func TestCreateUserProfileFromOneLineCredential(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	extra := `credential "bearer_token" "sentry-gemma" { endpoint = https.sentry }
+profile "oneline" {
+  credentials = [bearer_token.sentry-gemma]
+}
+`
+	writeTeamFile(t, w, "20-oneline.hcl", extra)
+	rw := postUsersCreate(w, `{"username":"ana","password":"ana-passphrase-12345","new_profile":{"name":"ana","template":"oneline"}}`)
+	if rw.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	if got := strings.Join(profileCredentialNames(t, w, "ana"), ","); got != "bearer_token.sentry-gemma-ana" {
+		t.Fatalf("ana credentials = %s", got)
+	}
+}
+
+func TestCreateUserProfileCloneNamesCollide(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	writeTeamFile(t, w, "20-twins.hcl", `credential "bearer_token" "token" { endpoint = https.sentry }
+credential "bearer_token" "token-twin" { endpoint = https.gitlab }
+profile "twin" {
+  credentials = [bearer_token.token, bearer_token.token-twin]
+}
+`)
+	rw := postUsersCreate(w, `{"username":"ana","password":"ana-passphrase-12345","new_profile":{"name":"ana","template":"twin"}}`)
+	if rw.Code != http.StatusConflict || !strings.Contains(rw.Body.String(), "token-ana") {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	if _, exists, _ := lookupDashboardUserRole(w.g.db, "ana"); exists {
+		t.Fatal("a refused request created the user")
+	}
+}
+
+func TestCreateUserProfileDropsLeftoversUnderTheName(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	if err := setCredentialSlot(w.g.db, "gitlab-pat-frank", "", "old-frank-token"); err != nil {
+		t.Fatal(err)
+	}
+	if err := createDashboardUser(w.g.db, "olduser", "olduser-passphrase-1", dashboardRoleMember); err != nil {
+		t.Fatal(err)
+	}
+	if err := setDashboardUserProfiles(w.g.db, "olduser", []string{"frank", "gemma"}); err != nil {
+		t.Fatal(err)
+	}
+	rw := postUsersCreate(w, `{"username":"frank","password":"frank-passphrase-1234","new_profile":{"name":"frank","template":"sean"}}`)
+	if rw.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	if _, found, err := readCredentialSecrets(w.g.db, "gitlab-pat-frank"); err != nil || found {
+		t.Fatalf("old secret still stored: found=%v err=%v", found, err)
+	}
+	if got, _ := listDashboardUserProfiles(w.g.db, "olduser"); strings.Join(got, ",") != "gemma" {
+		t.Fatalf("olduser's profiles = %v, want only gemma", got)
+	}
+}
+
+func TestCreateUserProfileWriteFailureRemovesUser(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores the read-only directory")
+	}
+	w := teamProfilesMux(t, true)
+	if err := os.Chmod(w.g.cfgPath, 0o550); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(w.g.cfgPath, 0o750) })
+	rw := postUsersCreate(w, `{"username":"frank","password":"frank-passphrase-1234","new_profile":{"name":"frank","template":"sean"}}`)
+	if rw.Code == http.StatusCreated {
+		t.Fatal("the write into a read-only directory succeeded")
+	}
+	if _, exists, _ := lookupDashboardUserRole(w.g.db, "frank"); exists {
+		t.Fatal("the user stayed although the profile was not declared")
+	}
+}
+
+// writeTeamFile adds a config file and reloads, as an operator edit
+// picked up by the file watcher would.
+func writeTeamFile(t *testing.T, w *webMux, name, src string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(w.g.cfgPath, name), []byte(src), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	cfg, policy, err := loadConfig(w.g.cfgPath)
+	if err != nil {
+		t.Fatalf("loadConfig: %v", err)
+	}
+	w.g.cfg.Store(cfg)
+	w.g.policy.Store(policy)
+}

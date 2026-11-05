@@ -188,43 +188,69 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if body.NewProfile != nil {
-		if _, exists, err := lookupDashboardUserRole(w.g.db, body.Username); err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		} else if exists {
-			http.Error(rw, errDashboardUserExists.Error(), http.StatusConflict)
+	if body.NewProfile == nil {
+		if !w.createUser(rw, body.Username, body.Password, body.Role, links) {
 			return
 		}
-		w.g.configMu.Lock()
-		err := w.g.applyUserProfileLocked(*body.NewProfile)
-		w.g.configMu.Unlock()
-		if err != nil {
-			http.Error(rw, err.Error(), userProfileErrorStatus(err))
-			return
-		}
-		log.Printf("dashboard config: profile %q declared from %q for user %q", body.NewProfile.Name, body.NewProfile.Template, body.Username)
-	}
-	if err := createLinkedDashboardUser(w.g.db, body.Username, body.Password, body.Role, links); err != nil {
-		if body.NewProfile != nil {
-			err = fmt.Errorf("profile %q was declared, but the user was not created: %w", body.NewProfile.Name, err)
-		}
-		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
-			http.Error(rw, err.Error(), http.StatusConflict)
-			return
-		}
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
 		return
 	}
-	log.Printf("dashboard auth: user %q created with role %s", body.Username, body.Role)
-	if body.NewProfile != nil {
-		if err := setDashboardUserProfiles(w.g.db, body.Username, []string{body.NewProfile.Name}); err != nil {
-			http.Error(rw, "user created, but profile "+body.NewProfile.Name+" was not assigned: "+err.Error(), http.StatusInternalServerError)
-			return
-		}
-		w.bustStateCache()
+	if !w.createUserWithProfile(rw, body.Username, body.Password, body.Role, links, *body.NewProfile) {
+		return
 	}
 	writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
+}
+
+// createUser inserts the user row, or writes the error response and
+// returns false.
+func (w *webMux) createUser(rw http.ResponseWriter, username, password string, role dashboardRole, links map[string]string) bool {
+	if err := createLinkedDashboardUser(w.g.db, username, password, role, links); err != nil {
+		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
+			http.Error(rw, err.Error(), http.StatusConflict)
+			return false
+		}
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	log.Printf("dashboard auth: user %q created with role %s", username, role)
+	return true
+}
+
+// createUserWithProfile declares the profile and creates the user as
+// one step: the profile is checked first, and the user is removed
+// again if the config write fails, so a refused request leaves neither
+// behind. It writes the error response and returns false on failure.
+func (w *webMux) createUserWithProfile(rw http.ResponseWriter, username, password string, role dashboardRole, links map[string]string, req newUserProfile) bool {
+	g := w.g
+	g.configMu.Lock()
+	defer g.configMu.Unlock()
+	plan, changes, err := g.planUserProfileLocked(req)
+	if err != nil {
+		http.Error(rw, err.Error(), userProfileErrorStatus(err))
+		return false
+	}
+	if !w.createUser(rw, username, password, role, links) {
+		return false
+	}
+	err = clearOrphanCredentialSecrets(g.db, plan.clones)
+	if err == nil {
+		err = g.writeConfigFilesLocked(changes)
+	}
+	if err != nil {
+		if delErr := deleteDashboardUser(g.db, username); delErr != nil {
+			http.Error(rw, fmt.Sprintf("profile %q was not declared (%v), and removing user %q again failed: %v", req.Name, err, username, delErr), http.StatusInternalServerError)
+			return false
+		}
+		http.Error(rw, err.Error(), userProfileErrorStatus(err))
+		return false
+	}
+	log.Printf("dashboard config: profile %q declared from %q for user %q", req.Name, req.Template, username)
+	w.bustStateCache()
+	if err := assignNewProfile(g.db, username, req.Name); err != nil {
+		http.Error(rw, fmt.Sprintf("user %q and profile %q were created, but the profile was not assigned (%v): tick it on the user's row", username, req.Name, err), http.StatusInternalServerError)
+		return false
+	}
+	return true
 }
 
 func userProfileErrorStatus(err error) int {

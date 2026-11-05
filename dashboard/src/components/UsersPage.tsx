@@ -256,7 +256,8 @@ function CreateUserForm({
         {withProfile && canCreateProfile && (
           <div className="basis-full text-xs text-text-muted">
             Credentials only {chosenTemplate} uses get an empty copy that the new user fills in;
-            credentials shared with other profiles are reused.
+            credentials shared with other profiles are reused. Rules written for {chosenTemplate} or
+            its own credentials are not copied.
           </div>
         )}
         {err && <div className="basis-full text-xs text-danger-500">{err}</div>}

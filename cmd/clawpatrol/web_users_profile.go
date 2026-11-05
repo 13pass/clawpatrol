@@ -1,8 +1,10 @@
 package main
 
 import (
+	"database/sql"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
+	"github.com/zclconf/go-cty/cty"
 )
 
 // newUserProfile asks /api/users/create to also declare a profile for
@@ -25,43 +28,52 @@ var (
 	errUserProfileConflict = errors.New("profile conflict")
 )
 
+// userProfilePlan is a profile ready to declare: the HCL to append and
+// the credentials it clones.
+type userProfilePlan struct {
+	snippet string
+	clones  []string
+}
+
 // planUserProfile returns the HCL declaring profile req.Name with the
 // template's credentials. A credential only the template uses is the
 // template owner's own: it is cloned under a name for the new profile,
 // and its secret starts empty for the new owner to fill. A credential
-// other profiles use too is shared as is.
-func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserProfile) (string, error) {
+// other profiles use too is shared as is. Rules that name the template
+// profile or its credentials are not copied.
+func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserProfile) (userProfilePlan, error) {
 	if !validDashboardUsername(req.Name) {
-		return "", fmt.Errorf("%w: profile name must match %s", errUserProfileInvalid, dashboardUsernameRe)
+		return userProfilePlan{}, fmt.Errorf("%w: profile name must match %s", errUserProfileInvalid, dashboardUsernameRe)
 	}
 	if policy == nil {
-		return "", fmt.Errorf("%w: no config is loaded", errUserProfileInvalid)
+		return userProfilePlan{}, fmt.Errorf("%w: no config is loaded", errUserProfileInvalid)
 	}
 	if policy.Profiles[req.Name] != nil {
-		return "", fmt.Errorf("%w: profile %q is already declared", errUserProfileConflict, req.Name)
+		return userProfilePlan{}, fmt.Errorf("%w: profile %q is already declared", errUserProfileConflict, req.Name)
 	}
 	template := policy.Profiles[req.Template]
 	if template == nil {
-		return "", fmt.Errorf("%w: template profile %q is not declared", errUserProfileInvalid, req.Template)
+		return userProfilePlan{}, fmt.Errorf("%w: template profile %q is not declared", errUserProfileInvalid, req.Template)
 	}
 
 	blocks, err := configTopLevelBlocks(cfgPath)
 	if err != nil {
-		return "", err
+		return userProfilePlan{}, err
 	}
 	templateBlock := blocks.find("profile", req.Template)
 	if templateBlock == nil {
-		return "", fmt.Errorf("%w: profile %q is not in the config files", errUserProfileInvalid, req.Template)
+		return userProfilePlan{}, fmt.Errorf("%w: profile %q is not in the config files", errUserProfileInvalid, req.Template)
 	}
 	if profileHasInlineCredentials(templateBlock) {
-		return "", fmt.Errorf("%w: profile %q sets per-credential options inline; declare the new profile by hand", errUserProfileInvalid, req.Template)
+		return userProfilePlan{}, fmt.Errorf("%w: profile %q sets per-credential options inline; declare the new profile by hand", errUserProfileInvalid, req.Template)
 	}
 
 	users := credentialProfileCounts(policy)
 	out := hclwrite.NewEmptyFile()
 	body := out.Body()
 	body.AppendUnstructuredTokens(commentTokens(fmt.Sprintf("Profile %q, created on the dashboard from profile %q.", req.Name, req.Template)))
-	var refs []string
+	var refs, clones []string
+	cloned := map[string]string{}
 	for _, ent := range template.Credentials {
 		sym := ent.Symbol
 		if users[sym.Name] > 1 {
@@ -69,23 +81,28 @@ func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserP
 			continue
 		}
 		clone := cloneCredentialName(sym.Name, req.Template, req.Name)
+		if other, ok := cloned[clone]; ok {
+			return userProfilePlan{}, fmt.Errorf("%w: credentials %q and %q would both be copied as %q", errUserProfileConflict, other, sym.Name, clone)
+		}
+		cloned[clone] = sym.Name
 		if policy.Credentials[clone] != nil {
-			return "", fmt.Errorf("%w: credential %q is already declared", errUserProfileConflict, clone)
+			return userProfilePlan{}, fmt.Errorf("%w: credential %q is already declared", errUserProfileConflict, clone)
 		}
 		src := blocks.find("credential", sym.Type, sym.Name)
 		if src == nil {
-			return "", fmt.Errorf("%w: credential %q is not in the config files", errUserProfileInvalid, sym.Name)
+			return userProfilePlan{}, fmt.Errorf("%w: credential %q is not in the config files", errUserProfileInvalid, sym.Name)
 		}
 		dst := body.AppendNewBlock("credential", []string{sym.Type, clone})
-		dst.Body().AppendUnstructuredTokens(trimLeadingNewlines(src.Body().BuildTokens(nil)))
+		dst.Body().AppendUnstructuredTokens(blockBodyLines(src.Body().BuildTokens(nil)))
 		refs = append(refs, sym.Type+"."+clone)
+		clones = append(clones, clone)
 	}
 	profile := body.AppendNewBlock("profile", []string{req.Name})
-	profile.Body().SetAttributeRaw("credentials", referenceListTokens(refs))
+	config.SetIdentList(profile.Body(), "credentials", refs)
 	if template.HITLAsyncGrants {
-		profile.Body().SetAttributeRaw("hitl_async_grants", hclwrite.Tokens{{Type: hclsyntax.TokenIdent, Bytes: []byte("true")}})
+		profile.Body().SetAttributeValue("hitl_async_grants", cty.True)
 	}
-	return string(hclwrite.Format(out.Bytes())), nil
+	return userProfilePlan{snippet: string(hclwrite.Format(out.Bytes())), clones: clones}, nil
 }
 
 // cloneCredentialName names the new profile's copy of a template
@@ -127,29 +144,17 @@ func profileHasInlineCredentials(b *hclwrite.Block) bool {
 	return false
 }
 
-// trimLeadingNewlines drops the newline a block body starts with; the
-// new block already opens on its own line.
-func trimLeadingNewlines(toks hclwrite.Tokens) hclwrite.Tokens {
+// blockBodyLines returns a block body's tokens as whole lines: without
+// the newline the body starts with (the new block already opens on its
+// own line) and ending in one, which a one-line source block lacks.
+func blockBodyLines(toks hclwrite.Tokens) hclwrite.Tokens {
 	for len(toks) > 0 && toks[0].Type == hclsyntax.TokenNewline {
 		toks = toks[1:]
 	}
-	return toks
-}
-
-func referenceListTokens(refs []string) hclwrite.Tokens {
-	toks := hclwrite.Tokens{{Type: hclsyntax.TokenOBrack, Bytes: []byte("[")}}
-	for i, ref := range refs {
-		if i > 0 {
-			toks = append(toks, &hclwrite.Token{Type: hclsyntax.TokenComma, Bytes: []byte(",")})
-		}
-		for j, part := range strings.Split(ref, ".") {
-			if j > 0 {
-				toks = append(toks, &hclwrite.Token{Type: hclsyntax.TokenDot, Bytes: []byte(".")})
-			}
-			toks = append(toks, &hclwrite.Token{Type: hclsyntax.TokenIdent, Bytes: []byte(part)})
-		}
+	if len(toks) > 0 && toks[len(toks)-1].Type != hclsyntax.TokenNewline {
+		toks = append(toks, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
 	}
-	return append(toks, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")})
+	return toks
 }
 
 func commentTokens(text string) hclwrite.Tokens {
@@ -170,50 +175,72 @@ func (bs configBlocks) find(typeName string, labels ...string) *hclwrite.Block {
 // configTopLevelBlocks parses every file the config loads, in load
 // order, and returns their top-level blocks.
 func configTopLevelBlocks(cfgPath string) (configBlocks, error) {
-	files, err := configFiles(cfgPath)
-	if err != nil {
-		return nil, err
-	}
-	dir := filepath.Dir(cfgPath)
+	dir, names := filepath.Dir(cfgPath), []string{filepath.Base(cfgPath)}
 	if configIsDir(cfgPath) {
+		var err error
+		if names, err = config.DirFileNames(cfgPath); err != nil {
+			return nil, err
+		}
 		dir = cfgPath
 	}
 	var out configBlocks
-	for _, f := range files {
-		src, err := os.ReadFile(filepath.Join(dir, f.Name))
+	for _, name := range names {
+		src, err := os.ReadFile(filepath.Join(dir, name))
 		if err != nil {
 			return nil, err
 		}
-		parsed, diags := hclwrite.ParseConfig(src, f.Name, hcl.InitialPos)
+		parsed, diags := hclwrite.ParseConfig(src, name, hcl.InitialPos)
 		if diags.HasErrors() {
-			return nil, fmt.Errorf("parse %s: %s", f.Name, diags.Error())
+			return nil, fmt.Errorf("parse %s: %s", name, diags.Error())
 		}
 		out = append(out, parsed.Body().Blocks()...)
 	}
 	return out, nil
 }
 
-// applyUserProfileLocked declares the profile in the dashboard's config
-// file and reloads. g.configMu must be held.
-func (g *Gateway) applyUserProfileLocked(req newUserProfile) error {
+// planUserProfileLocked checks req and returns the config change that
+// declares it, without writing anything. g.configMu must be held until
+// the change is written, so the plan cannot go stale.
+func (g *Gateway) planUserProfileLocked(req newUserProfile) (userProfilePlan, []configChange, error) {
 	if !g.cfg.Load().DashboardConfigWrites() {
-		return fmt.Errorf("%w: dashboard config writes are disabled (gateway.dashboard_config_writes)", errUserProfileInvalid)
+		return userProfilePlan{}, nil, fmt.Errorf("%w: dashboard config writes are disabled (gateway.dashboard_config_writes)", errUserProfileInvalid)
 	}
-	snippet, err := planUserProfile(g.cfgPath, g.Policy(), req)
+	plan, err := planUserProfile(g.cfgPath, g.Policy(), req)
 	if err != nil {
-		return err
+		return userProfilePlan{}, nil, err
 	}
 	target, targetPath, err := resolveConfigFile(g.cfgPath, "")
 	if err != nil {
-		return err
+		return userProfilePlan{}, nil, err
 	}
 	current, err := readConfigFileOrEmpty(targetPath)
 	if err != nil {
-		return err
+		return userProfilePlan{}, nil, err
 	}
-	changes, err := planConfigAppend(g.cfgPath, target, current, snippet)
+	changes, err := planConfigAppend(g.cfgPath, target, current, plan.snippet)
 	if err != nil {
-		return err
+		return userProfilePlan{}, nil, err
 	}
-	return g.writeConfigFilesLocked(changes)
+	return plan, changes, nil
+}
+
+// clearOrphanCredentialSecrets drops secrets still stored under names
+// the plan is about to declare. Those names are undeclared, so the
+// rows are left over from an earlier config; the new credentials must
+// start empty, not inherit another person's token.
+func clearOrphanCredentialSecrets(db *sql.DB, names []string) error {
+	for _, name := range names {
+		_, found, err := readCredentialSecrets(db, name)
+		if err != nil {
+			return err
+		}
+		if !found {
+			continue
+		}
+		if err := clearCredentialSecrets(db, name); err != nil {
+			return err
+		}
+		log.Printf("dashboard config: cleared the stored secret left under undeclared credential %q", name)
+	}
+	return nil
 }

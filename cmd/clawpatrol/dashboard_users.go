@@ -450,6 +450,27 @@ func setDashboardUserProfiles(db *sql.DB, username string, profiles []string) er
 	return tx.Commit()
 }
 
+// assignNewProfile makes username the only owner of a profile that was
+// just declared. Rows naming it for other users are left over from an
+// earlier profile of the same name and would hand them the new one.
+func assignNewProfile(db *sql.DB, username, profile string) error {
+	if db == nil {
+		return fmt.Errorf("no db")
+	}
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err := tx.Exec(`DELETE FROM dashboard_user_profiles WHERE profile = ?`, profile); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`INSERT INTO dashboard_user_profiles (username, profile) VALUES (?, ?)`, username, profile); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // setDashboardUserApprover sets the approver username's "require
 // approval" rules route to; "" means the dashboard only.
 func setDashboardUserApprover(db *sql.DB, username, approver string) error {
