@@ -1,6 +1,11 @@
 import { useEffect, useState } from "react";
 import { decideHITL, getHITLPending, type HITLPending, type HITLResolveResult } from "../lib/api";
+import { headersToJSON } from "../lib/clipboard";
+import { fmtDateTime } from "../lib/format";
 import { Button } from "./Button";
+import { CopyButton } from "./CopyButton";
+import { Modal } from "./Modal";
+import { Headers, Section } from "./RequestDetailPage";
 
 // agentIP, when set, scopes the bar to a single device's pending
 // approvals (used on the device page); unset shows every device's
@@ -86,10 +91,16 @@ function PendingCard({
     item.approval_effect === "create_retry_grant" || item.operation_state === "pending_approval"
       ? "approve retry"
       : "approve";
+  const [detailsOpen, setDetailsOpen] = useState(false);
+  const deny = () => onDecide(item.id, false, `Deny this request?\n\n${target}`);
+  const approve = () => {
+    const cap = approveLabel.charAt(0).toUpperCase() + approveLabel.slice(1);
+    onDecide(item.id, true, `${cap}?\n\n${target}`);
+  };
 
   return (
     <div className="border-l-4 border-butter-400 bg-canvas border-y border-r border-navy overflow-hidden">
-      <div className="px-4 py-3 flex items-center gap-3 min-w-0">
+      <div className="px-4 py-3 flex flex-wrap items-center gap-3 min-w-0">
         {/* status badge */}
         <div className="flex items-center gap-1.5 shrink-0">
           <span className="w-2 h-2 rounded-full bg-butter-400 animate-pulse" />
@@ -107,23 +118,25 @@ function PendingCard({
           {item.path}
         </span>
         {/* actions */}
-        <div className="flex gap-1.5 shrink-0">
-          <Button
-            variant="outline"
-            onClick={() => onDecide(item.id, false, `Deny this request?\n\n${target}`)}
-          >
+        <div className="flex gap-1.5 shrink-0 ml-auto">
+          <Button variant="outline" onClick={() => setDetailsOpen(true)}>
+            check details
+          </Button>
+          <Button variant="outline" onClick={deny}>
             deny
           </Button>
-          <Button
-            onClick={() => {
-              const cap = approveLabel.charAt(0).toUpperCase() + approveLabel.slice(1);
-              onDecide(item.id, true, `${cap}?\n\n${target}`);
-            }}
-          >
-            {approveLabel}
-          </Button>
+          <Button onClick={approve}>{approveLabel}</Button>
         </div>
       </div>
+      {detailsOpen && (
+        <HITLDetailsModal
+          item={item}
+          approveLabel={approveLabel}
+          onDeny={deny}
+          onApprove={approve}
+          onClose={() => setDetailsOpen(false)}
+        />
+      )}
       {(item.body_sample || item.ua || item.reason) && (
         <div className="px-4 pb-2.5 pt-1.5 border-t border-canvas-muted space-y-0.5">
           {item.body_sample && (
@@ -141,6 +154,110 @@ function PendingCard({
         </div>
       )}
     </div>
+  );
+}
+
+// HITLDetailsModal shows the full request behind a pending approval:
+// method and URL, who asked and why, the headers as the agent sent
+// them (credentials masked server-side) and the body.
+function HITLDetailsModal({
+  item,
+  approveLabel,
+  onDeny,
+  onApprove,
+  onClose,
+}: {
+  item: HITLPending;
+  approveLabel: string;
+  onDeny: () => void;
+  onApprove: () => void;
+  onClose: () => void;
+}) {
+  const isHTTP = !item.family || item.family === "http" || item.family === "https";
+  const ep = item.endpoint || item.host;
+  const sep = item.path && !item.path.startsWith("/") ? " " : "";
+  const url = isHTTP ? `https://${item.host}${item.path}` : `${ep}${sep}${item.path}`;
+  const headers = item.headers ?? {};
+  const hasHeaders = Object.keys(headers).length > 0;
+  // Go's zero time: the approval has no enforced deadline.
+  const hasExpiry = !!item.expires_at && !item.expires_at.startsWith("0001-");
+
+  return (
+    <Modal title="Request awaiting approval" subtitle={item.reason} size="lg" onClose={onClose}>
+      <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-canvas-dark">
+        <div className="px-4 py-3 space-y-2">
+          <div className="font-mono text-sm text-text break-all">
+            <span className="font-semibold text-text-muted mr-2">{item.method}</span>
+            {url}
+          </div>
+          <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-muted">
+            {item.profile && (
+              <span>
+                profile <span className="font-mono text-text">{item.profile}</span>
+              </span>
+            )}
+            {item.agent_ip && (
+              <span>
+                device <span className="font-mono text-text">{item.agent_ip}</span>
+              </span>
+            )}
+            {item.rule && (
+              <span>
+                rule <span className="font-mono text-text">{item.rule}</span>
+              </span>
+            )}
+            <span>requested {fmtDateTime(item.created_at)}</span>
+            {hasExpiry && <span>expires {fmtDateTime(item.expires_at)}</span>}
+          </div>
+          {item.approval_message && (
+            <div className="text-xs text-text-muted">{item.approval_message}</div>
+          )}
+        </div>
+        {hasHeaders && (
+          <Section
+            title="Request headers"
+            action={<CopyButton label="request headers" text={() => headersToJSON(headers)} />}
+          >
+            <Headers obj={headers} />
+          </Section>
+        )}
+        {item.body_sample && (
+          <Section
+            title="Request body"
+            action={<CopyButton label="request body" text={() => item.body_sample ?? ""} />}
+          >
+            <ApprovalBody text={item.body_sample} />
+          </Section>
+        )}
+        {!hasHeaders && !item.body_sample && (
+          <div className="px-4 py-3 text-xs text-text-subtle">No headers or body captured</div>
+        )}
+      </div>
+      <div className="flex justify-end gap-1.5 px-4 py-3 border-t border-navy">
+        <Button variant="outline" onClick={onDeny}>
+          deny
+        </Button>
+        <Button onClick={onApprove}>{approveLabel}</Button>
+      </div>
+    </Modal>
+  );
+}
+
+// ApprovalBody pretty-prints a body only when it is complete JSON. The
+// request log's viewer repairs a cut-off JSON body, which would hide
+// bytes from someone deciding whether to send it, so anything else is
+// shown verbatim.
+function ApprovalBody({ text }: { text: string }) {
+  let shown = text;
+  try {
+    shown = JSON.stringify(JSON.parse(text), null, 2);
+  } catch {
+    /* not complete JSON: show it as sent */
+  }
+  return (
+    <pre className="overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-xs text-text-muted">
+      {shown}
+    </pre>
   );
 }
 

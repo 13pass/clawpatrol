@@ -650,10 +650,16 @@ func devSeedAddHITL(g *Gateway, r *rand.Rand, devices []devSeedDevice, n int) st
 			Family:     "https",
 			UA:         p.ua,
 			BodySample: p.body,
-			Reason:     p.reason,
-			Approvers:  []string{"ops"},
-			CreatedAt:  time.Now().Add(-time.Duration(r.Intn(30)) * time.Minute),
-			ExpiresAt:  time.Now().Add(time.Duration(20+r.Intn(60)) * time.Minute),
+			Headers: map[string]string{
+				"Accept":        "application/json",
+				"Authorization": "***",
+				"Content-Type":  "application/json",
+				"User-Agent":    p.ua,
+			},
+			Reason:    p.reason,
+			Approvers: []string{"ops"},
+			CreatedAt: time.Now().Add(-time.Duration(r.Intn(30)) * time.Minute),
+			ExpiresAt: time.Now().Add(time.Duration(20+r.Intn(60)) * time.Minute),
 		})
 		last = id
 	}

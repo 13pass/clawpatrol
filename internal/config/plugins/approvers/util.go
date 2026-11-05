@@ -39,6 +39,9 @@ func buildPending(req runtime.ApproveRequest) runtime.HITLPending {
 	if req.Rule != nil {
 		pending.Rule = req.Rule.Name
 	}
+	if req.Request != nil {
+		pending.Headers = runtime.MaskedHeaders(req.Request.Headers)
+	}
 	runtime.NormalizeHITLPendingApproval(&pending)
 	return pending
 }

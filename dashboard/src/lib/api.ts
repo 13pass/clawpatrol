@@ -398,7 +398,12 @@ export type HITLPending = {
   family?: string;
   ua?: string;
   body_sample?: string;
+  // Request headers as the agent sent them, sensitive values masked
+  // server-side as "***".
+  headers?: Record<string, string>;
   reason?: string;
+  profile?: string;
+  rule?: string;
   created_at: string;
   expires_at: string;
 };
