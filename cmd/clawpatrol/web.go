@@ -3425,12 +3425,10 @@ func flatHeaders(h http.Header) map[string]string {
 }
 
 func flatHeadersRedacted(h http.Header, redactions []string) map[string]string {
-	out := make(map[string]string, len(h))
-	for k, v := range h {
-		if runtime.IsSensitiveHeader(k) {
-			out[k] = "***"
-		} else {
-			out[k] = redactCredentialSample(strings.Join(v, ", "), redactions)
+	out := runtime.MaskedHeaders(h)
+	for k, v := range out {
+		if !runtime.IsSensitiveHeader(k) {
+			out[k] = redactCredentialSample(v, redactions)
 		}
 	}
 	return out

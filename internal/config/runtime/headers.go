@@ -19,17 +19,17 @@ func IsSensitiveHeader(name string) bool {
 	return sensitiveHeaderRe.MatchString(name)
 }
 
+// MaskedValue replaces the value of every sensitive header shown to a
+// human.
+const MaskedValue = "***"
+
 // MaskedHeaders flattens h for display, joining repeated values with
-// ", " and replacing sensitive values with "***". Returns nil when h
-// is empty.
+// ", " and replacing sensitive values with MaskedValue.
 func MaskedHeaders(h http.Header) map[string]string {
-	if len(h) == 0 {
-		return nil
-	}
 	out := make(map[string]string, len(h))
 	for name, values := range h {
 		if IsSensitiveHeader(name) {
-			out[name] = "***"
+			out[name] = MaskedValue
 		} else {
 			out[name] = strings.Join(values, ", ")
 		}

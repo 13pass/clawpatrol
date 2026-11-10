@@ -487,7 +487,7 @@ func devSeedAction(r *rand.Rand, devices []devSeedDevice, ts time.Time) Event {
 		ev.ReqHeaders = map[string]string{
 			"Content-Type":  "application/json",
 			"User-Agent":    "clawpatrol/0.1 anthropic-sdk/0.55",
-			"Authorization": "***",
+			"Authorization": runtime.MaskedValue,
 		}
 		ev.RespHeaders = map[string]string{
 			"Content-Type":      "application/json",
@@ -652,7 +652,7 @@ func devSeedAddHITL(g *Gateway, r *rand.Rand, devices []devSeedDevice, n int) st
 			BodySample: p.body,
 			Headers: map[string]string{
 				"Accept":        "application/json",
-				"Authorization": "***",
+				"Authorization": runtime.MaskedValue,
 				"Content-Type":  "application/json",
 				"User-Agent":    p.ua,
 			},

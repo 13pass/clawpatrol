@@ -35,7 +35,19 @@ func TestBuildPendingWithoutRequestHasNoHeaders(t *testing.T) {
 	req := approveRequestWithHeaders(nil)
 	req.Request = nil
 
-	if got := buildPending(req).Headers; got != nil {
-		t.Fatalf("Headers = %v, want nil", got)
+	if got := buildPending(req).Headers; len(got) != 0 {
+		t.Fatalf("Headers = %v, want none", got)
+	}
+}
+
+func TestBuildPendingFlagsBodyTheApproverCannotSee(t *testing.T) {
+	req := approveRequestWithHeaders(nil)
+	req.Request.Truncated = true
+	req.BodyNotCaptured = true
+
+	got := buildPending(req)
+
+	if !got.BodyTruncated || !got.BodyNotCaptured {
+		t.Fatalf("BodyTruncated = %v, BodyNotCaptured = %v, want both true", got.BodyTruncated, got.BodyNotCaptured)
 	}
 }

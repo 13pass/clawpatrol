@@ -2925,9 +2925,10 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					asyncSyncWait = start.SyncWaitTimeout
 				}
 			}
+			bodyNotCaptured := matchBody == nil && req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0
 			v := g.runApproveChain(req.Context(), cr.Outcome.Approve, runApproveCtx{
 				AgentIP: agentAddr, Host: host, Method: req.Method, Path: req.URL.RequestURI(),
-				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), Reason: cr.Outcome.Reason,
+				UA: req.Header.Get("User-Agent"), BodySample: string(matchBody), BodyNotCaptured: bodyNotCaptured, Reason: cr.Outcome.Reason,
 				Endpoint: ep, Rule: cr, Profile: profile, Request: mreq,
 				AsyncOperationID: asyncOp.ID, AsyncPendingOnSyncTimeout: asyncOp.ID != "", AsyncSyncWaitTimeout: asyncSyncWait,
 			})
@@ -3395,6 +3396,7 @@ type runApproveCtx struct {
 	Path                      string
 	UA                        string
 	BodySample                string
+	BodyNotCaptured           bool
 	Reason                    string
 	Endpoint                  *config.CompiledEndpoint
 	Rule                      *config.CompiledRule
@@ -3458,6 +3460,7 @@ func (g *Gateway) runApproveChain(ctx context.Context, stages []config.ApproveSt
 			Path:                      c.Path,
 			UA:                        c.UA,
 			BodySample:                c.BodySample,
+			BodyNotCaptured:           c.BodyNotCaptured,
 			Reason:                    c.Reason,
 			AsyncOperationID:          c.AsyncOperationID,
 			AsyncPendingOnSyncTimeout: c.AsyncPendingOnSyncTimeout,

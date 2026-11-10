@@ -1,4 +1,12 @@
-import { useEffect, useState } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type Dispatch,
+  type ReactNode,
+  type SetStateAction,
+} from "react";
 import { decideHITL, getHITLPending, type HITLPending, type HITLResolveResult } from "../lib/api";
 import { headersToJSON } from "../lib/clipboard";
 import { fmtDateTime } from "../lib/format";
@@ -7,55 +15,84 @@ import { CopyButton } from "./CopyButton";
 import { Modal } from "./Modal";
 import { Headers, Section } from "./RequestDetailPage";
 
+const POLL_MS = 1000;
+// How long a card stays up after its request leaves the pool.
+const FLASH_MS = 2500;
+
+type Outcome = "approved" | "denied" | "gone";
+type Resolved = { item: HITLPending; outcome: Outcome };
+type DecideFn = (item: HITLPending, allow: boolean) => void;
+
 // agentIP, when set, scopes the bar to a single device's pending
 // approvals (used on the device page); unset shows every device's
 // (the home page).
 export function HITLBar({ agentIP }: { agentIP?: string } = {}) {
   const [pending, setPending] = useState<HITLPending[]>([]);
-  const [justResolved, setJustResolved] = useState<HITLPending[]>([]);
+  const [resolved, setResolved] = useState<Resolved[]>([]);
   const [notice, setNotice] = useState("");
+  // The request open in the details dialog. It is kept after the
+  // request leaves the pool so the dialog can say so instead of
+  // vanishing under the reader.
+  const [details, setDetails] = useState<HITLPending | null>(null);
+  // The poller compares against the last list it showed to spot
+  // requests decided elsewhere, timed out or abandoned, and skips the
+  // ones decided here so an in-flight poll cannot bring them back.
+  const shown = useRef<HITLPending[]>([]);
+  const decided = useRef(new Set<string>());
 
   useEffect(() => {
-    let cancelled = false;
+    const stopped = new AbortController();
     async function tick() {
       try {
         const r = await getHITLPending();
-        if (!cancelled) {
-          const incoming = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
-          // Detect >0 → 0 transition: briefly flash green "Approved" cards.
-          setPending((prev) => {
-            if (prev.length > 0 && incoming.length === 0) {
-              setJustResolved(prev);
-              setTimeout(() => setJustResolved([]), 2500);
-            }
-            return incoming;
-          });
-        }
+        if (stopped.signal.aborted) return;
+        const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
+        const live = new Set(scoped.map((p) => p.id));
+        for (const id of decided.current) if (!live.has(id)) decided.current.delete(id);
+        const incoming = scoped.filter((p) => !decided.current.has(p.id));
+        const ids = new Set(incoming.map((p) => p.id));
+        const gone = shown.current.filter((p) => !ids.has(p.id));
+        shown.current = incoming;
+        setPending(incoming);
+        flash(setResolved, gone, "gone");
       } catch {
         /* ignore transient */
       }
     }
     tick();
-    const t = setInterval(tick, 1000);
+    const t = setInterval(tick, POLL_MS);
     return () => {
-      cancelled = true;
+      stopped.abort();
       clearInterval(t);
+      // A new agentIP scope starts empty, not with the old scope's cards.
+      shown.current = [];
     };
   }, [agentIP]);
 
-  async function decide(id: string, allow: boolean, confirmMsg: string) {
-    if (!confirm(confirmMsg)) return;
+  async function decide(item: HITLPending, allow: boolean) {
+    const label = approveLabel(item);
+    const question = allow
+      ? `${label.charAt(0).toUpperCase() + label.slice(1)}?`
+      : "Deny this request?";
+    if (!confirm(`${question}\n\n${item.method} ${hitlTarget(item)}`)) return;
+    setDetails((d) => (d?.id === item.id ? null : d));
     setNotice("");
-    setPending((p) => p.filter((x) => x.id !== id));
+    decided.current.add(item.id);
+    shown.current = shown.current.filter((x) => x.id !== item.id);
+    setPending((p) => p.filter((x) => x.id !== item.id));
     try {
-      const result = await decideHITL(id, allow);
-      if (!result.ok) setNotice(hitlDecisionNotice(result));
+      const result = await decideHITL(item.id, allow);
+      if (result.ok) flash(setResolved, [item], allow ? "approved" : "denied");
+      else setNotice(hitlDecisionNotice(result));
     } catch (e: any) {
+      decided.current.delete(item.id);
       setNotice("HITL decision failed: " + (e?.message ?? e));
     }
   }
 
-  if (pending.length === 0 && justResolved.length === 0 && !notice) return null;
+  if (pending.length === 0 && resolved.length === 0 && !notice && !details) return null;
+
+  const liveDetails = details && pending.find((p) => p.id === details.id);
 
   return (
     <div className="space-y-1.5">
@@ -64,39 +101,69 @@ export function HITLBar({ agentIP }: { agentIP?: string } = {}) {
           {notice}
         </div>
       )}
-      {justResolved.map((r) => (
-        <ResolvedCard key={r.id} item={r} />
+      {resolved.map((r) => (
+        <ResolvedCard key={r.item.id} item={r.item} outcome={r.outcome} />
       ))}
       {pending.map((p) => (
-        <PendingCard key={p.id} item={p} onDecide={decide} />
+        <PendingCard key={p.id} item={p} onDecide={decide} onDetails={() => setDetails(p)} />
       ))}
+      {details && (
+        <HITLDetailsModal
+          item={liveDetails ?? details}
+          decidable={!!liveDetails}
+          onDecide={decide}
+          onClose={() => setDetails(null)}
+        />
+      )}
     </div>
   );
+}
+
+// flash shows items as resolved cards for FLASH_MS.
+function flash(
+  setResolved: Dispatch<SetStateAction<Resolved[]>>,
+  items: HITLPending[],
+  outcome: Outcome,
+) {
+  if (items.length === 0) return;
+  const ids = new Set(items.map((i) => i.id));
+  const others = (r: Resolved[]) => r.filter((x) => !ids.has(x.item.id));
+  setResolved((r) => [...others(r), ...items.map((item) => ({ item, outcome }))]);
+  setTimeout(() => setResolved(others), FLASH_MS);
+}
+
+// hitlTarget labels a request the same way on the card, in the dialog
+// and on the resolved card: the endpoint (the host when unnamed), then
+// the path, or the query / resource for SQL and k8s.
+function hitlTarget(item: HITLPending): string {
+  const ep = item.endpoint || item.host;
+  const sep = item.path && !item.path.startsWith("/") ? " " : "";
+  return `${ep}${sep}${item.path}`;
+}
+
+function isRetryApproval(item: HITLPending): boolean {
+  return (
+    item.approval_effect === "create_retry_grant" || item.operation_state === "pending_approval"
+  );
+}
+
+// Verb matches the Slack "Approve" button and the "approved" status
+// badge — the dashboard previously said "allow" here, which read as
+// a different action from the same decision shown elsewhere.
+function approveLabel(item: HITLPending): string {
+  return isRetryApproval(item) ? "approve retry" : "approve";
 }
 
 function PendingCard({
   item,
   onDecide,
+  onDetails,
 }: {
   item: HITLPending;
-  onDecide: (id: string, allow: boolean, msg: string) => void;
+  onDecide: DecideFn;
+  onDetails: () => void;
 }) {
-  const ep = item.endpoint || item.host;
-  const sep = item.path && !item.path.startsWith("/") ? " " : "";
-  const target = `${item.method} ${ep}${sep}${item.path}`;
-  // Verb matches the Slack "Approve" button and the "approved" status
-  // badge — the dashboard previously said "allow" here, which read as
-  // a different action from the same decision shown elsewhere.
-  const approveLabel =
-    item.approval_effect === "create_retry_grant" || item.operation_state === "pending_approval"
-      ? "approve retry"
-      : "approve";
-  const [detailsOpen, setDetailsOpen] = useState(false);
-  const deny = () => onDecide(item.id, false, `Deny this request?\n\n${target}`);
-  const approve = () => {
-    const cap = approveLabel.charAt(0).toUpperCase() + approveLabel.slice(1);
-    onDecide(item.id, true, `${cap}?\n\n${target}`);
-  };
+  const target = hitlTarget(item);
 
   return (
     <div className="border-l-4 border-butter-400 bg-canvas border-y border-r border-navy overflow-hidden">
@@ -112,31 +179,23 @@ function PendingCard({
         <span className="font-mono text-xs font-semibold text-text-muted shrink-0">
           {item.method}
         </span>
-        <span className="font-mono text-xs text-text truncate flex-1 min-w-0" title={target}>
-          {ep}
-          {sep}
-          {item.path}
+        <span
+          className="font-mono text-xs text-text truncate flex-1 min-w-0"
+          title={`${item.method} ${target}`}
+        >
+          {target}
         </span>
         {/* actions */}
         <div className="flex gap-1.5 shrink-0 ml-auto">
-          <Button variant="outline" onClick={() => setDetailsOpen(true)}>
+          <Button variant="outline" onClick={onDetails}>
             check details
           </Button>
-          <Button variant="outline" onClick={deny}>
+          <Button variant="outline" onClick={() => onDecide(item, false)}>
             deny
           </Button>
-          <Button onClick={approve}>{approveLabel}</Button>
+          <Button onClick={() => onDecide(item, true)}>{approveLabel(item)}</Button>
         </div>
       </div>
-      {detailsOpen && (
-        <HITLDetailsModal
-          item={item}
-          approveLabel={approveLabel}
-          onDeny={deny}
-          onApprove={approve}
-          onClose={() => setDetailsOpen(false)}
-        />
-      )}
       {(item.body_sample || item.ua || item.reason) && (
         <div className="px-4 pb-2.5 pt-1.5 border-t border-canvas-muted space-y-0.5">
           {item.body_sample && (
@@ -158,39 +217,48 @@ function PendingCard({
 }
 
 // HITLDetailsModal shows the full request behind a pending approval:
-// method and URL, who asked and why, the headers as the agent sent
-// them (credentials masked server-side) and the body.
+// what is called, who asked and why, the headers as the agent sent
+// them (credentials masked server-side) and the body. Once the request
+// leaves the pool it says so and offers no decision.
 function HITLDetailsModal({
   item,
-  approveLabel,
-  onDeny,
-  onApprove,
+  decidable,
+  onDecide,
   onClose,
 }: {
   item: HITLPending;
-  approveLabel: string;
-  onDeny: () => void;
-  onApprove: () => void;
+  decidable: boolean;
+  onDecide: DecideFn;
   onClose: () => void;
 }) {
   const isHTTP = !item.family || item.family === "http" || item.family === "https";
-  const ep = item.endpoint || item.host;
-  const sep = item.path && !item.path.startsWith("/") ? " " : "";
-  const url = isHTTP ? `https://${item.host}${item.path}` : `${ep}${sep}${item.path}`;
+  const showHost = isHTTP && !!item.host && item.host !== item.endpoint;
   const headers = item.headers ?? {};
   const hasHeaders = Object.keys(headers).length > 0;
+  const hasBody = !!item.body_sample || !!item.body_not_captured;
   // Go's zero time: the approval has no enforced deadline.
   const hasExpiry = !!item.expires_at && !item.expires_at.startsWith("0001-");
 
   return (
     <Modal title="Request awaiting approval" subtitle={item.reason} size="lg" onClose={onClose}>
       <div className="flex-1 min-h-0 overflow-y-auto divide-y divide-canvas-dark">
+        {!decidable && (
+          <div className="px-4 py-2 text-xs text-rust-700 bg-canvas">
+            This request is no longer pending. It was decided elsewhere, it timed out, or the agent
+            stopped waiting.
+          </div>
+        )}
         <div className="px-4 py-3 space-y-2">
           <div className="font-mono text-sm text-text break-all">
             <span className="font-semibold text-text-muted mr-2">{item.method}</span>
-            {url}
+            {hitlTarget(item)}
           </div>
           <div className="flex flex-wrap gap-x-4 gap-y-1 text-xs text-text-muted">
+            {showHost && (
+              <span>
+                host <span className="font-mono text-text">{item.host}</span>
+              </span>
+            )}
             {item.profile && (
               <span>
                 profile <span className="font-mono text-text">{item.profile}</span>
@@ -218,67 +286,141 @@ function HITLDetailsModal({
             title="Request headers"
             action={<CopyButton label="request headers" text={() => headersToJSON(headers)} />}
           >
+            {isRetryApproval(item) && (
+              <DetailsNote>
+                Approving lets the agent send this request again once. The gateway checks that the
+                retry has the same method, URL and body. It does not check these headers.
+              </DetailsNote>
+            )}
             <Headers obj={headers} />
           </Section>
         )}
-        {item.body_sample && (
+        {hasBody && (
           <Section
             title="Request body"
-            action={<CopyButton label="request body" text={() => item.body_sample ?? ""} />}
+            action={
+              item.body_sample ? (
+                <CopyButton label="request body" text={() => item.body_sample ?? ""} />
+              ) : undefined
+            }
           >
-            <ApprovalBody text={item.body_sample} />
+            {item.body_truncated && (
+              <DetailsNote>
+                Cut at the gateway's body buffer limit. The rest goes upstream without being shown
+                here.
+              </DetailsNote>
+            )}
+            {item.body_not_captured && (
+              <DetailsNote>
+                The gateway does not capture {item.method} bodies. This request has one, and it goes
+                upstream without being shown here.
+              </DetailsNote>
+            )}
+            {item.body_sample && <ApprovalBody text={item.body_sample} />}
           </Section>
         )}
-        {!hasHeaders && !item.body_sample && (
+        {!hasHeaders && !hasBody && (
           <div className="px-4 py-3 text-xs text-text-subtle">No headers or body captured</div>
         )}
       </div>
       <div className="flex justify-end gap-1.5 px-4 py-3 border-t border-navy">
-        <Button variant="outline" onClick={onDeny}>
-          deny
-        </Button>
-        <Button onClick={onApprove}>{approveLabel}</Button>
+        {decidable ? (
+          <>
+            <Button variant="outline" onClick={() => onDecide(item, false)}>
+              deny
+            </Button>
+            <Button onClick={() => onDecide(item, true)}>{approveLabel(item)}</Button>
+          </>
+        ) : (
+          <Button variant="outline" onClick={onClose}>
+            close
+          </Button>
+        )}
       </div>
     </Modal>
   );
 }
 
-// ApprovalBody pretty-prints a body only when it is complete JSON. The
-// request log's viewer repairs a cut-off JSON body, which would hide
-// bytes from someone deciding whether to send it, so anything else is
-// shown verbatim.
+function DetailsNote({ children }: { children: ReactNode }) {
+  return <div className="px-4 pt-2 text-xs text-rust-700">{children}</div>;
+}
+
+// ApprovalBody shows the body exactly as sent. Formatting is opt-in and
+// labelled: re-serializing JSON keeps only the last of duplicate keys,
+// rounds large numbers and reorders integer-like keys, so the formatted
+// view can differ from the bytes that go upstream.
 function ApprovalBody({ text }: { text: string }) {
-  let shown = text;
-  try {
-    shown = JSON.stringify(JSON.parse(text), null, 2);
-  } catch {
-    /* not complete JSON: show it as sent */
-  }
+  const [formatted, setFormatted] = useState(false);
+  const pretty = useMemo(() => {
+    try {
+      return JSON.stringify(JSON.parse(text), null, 2);
+    } catch {
+      return null;
+    }
+  }, [text]);
+
   return (
-    <pre className="overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-xs text-text-muted">
-      {shown}
-    </pre>
+    <div>
+      {pretty !== null && (
+        <div className="flex flex-wrap items-center gap-2 px-4 pt-2 text-2xs text-text-muted">
+          <Button variant="outline" size="xs" onClick={() => setFormatted((f) => !f)}>
+            {formatted ? "show as sent" : "format JSON"}
+          </Button>
+          {formatted && (
+            <span>
+              Formatted view: duplicate keys and large numbers may differ from what is sent.
+            </span>
+          )}
+        </div>
+      )}
+      <pre className="overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-xs text-text-muted">
+        {formatted && pretty !== null ? pretty : text}
+      </pre>
+    </div>
   );
 }
 
-function ResolvedCard({ item }: { item: HITLPending }) {
-  const ep = item.endpoint || item.host;
-  const sep = item.path && !item.path.startsWith("/") ? " " : "";
+const OUTCOME_STYLE: Record<Outcome, { label: string; border: string; dot: string; text: string }> =
+  {
+    approved: {
+      label: "approved",
+      border: "border-success-500",
+      dot: "bg-success-500",
+      text: "text-success-700",
+    },
+    denied: {
+      label: "denied",
+      border: "border-rust-400",
+      dot: "bg-rust-400",
+      text: "text-rust-700",
+    },
+    gone: {
+      label: "no longer pending",
+      border: "border-navy-200",
+      dot: "bg-navy-200",
+      text: "text-text-muted",
+    },
+  };
+
+function ResolvedCard({ item, outcome }: { item: HITLPending; outcome: Outcome }) {
+  const style = OUTCOME_STYLE[outcome];
   return (
-    <div className="border-l-4 border-success-500 bg-canvas border-y border-r border-navy px-4 py-3 flex items-center gap-3 min-w-0">
+    <div
+      className={`border-l-4 ${style.border} bg-canvas border-y border-r border-navy px-4 py-3 flex items-center gap-3 min-w-0`}
+    >
       <div className="flex items-center gap-1.5 shrink-0">
-        <span className="w-2 h-2 rounded-full bg-success-500" />
-        <span className="font-mono text-2xs font-bold uppercase tracking-wider text-success-700 whitespace-nowrap">
-          approved
+        <span className={`w-2 h-2 rounded-full ${style.dot}`} />
+        <span
+          className={`font-mono text-2xs font-bold uppercase tracking-wider ${style.text} whitespace-nowrap`}
+        >
+          {style.label}
         </span>
       </div>
       <span className="font-mono text-xs font-semibold text-text-muted shrink-0">
         {item.method}
       </span>
       <span className="font-mono text-xs text-text truncate flex-1 min-w-0">
-        {ep}
-        {sep}
-        {item.path}
+        {hitlTarget(item)}
       </span>
     </div>
   );

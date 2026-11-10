@@ -14,10 +14,7 @@ import (
 // templateVarRe matches {{var}} placeholders, capturing the var name.
 var templateVarRe = regexp.MustCompile(`\{\{([^{}]+)\}\}`)
 
-const (
-	headerVarPrefix   = "http.headers."
-	maskedHeaderValue = "***"
-)
+const headerVarPrefix = "http.headers."
 
 // expandMessage substitutes {{var}} placeholders in tmpl using fields
 // from req. Supported vars:
@@ -30,7 +27,7 @@ const (
 //   - JSON body access: body_json.<field> or body_json.<a>.<b>...
 //   - Request headers: http.headers.<Name>, matched case-insensitively,
 //     multiple values joined with ", ". Headers that may carry a
-//     credential (runtime.IsSensitiveHeader) render as "***".
+//     credential (runtime.IsSensitiveHeader) render as runtime.MaskedValue.
 //
 // Substituted values pass through escape (nil means none), which
 // makes them inert in the notifier's message format; the template's
@@ -63,7 +60,7 @@ func headerVar(key string, req *match.Request) (string, bool) {
 		return "", false
 	}
 	if runtime.IsSensitiveHeader(name) {
-		return maskedHeaderValue, true
+		return runtime.MaskedValue, true
 	}
 	return strings.Join(values, ", "), true
 }
