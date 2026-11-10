@@ -92,7 +92,9 @@ func (g *Gateway) maybeStartAsyncHITLOperation(ctx context.Context, in hitlAsync
 	if syncWait <= 0 {
 		return hitlAsyncOperationStart{}, false, nil
 	}
-	if in.Approver.HITLAsyncFingerprintBody() != config.HITLAsyncFingerprintRawBody || in.Truncated || int64(len(in.RawBody)) > in.Approver.HITLAsyncMaxBodyBytes() {
+	// A body that was cut or never buffered cannot be fingerprinted, and
+	// the retry (which is buffered) would never match the grant.
+	if in.Approver.HITLAsyncFingerprintBody() != config.HITLAsyncFingerprintRawBody || in.Truncated || in.MatchReq.BodyNotCaptured || int64(len(in.RawBody)) > in.Approver.HITLAsyncMaxBodyBytes() {
 		return hitlAsyncOperationStart{}, false, nil
 	}
 	key, err := loadOrCreateHITLFingerprintKey(ctx, g.db)
