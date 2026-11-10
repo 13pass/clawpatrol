@@ -43,7 +43,7 @@ Endpoints below that may park a request for human approval: admin, deploy, relea
 
 Some gated endpoints do not hold your connection forever. Each such endpoint has a synchronous wait window (its sync_wait_timeout, listed per endpoint below): if a human has not decided within that window, the gateway stops holding the connection and answers with HTTP 202 Accepted. A 202 is NOT success and NOT failure — it means "parked for human approval, continuing asynchronously." Do not treat it as either; switch to polling.
 
-A request whose body the gateway cannot bind to an approval stays synchronous, with no 202: a body over the approver's async size limit, a body cut off while being read, or a body on a method other than POST, PUT or PATCH (the gateway does not read those). The connection is then held until a human decides or the approval times out.
+A request whose body the gateway cannot bind to an approval stays synchronous, with no 202: a body larger than the gateway's body buffer limit, a body over the approver's async size limit, a body whose read failed, or a body on a method other than POST, PUT or PATCH (the gateway does not read those). Both limits are gateway settings. The connection is then held until a human decides or the approval times out.
 
 The 202 body is JSON describing the parked operation. The fields you act on:
 - operation_id: the parked operation's id.

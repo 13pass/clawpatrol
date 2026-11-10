@@ -18,7 +18,10 @@ import { Headers, Section } from "./RequestDetailPage";
 const POLL_MS = 1000;
 // A poll that has not answered by then is abandoned, so one hung
 // request cannot stop the bar from polling.
-const POLL_TIMEOUT_MS = 3000;
+const POLL_TIMEOUT_MS = 5000;
+// After this many failed polls in a row the bar says its list may be
+// out of date, until a poll succeeds.
+const STALE_AFTER_FAILURES = 3;
 // How long a card stays up after its request leaves the pool.
 const FLASH_MS = 2500;
 
@@ -38,6 +41,7 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   const [pending, setPending] = useState<HITLPending[]>([]);
   const [resolved, setResolved] = useState<Resolved[]>([]);
   const [notice, setNotice] = useState("");
+  const [stale, setStale] = useState(false);
   // The request open in the details dialog. It is kept after the
   // request leaves the pool so the dialog can say so instead of
   // vanishing under the reader.
@@ -54,9 +58,10 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
     // aborted by its own timeout or by unmount.
     const run: {
       stopped?: boolean;
+      failures: number;
       poll?: AbortController;
       timer?: ReturnType<typeof setTimeout>;
-    } = {};
+    } = { failures: 0 };
     async function tick() {
       const poll = new AbortController();
       const timeout = setTimeout(() => poll.abort(), POLL_TIMEOUT_MS);
@@ -64,6 +69,8 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
       try {
         const r = await getHITLPending(poll.signal);
         if (run.stopped) return;
+        run.failures = 0;
+        setStale(false);
         const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
         const live = new Set(scoped.map((p) => p.id));
         for (const id of decided.current) if (!live.has(id)) decided.current.delete(id);
@@ -74,7 +81,9 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
         setPending(incoming);
         flash(setResolved, gone, "gone");
       } catch {
-        /* ignore transient */
+        // One failure is transient; a run of them means the list shown
+        // can no longer be trusted.
+        if (!run.stopped && ++run.failures >= STALE_AFTER_FAILURES) setStale(true);
       } finally {
         clearTimeout(timeout);
       }
@@ -115,12 +124,18 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
     }
   }
 
-  if (pending.length === 0 && resolved.length === 0 && !notice && !details) return null;
+  if (pending.length === 0 && resolved.length === 0 && !notice && !details && !stale) return null;
 
   const liveDetails = details && pending.find((p) => p.id === details.id);
 
   return (
     <div className="space-y-1.5">
+      {stale && (
+        <div className="px-4 py-2 text-xs text-rust-700 bg-canvas border-1.5 border-rust-200">
+          Approval list may be out of date: the gateway has not answered the last few checks.
+          Requests shown here may already be decided, and new ones may be missing.
+        </div>
+      )}
       {notice && (
         <div className="px-4 py-2 text-xs text-rust-700 bg-canvas border-1.5 border-rust-200">
           {notice}
