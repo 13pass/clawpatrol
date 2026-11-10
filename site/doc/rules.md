@@ -392,8 +392,17 @@ pre-approve, or require approval. An admin's go to the dashboard file
 at priority 100. A member's go to the member's own file at priority
 50, pinned with `profile` and `credential` to the request's profile
 and credential, and a member's pre-approval carries `yield_to_deny`:
-it can skip an admin's approval, never undo an admin's deny. A member's
-deny or require-approval only tightens, so it needs no such flag.
+it can skip an admin's approval, never undo an admin's deny.
+
+A member's change is written at once only when it can only tighten
+their profile: a new deny, re-enabling a deny, or switching off one
+of their own pre-approvals. Any other change waits for an admin on the
+Rules page: a new pre-approval, a new "require approval" (at priority
+50 it would stand in for an admin's deny or approver), and switching
+off a deny or a required approval. The admins with a verified
+notification channel get a message; one of them approves the change,
+edits the rule and approves it, or rejects it, and the member hears
+back on their own channel.
 
 ### `yield_to_deny = true`
 

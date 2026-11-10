@@ -398,7 +398,17 @@ export type HITLPending = {
   family?: string;
   ua?: string;
   body_sample?: string;
+  // body_sample is only part of the body (buffer limit or read error).
+  body_truncated?: boolean;
+  // The request has a body the gateway did not buffer (only POST, PUT
+  // and PATCH bodies are), so body_sample is empty.
+  body_not_captured?: boolean;
+  // Request headers as the agent sent them, sensitive values masked
+  // server-side as "***".
+  headers?: Record<string, string>;
   reason?: string;
+  profile?: string;
+  rule?: string;
   created_at: string;
   expires_at: string;
 };
@@ -416,8 +426,8 @@ export type HITLOperationState =
 
 export type HITLApprovalEffect = "execute_upstream" | "create_retry_grant";
 
-export async function getHITLPending(): Promise<HITLPending[]> {
-  const r = await api("/api/hitl/pending");
+export async function getHITLPending(signal?: AbortSignal): Promise<HITLPending[]> {
+  const r = await api("/api/hitl/pending", { signal });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -621,6 +631,7 @@ export type RuleRequest = {
 
 export type ScopedRule = {
   rule_name: string;
+  verdict: RuleVerdict;
   endpoint_name: string;
   family: string;
   condition?: string;
@@ -639,6 +650,19 @@ export type RulePreviewResp = {
   recent_sampled: number;
   writes_enabled: boolean;
   writes_unavailable?: string;
+  // needs_review: a member's rule that could loosen their profile is
+  // sent to the admins instead of applied.
+  needs_review?: boolean;
+};
+
+// RuleChangeResult answers a rule change: applied, or (pending) sent
+// to the admins as request request_id.
+export type RuleChangeResult = {
+  ok: boolean;
+  rule_name?: string;
+  file?: string;
+  pending?: boolean;
+  request_id?: number;
 };
 
 async function postJSON<T>(path: string, body: object): Promise<T> {
@@ -655,10 +679,11 @@ export function previewRule(actionID: string, req: RuleRequest) {
   return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
 }
 
-export function createRule(actionID: string, req: RuleRequest) {
-  return postJSON<{ ok: boolean; rule_name: string; file: string }>("/api/rules/create", {
+export function createRule(actionID: string, req: RuleRequest, reason?: string) {
+  return postJSON<RuleChangeResult>("/api/rules/create", {
     action_id: actionID,
     ...req,
+    reason: reason || undefined,
   });
 }
 
@@ -700,7 +725,11 @@ export type MyRule = {
   verdict?: string;
   approve?: string[];
   reason?: string;
+  // needs_review lists the changes a member must ask an admin for.
+  needs_review?: RuleChange[];
 };
+
+export type RuleChange = "disable" | "enable" | "delete";
 
 export async function getMyRules(): Promise<{
   file: string;
@@ -712,12 +741,69 @@ export async function getMyRules(): Promise<{
   return r.json();
 }
 
-export function setMyRuleDisabled(name: string, disabled: boolean) {
-  return postJSON<{ ok: boolean }>("/api/my/rules/update", { name, disabled });
+export function setMyRuleDisabled(name: string, disabled: boolean, reason?: string) {
+  return postJSON<RuleChangeResult>("/api/my/rules/update", {
+    name,
+    disabled,
+    reason: reason || undefined,
+  });
 }
 
-export function deleteMyRule(name: string) {
-  return postJSON<{ ok: boolean }>("/api/my/rules/delete", { name });
+export function deleteMyRule(name: string, reason?: string) {
+  return postJSON<RuleChangeResult>("/api/my/rules/delete", { name, reason: reason || undefined });
+}
+
+export type RuleRequestKind = "create" | "disable" | "enable" | "delete";
+export type RuleRequestStatus = "pending" | "approved" | "rejected" | "withdrawn";
+
+// RuleChangeRequest is a member's rule change waiting for, or decided
+// by, an admin.
+export type RuleChangeRequest = {
+  id: number;
+  username: string;
+  kind: RuleRequestKind;
+  rule_name: string;
+  profile?: string;
+  summary: string;
+  // hcl is the rule of a create: as asked, or as the admin edited it.
+  hcl?: string;
+  reason?: string;
+  status: RuleRequestStatus;
+  created_ns: number;
+  decided_by?: string;
+  decided_ns?: number;
+  decision_note?: string;
+  edited?: boolean;
+};
+
+// listRuleRequests returns the pending requests, then recent decided
+// ones: everyone's for an admin, the caller's own for a member.
+export async function listRuleRequests(): Promise<RuleChangeRequest[]> {
+  const r = await api("/api/rule-requests");
+  if (!r.ok) throw new Error(await r.text());
+  return ((await r.json()) as { requests: RuleChangeRequest[] }).requests;
+}
+
+export function withdrawRuleRequest(id: number) {
+  return postJSON<{ ok: boolean }>("/api/rule-requests/withdraw", { id });
+}
+
+// decideRuleRequest approves or rejects a request (admins). hcl, for a
+// new rule, approves that version instead of the one asked for.
+export function decideRuleRequest(
+  id: number,
+  decision: "approve" | "reject",
+  note?: string,
+  hcl?: string,
+) {
+  return postJSON<{ ok: boolean; status: RuleRequestStatus }>("/api/rule-requests/decide", {
+    id,
+    decision,
+    note: note || undefined,
+    // An edited rule is sent even when empty, so the gateway refuses it
+    // rather than applying the one asked for.
+    hcl,
+  });
 }
 
 export function deleteUser(username: string) {
@@ -788,6 +874,8 @@ type StateResp = {
   // running config name rather than a hardcoded string.
   config_file?: string;
   dashboard_config_writes?: boolean;
+  // Admins only: member rule changes waiting for review.
+  rule_requests_pending?: number;
 };
 let lastStateTag = "";
 let lastState: StateResp | null = null;

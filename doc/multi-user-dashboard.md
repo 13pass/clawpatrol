@@ -288,6 +288,41 @@ dashboard then shows the install and join commands to send the user,
 with `--profile` set and an optional `--hostname`, which the Add device
 dialog also offers now.
 
+### Rule change requests (done)
+
+`dashboard_config_writes` let a member pre-approve their own traffic
+with no one looking, and a member's "require approval" rule, at
+priority 50, could stand in for an admin deny (`k8s-default-deny` at
+−100, say) with an approval the member routes to themselves. So a
+member's change is now written at once only when it can only tighten
+the profile: a new deny, re-enabling a deny, disabling or deleting one
+of their own pre-approvals. Everything else — a new pre-approval or
+required approval, disabling or deleting a deny or a required
+approval, re-enabling a pre-approval — becomes a row in
+`rule_requests` (migration 0032) and answers 202:
+
+- The rule is generated and validated as before, so an admin is never
+  handed one that does not load. The member may add a reason.
+- Every admin with a verified channel gets a message with the summary,
+  the reason and a link to the Rules page; admins also see a count on
+  the Rules button (`rule_requests_pending` in `/api/state`).
+- On the Rules page an admin approves a request, edits the rule of a
+  new one in the HCL editor and approves that, or rejects it, with an
+  optional note. The change is applied to the member's file as the
+  member is then: it fails (409) when they lost the profile, the rule
+  is gone or the user was deleted. The member hears back on their
+  channel, sees the answer on their Rules page, and may withdraw a
+  pending request.
+- One pending request per member and rule.
+- Deleting a user withdraws their pending requests and files all of
+  theirs under `<name> (deleted <time>)`, like their rules file, so a
+  later user of the same name starts with none.
+
+Routes: `GET /api/rule-requests` (an admin's: everyone's; a member's:
+their own), `POST /api/rule-requests/withdraw` (the requester),
+`POST /api/rule-requests/decide` (admins). Approve or reject is
+audited like every dashboard write.
+
 ### Later
 
 TOTP, Git export of user

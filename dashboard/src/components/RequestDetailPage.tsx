@@ -669,7 +669,7 @@ function Facets({ rows }: { rows: FacetRow[] }) {
   );
 }
 
-function Section({
+export function Section({
   title,
   children,
   action,
@@ -693,7 +693,7 @@ function Section({
 
 const SENSITIVE = /auth|token|secret|key|password|cookie/i;
 
-function Headers({ obj }: { obj: Record<string, string> }) {
+export function Headers({ obj }: { obj: Record<string, string> }) {
   return (
     <pre className="overflow-auto whitespace-pre-wrap break-all px-4 py-3 font-mono text-xs leading-relaxed">
       {Object.entries(obj).map(([k, v]) => (

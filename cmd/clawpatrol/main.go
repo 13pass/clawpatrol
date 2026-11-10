@@ -2790,23 +2790,26 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 		// any path that needed the complete body.
 		var bufferedBody bufferedHTTPBodyResult
 		var matchBody []byte
-		var truncated bool
+		var truncated, bodyNotCaptured bool
 		retryOperationID := strings.TrimSpace(req.Header.Get(hitlRetryOperationHeader))
 		if req.Method == "POST" || req.Method == "PUT" || req.Method == "PATCH" || retryOperationID != "" {
 			bufferedBody = bufferHTTPBodyForMatchResult(req, g.cfg.Load().BodyBufferLimit())
 			matchBody = bufferedBody.body
 			truncated = bufferedBody.truncated
+		} else {
+			bodyNotCaptured = req.Body != nil && req.Body != http.NoBody && req.ContentLength != 0
 		}
 
 		mreq := &match.Request{
-			Family:    ep.Family,
-			Method:    req.Method,
-			URL:       req.URL,
-			Headers:   req.Header,
-			Body:      matchBody,
-			PeerIP:    pip,
-			Profile:   profile,
-			Truncated: truncated,
+			Family:          ep.Family,
+			Method:          req.Method,
+			URL:             req.URL,
+			Headers:         req.Header,
+			Body:            matchBody,
+			PeerIP:          pip,
+			Profile:         profile,
+			Truncated:       truncated,
+			BodyNotCaptured: bodyNotCaptured,
 		}
 		// clickhouse_https carries the agent-declared database in
 		// `?database=` or `X-ClickHouse-Database` (query wins). Other
