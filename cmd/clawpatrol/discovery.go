@@ -655,6 +655,9 @@ func buildDiscoveryHITL(policy *config.CompiledPolicy, prof *config.CompiledProf
 // and that approver must declare a positive sync_wait_timeout. An endpoint
 // gated only synchronously — dashboard approver, multi-stage chain, or no
 // sync window — reports false and is documented by the synchronous flow.
+// The live rule also refuses per request a body it cannot bind
+// (hitlAsyncBodySkipReason); the manifest explanation says so, since
+// discovery cannot predict it.
 //
 // When several gated rules qualify, the earliest hand-back wins: the agent
 // is told the soonest a request here could go async (smallest sync wait).
@@ -730,6 +733,11 @@ func hitlAsyncManifestExplanation() string {
 		`not decided within that window, the gateway stops holding the connection and answers with `+
 		`HTTP 202 Accepted. A 202 is NOT success and NOT failure — it means "parked for human `+
 		`approval, continuing asynchronously." Do not treat it as either; switch to polling.
+
+A request whose body the gateway cannot bind to an approval stays synchronous, with no 202: `+
+		`a body over the approver's async size limit, a body cut off while being read, or a body on a `+
+		`method other than POST, PUT or PATCH (the gateway does not read those). The connection is `+
+		`then held until a human decides or the approval times out.
 
 The 202 body is JSON describing the parked operation. The fields you act on:
 - operation_id: the parked operation's id.

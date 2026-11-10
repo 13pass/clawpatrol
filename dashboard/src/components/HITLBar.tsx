@@ -18,7 +18,7 @@ import { Headers, Section } from "./RequestDetailPage";
 const POLL_MS = 1000;
 // A poll that has not answered by then is abandoned, so one hung
 // request cannot stop the bar from polling.
-const POLL_TIMEOUT_MS = 10_000;
+const POLL_TIMEOUT_MS = 3000;
 // How long a card stays up after its request leaves the pool.
 const FLASH_MS = 2500;
 

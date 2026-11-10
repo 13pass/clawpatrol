@@ -2883,7 +2883,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			})
 			if err != nil {
 				status, contentType, body := hitlRetryRelayFailure(err)
-				log.Printf("hitl retry rejected %s %s %s operation %q: %v", host, req.Method, req.URL.Path, retryOperationID, err)
+				log.Printf("hitl retry rejected %q %s %q operation %q: %v", host, req.Method, req.URL.Path, retryOperationID, err)
 				_, _ = fmt.Fprintf(tc, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), contentType, len(body), body)
 				ev.Status = strconv.Itoa(status)
 				ev.Action = "hitl_retry_rejected"
@@ -2898,7 +2898,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			hitlRetryConsumedOperation = &consumed
 			hitlRetryBypassedApproval = true
 			ev.Action = "hitl_retry_approved"
-			log.Printf("hitl retry approved %s %s %s operation %q by %s", host, req.Method, req.URL.Path, retryOperationID, principalID)
+			log.Printf("hitl retry approved %q %s %q operation %q by %s", host, req.Method, req.URL.Path, retryOperationID, principalID)
 		}
 
 		// Approve chain — dispatch each stage to its approver
@@ -2922,7 +2922,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					Now:         time.Now().UTC(),
 				})
 				if err != nil {
-					log.Printf("hitl async operation start %s %s: %v", host, req.URL.Path, err)
+					log.Printf("hitl async operation start %q %q: %v", host, req.URL.Path, err)
 				} else if started {
 					asyncOp = start.Operation
 					asyncSyncWait = start.SyncWaitTimeout
