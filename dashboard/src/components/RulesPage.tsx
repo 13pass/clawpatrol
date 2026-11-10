@@ -1,17 +1,40 @@
 import { useEffect, useState, type ReactNode } from "react";
-import { deleteMyRule, getMyRules, setMyRuleDisabled, type MyRule } from "../lib/api";
+import {
+  deleteMyRule,
+  getMyRules,
+  setMyRuleDisabled,
+  type MyRule,
+  type RuleChangeResult,
+} from "../lib/api";
 import { Button } from "./Button";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
+import { RuleRequests } from "./RuleRequests";
+
+type RuleChange = "disable" | "enable" | "delete";
+
+// changeNeedsReview mirrors the gateway: a member's change waits for
+// an admin when it could loosen their profile — switching off a rule
+// that doesn't pre-approve, or switching on one that doesn't deny.
+function changeNeedsReview(r: MyRule, change: RuleChange): boolean {
+  const allows = !r.approve?.length && r.verdict === "allow";
+  const denies = !r.approve?.length && r.verdict === "deny";
+  if (change === "enable") return r.disabled && !denies;
+  if (change === "disable") return !r.disabled && !allows;
+  return !allows;
+}
 
 // RulesPage lists the rules in the viewer's own rules file — for a
 // member, the ones they created from their requests — and lets them
-// disable, re-enable or delete each one.
-export function RulesPage() {
+// disable, re-enable or delete each one. Above them sit the rule
+// requests: those to review for an admin, a member's own otherwise.
+export function RulesPage({ isMember }: { isMember: boolean }) {
   const [file, setFile] = useState("");
   const [rules, setRules] = useState<MyRule[]>([]);
   const [unavailable, setUnavailable] = useState("");
   const [err, setErr] = useState("");
+  const [info, setInfo] = useState("");
+  const [requestsVersion, setRequestsVersion] = useState(0);
 
   async function refresh() {
     try {
@@ -29,9 +52,27 @@ export function RulesPage() {
     refresh();
   }, []);
 
-  async function run(action: () => Promise<unknown>) {
+  async function change(r: MyRule, kind: RuleChange) {
+    let reason: string | undefined;
+    if (isMember && changeNeedsReview(r, kind)) {
+      const answer = window.prompt(
+        `An admin reviews this before it applies: ${kind} rule ${r.name}. Why do you need it? (optional)`,
+      );
+      if (answer === null) return;
+      reason = answer;
+    } else if (kind === "delete" && !window.confirm(`Delete rule ${r.name}?`)) {
+      return;
+    }
     try {
-      await action();
+      let res: RuleChangeResult;
+      if (kind === "delete") res = await deleteMyRule(r.name, reason);
+      else res = await setMyRuleDisabled(r.name, kind === "disable", reason);
+      setInfo(
+        res.pending
+          ? `Sent to the admins: ${kind} ${r.name}. It applies once one approves it.`
+          : "",
+      );
+      setRequestsVersion((v) => v + 1);
       await refresh();
     } catch (e) {
       setErr(String(e instanceof Error ? e.message : e));
@@ -56,6 +97,14 @@ export function RulesPage() {
         )}
       </p>
       {err && <div className="text-xs text-danger-500">{err}</div>}
+      {info && <div className="text-xs text-text">{info}</div>}
+      <RuleRequests
+        isMember={isMember}
+        version={requestsVersion}
+        onDecided={() => {
+          refresh();
+        }}
+      />
       <section className="bg-canvas border-1.5 border-navy overflow-x-auto">
         <table className="w-full border-collapse text-xs">
           <thead className="bg-navy-100 border-b border-navy">
@@ -101,7 +150,7 @@ export function RulesPage() {
                       size="xs"
                       variant="outline"
                       disabled={!r.owned}
-                      onClick={() => run(() => setMyRuleDisabled(r.name, !r.disabled))}
+                      onClick={() => change(r, r.disabled ? "enable" : "disable")}
                     >
                       {r.disabled ? "Enable" : "Disable"}
                     </Button>
@@ -109,11 +158,7 @@ export function RulesPage() {
                       size="xs"
                       variant="outline"
                       disabled={!r.owned}
-                      onClick={() => {
-                        if (window.confirm(`Delete rule ${r.name}?`)) {
-                          run(() => deleteMyRule(r.name));
-                        }
-                      }}
+                      onClick={() => change(r, "delete")}
                     >
                       Delete
                     </Button>

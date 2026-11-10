@@ -355,11 +355,20 @@ member, and land in that member's own file of a directory config
 (`50-user-<name>.hcl`). Each one is pinned with `profile = …` to the
 request's profile and `credential = …` to its credential, so it can
 only match the member's own traffic even on a shared endpoint or
-credential. A member's deny or require-approval only tightens. A
-member's pre-approval carries `yield_to_deny`: it may skip an admin's
-approval, but whenever the admin rules would deny the request — an
-explicit deny or a catch-all — the deny stands. "Require approval"
-routes to the member's approver, set by an admin.
+credential. A member's pre-approval carries `yield_to_deny`: it may
+skip an admin's approval, but whenever the admin rules would deny the
+request — an explicit deny or a catch-all — the deny stands. "Require
+approval" routes to the member's approver, set by an admin.
+
+Only a change that can only tighten the member's profile is written
+at once: a new or re-enabled deny, or switching off one of their own
+pre-approvals. Every other member change — a new pre-approval, a new
+"require approval" (which, at member priority, would replace an admin
+deny or the admin's approver), switching off a deny or a required
+approval — is stored as a rule request and applies only when an admin
+approves it, possibly after editing the rule. An approved change is
+checked against the member as they are then: a member who has lost
+the profile, or a rule that is gone, makes the approval fail.
 
 A member may change only rules pinned to a profile they still own:
 when an admin takes a profile away, the member's rules for it keep

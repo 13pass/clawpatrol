@@ -68,6 +68,7 @@ export default function App() {
   const [whoami, setWhoami] = useState<Whoami | null>(null);
   const [update, setUpdate] = useState<UpdateBanner | null>(null);
   const [configFile, setConfigFile] = useState<string>("gateway.hcl");
+  const [ruleRequestsPending, setRuleRequestsPending] = useState(0);
   const [connectId, setConnectId] = useState<string | null>(null);
   const [route, setRoute] = useState(parseRoute());
 
@@ -89,6 +90,7 @@ export default function App() {
       setWhoami(s.whoami);
       setUpdate(s.update ?? null);
       if (s.config_file) setConfigFile(s.config_file);
+      setRuleRequestsPending(s.rule_requests_pending ?? 0);
     } catch {
       /* swallow */
     }
@@ -115,13 +117,13 @@ export default function App() {
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
       <UpdateNotice update={update} />
-      <Header whoami={whoami} currentRoute={shown} />
+      <Header whoami={whoami} currentRoute={shown} ruleRequestsPending={ruleRequestsPending} />
       {shown === "account" ? (
         <AccountPage whoami={whoami} />
       ) : route.name === "requests" ? (
         <RequestsPage isMember={isMember} />
       ) : route.name === "rules" ? (
-        <RulesPage />
+        <RulesPage isMember={isMember} />
       ) : route.name === "users" ? (
         <UsersPage whoami={whoami} />
       ) : route.name === "main" ? (

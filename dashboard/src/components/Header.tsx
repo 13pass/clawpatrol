@@ -7,7 +7,17 @@ import type { Whoami } from "../lib/api";
 // settings, users, requests, rules, account). Identity + log-out moved
 // to the account page. Members don't get plugins or users, which stay
 // with admins.
-export function Header({ whoami, currentRoute }: { whoami: Whoami | null; currentRoute?: string }) {
+export function Header({
+  whoami,
+  currentRoute,
+  ruleRequestsPending = 0,
+}: {
+  whoami: Whoami | null;
+  currentRoute?: string;
+  // ruleRequestsPending counts member rule changes waiting for an
+  // admin; the gateway sends it to admins only.
+  ruleRequestsPending?: number;
+}) {
   // Single-device pages are part of the Devices section, so the nav
   // button stays lit when drilling into a device.
   const devicesActive = currentRoute === "devices" || currentRoute === "device";
@@ -54,8 +64,21 @@ export function Header({ whoami, currentRoute }: { whoami: Whoami | null; curren
           >
             <Icon paths={["M4 6h16", "M4 12h16", "M4 18h10"]} />
           </NavLink>
-          <NavLink href="#/rules" label="Rules" active={currentRoute === "rules"}>
+          <NavLink
+            href="#/rules"
+            label={
+              ruleRequestsPending > 0
+                ? `Rules (${ruleRequestsPending} request${ruleRequestsPending === 1 ? "" : "s"} to review)`
+                : "Rules"
+            }
+            active={currentRoute === "rules"}
+          >
             <Icon paths={["M12 3 4 6v6c0 5 3.5 8 8 9 4.5-1 8-4 8-9V6z", "m9 12 2 2 4-4"]} />
+            {ruleRequestsPending > 0 && (
+              <span className="absolute -top-1 -right-1 min-w-4 h-4 px-1 rounded-full bg-rust-400 border border-navy text-2xs font-mono font-bold leading-none flex items-center justify-center">
+                {ruleRequestsPending}
+              </span>
+            )}
           </NavLink>
           <NavLink href="#/account" label="Account" active={currentRoute === "account"}>
             <AccountIcon />

@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -412,6 +413,10 @@ func (w *webMux) apiUsersDelete(rw http.ResponseWriter, r *http.Request) {
 	}
 	if err := w.archiveMemberRules(body.Username); err != nil {
 		http.Error(rw, "could not set the user's rules aside: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := retireRuleRequests(w.g.db, body.Username, time.Now()); err != nil {
+		http.Error(rw, "could not set the user's rule requests aside: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := deleteDashboardUser(w.g.db, body.Username); err != nil {
