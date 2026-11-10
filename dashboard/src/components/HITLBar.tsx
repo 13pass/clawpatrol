@@ -16,6 +16,9 @@ import { Modal } from "./Modal";
 import { Headers, Section } from "./RequestDetailPage";
 
 const POLL_MS = 1000;
+// A poll that has not answered by then is abandoned, so one hung
+// request cannot stop the bar from polling.
+const POLL_TIMEOUT_MS = 10_000;
 // How long a card stays up after its request leaves the pool.
 const FLASH_MS = 2500;
 
@@ -47,12 +50,14 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
 
   useEffect(() => {
     const stopped = new AbortController();
+    const next: { timer?: ReturnType<typeof setTimeout> } = {};
     // Each poll is scheduled when the previous one ends, so polls never
     // overlap and their responses arrive in order.
     async function tick() {
-      if (stopped.signal.aborted) return;
       try {
-        const r = await getHITLPending(stopped.signal);
+        const r = await getHITLPending(
+          AbortSignal.any([stopped.signal, AbortSignal.timeout(POLL_TIMEOUT_MS)]),
+        );
         if (stopped.signal.aborted) return;
         const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
         const live = new Set(scoped.map((p) => p.id));
@@ -66,10 +71,13 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
       } catch {
         /* ignore transient */
       }
-      if (!stopped.signal.aborted) setTimeout(tick, POLL_MS);
+      if (!stopped.signal.aborted) next.timer = setTimeout(tick, POLL_MS);
     }
     tick();
-    return () => stopped.abort();
+    return () => {
+      stopped.abort();
+      clearTimeout(next.timer);
+    };
   }, [agentIP]);
 
   async function decide(item: HITLPending, allow: boolean) {
