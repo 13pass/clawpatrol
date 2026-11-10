@@ -806,11 +806,20 @@ type HITLPending struct {
 	// Family is the endpoint family ("http" | "sql" | "k8s") so the
 	// dashboard can pick a matching label for Path ("Query" /
 	// "Resource" / "Path"). Empty when no endpoint metadata is set.
-	Family     string   `json:"family,omitempty"`
-	UA         string   `json:"ua,omitempty"`
-	BodySample string   `json:"body_sample,omitempty"`
-	Reason     string   `json:"reason,omitempty"`
-	Approvers  []string `json:"approvers,omitempty"`
+	Family     string `json:"family,omitempty"`
+	UA         string `json:"ua,omitempty"`
+	BodySample string `json:"body_sample,omitempty"`
+	// BodyTruncated and BodyNotCaptured mirror match.Request: the body
+	// was only partly read (buffer limit or read error), or not read at
+	// all. Either way BodySample is not the whole body.
+	BodyTruncated   bool `json:"body_truncated,omitempty"`
+	BodyNotCaptured bool `json:"body_not_captured,omitempty"`
+	// Headers is the request as the agent sent it, before credential
+	// injection, for the dashboard's "check details" view. Sensitive
+	// values are masked (MaskedHeaders).
+	Headers   map[string]string `json:"headers,omitempty"`
+	Reason    string            `json:"reason,omitempty"`
+	Approvers []string          `json:"approvers,omitempty"`
 	// Profile and Rule say whose request this is and which rule asked
 	// for approval; the dashboard scopes pending approvals by them.
 	Profile string `json:"profile,omitempty"`

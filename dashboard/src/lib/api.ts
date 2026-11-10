@@ -398,7 +398,17 @@ export type HITLPending = {
   family?: string;
   ua?: string;
   body_sample?: string;
+  // body_sample is only part of the body (buffer limit or read error).
+  body_truncated?: boolean;
+  // The request has a body the gateway did not buffer (only POST, PUT
+  // and PATCH bodies are), so body_sample is empty.
+  body_not_captured?: boolean;
+  // Request headers as the agent sent them, sensitive values masked
+  // server-side as "***".
+  headers?: Record<string, string>;
   reason?: string;
+  profile?: string;
+  rule?: string;
   created_at: string;
   expires_at: string;
 };
@@ -416,8 +426,8 @@ export type HITLOperationState =
 
 export type HITLApprovalEffect = "execute_upstream" | "create_retry_grant";
 
-export async function getHITLPending(): Promise<HITLPending[]> {
-  const r = await api("/api/hitl/pending");
+export async function getHITLPending(signal?: AbortSignal): Promise<HITLPending[]> {
+  const r = await api("/api/hitl/pending", { signal });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

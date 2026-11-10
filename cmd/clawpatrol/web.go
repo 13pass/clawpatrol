@@ -3425,12 +3425,10 @@ func flatHeaders(h http.Header) map[string]string {
 }
 
 func flatHeadersRedacted(h http.Header, redactions []string) map[string]string {
-	out := make(map[string]string, len(h))
-	for k, v := range h {
-		if runtime.IsSensitiveHeader(k) {
-			out[k] = "***"
-		} else {
-			out[k] = redactCredentialSample(strings.Join(v, ", "), redactions)
+	out := runtime.MaskedHeaders(h)
+	for k, v := range out {
+		if !runtime.IsSensitiveHeader(k) {
+			out[k] = redactCredentialSample(v, redactions)
 		}
 	}
 	return out
@@ -3988,11 +3986,12 @@ func (r *HITLRegistry) resolve(id string, state runtime.HITLState, reason string
 
 // terminalHITLPending is the copy of a pending entry kept on its
 // terminal record for hitlTerminalTTL. Late message updates only need
-// the routing/rendering fields, so the body sample — the one field
-// that can be large — is dropped rather than retained for 30 minutes
-// per decision.
+// the routing/rendering fields, so the body sample and headers — the
+// fields that can be large — are dropped rather than retained for 30
+// minutes per decision.
 func terminalHITLPending(p runtime.HITLPending) runtime.HITLPending {
 	p.BodySample = ""
+	p.Headers = nil
 	return p
 }
 

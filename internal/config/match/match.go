@@ -79,6 +79,12 @@ type Request struct {
 	// its other predicates still matches or no-matches honestly.
 	Truncated bool
 
+	// BodyNotCaptured is set when the request has a body the frontend
+	// did not buffer into Body (the HTTPS frontend buffers POST, PUT
+	// and PATCH bodies only). Matchers ignore it. Approval prompts use
+	// it to warn that the body they show is not the whole request.
+	BodyNotCaptured bool
+
 	// Unparseable is set by a wire frontend when its SQL parser
 	// refuses the Query bytes outright (the statement is still on
 	// Meta.Statement, but Verb / Tables / Functions are left zero
