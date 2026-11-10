@@ -211,7 +211,10 @@ func TestMemberRulePreviewCreateAndManage(t *testing.T) {
 	if got := matchedRule(ep, httpReq("POST", "/api/v4/projects/5/issues/6/notes", "team-a", nil)); got != "" {
 		t.Fatalf("disabled rule still matched (%q)", got)
 	}
-	approveRequest(t, env, serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/delete", `{"name":"`+ruleName+`"}`))
+	// Deleting a rule already switched off changes nothing: no review.
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/delete", `{"name":"`+ruleName+`"}`); rw.Code != http.StatusOK {
+		t.Fatalf("delete = %d %s", rw.Code, rw.Body.String())
+	}
 	if got := readCfgFile(t, env.w, "50-user-alice.hcl"); strings.Contains(got, ruleName) {
 		t.Fatalf("rule still in the file after delete:\n%s", got)
 	}

@@ -699,7 +699,11 @@ export type MyRule = {
   verdict?: string;
   approve?: string[];
   reason?: string;
+  // needs_review lists the changes a member must ask an admin for.
+  needs_review?: RuleChange[];
 };
+
+export type RuleChange = "disable" | "enable" | "delete";
 
 export async function getMyRules(): Promise<{
   file: string;
@@ -770,7 +774,9 @@ export function decideRuleRequest(
     id,
     decision,
     note: note || undefined,
-    hcl: hcl || undefined,
+    // An edited rule is sent even when empty, so the gateway refuses it
+    // rather than applying the one asked for.
+    hcl,
   });
 }
 

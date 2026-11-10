@@ -216,7 +216,11 @@ function PendingForAdmin({
       </label>
       {err && <div className="text-xs text-danger-500 whitespace-pre-wrap">{err}</div>}
       <div className="flex gap-2">
-        <Button size="sm" disabled={busy} onClick={() => decide("approve")}>
+        <Button
+          size="sm"
+          disabled={busy || (edited && !hcl.trim())}
+          onClick={() => decide("approve")}
+        >
           {edited ? "Approve edited rule" : "Approve"}
         </Button>
         <Button size="sm" variant="outline" disabled={busy} onClick={() => decide("reject")}>

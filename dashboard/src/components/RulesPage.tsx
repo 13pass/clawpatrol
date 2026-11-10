@@ -4,25 +4,13 @@ import {
   getMyRules,
   setMyRuleDisabled,
   type MyRule,
+  type RuleChange,
   type RuleChangeResult,
 } from "../lib/api";
 import { Button } from "./Button";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
 import { RuleRequests } from "./RuleRequests";
-
-type RuleChange = "disable" | "enable" | "delete";
-
-// changeNeedsReview mirrors the gateway: a member's change waits for
-// an admin when it could loosen their profile — switching off a rule
-// that doesn't pre-approve, or switching on one that doesn't deny.
-function changeNeedsReview(r: MyRule, change: RuleChange): boolean {
-  const allows = !r.approve?.length && r.verdict === "allow";
-  const denies = !r.approve?.length && r.verdict === "deny";
-  if (change === "enable") return r.disabled && !denies;
-  if (change === "disable") return !r.disabled && !allows;
-  return !allows;
-}
 
 // RulesPage lists the rules in the viewer's own rules file — for a
 // member, the ones they created from their requests — and lets them
@@ -54,7 +42,7 @@ export function RulesPage({ isMember }: { isMember: boolean }) {
 
   async function change(r: MyRule, kind: RuleChange) {
     let reason: string | undefined;
-    if (isMember && changeNeedsReview(r, kind)) {
+    if (r.needs_review?.includes(kind)) {
       const answer = window.prompt(
         `An admin reviews this before it applies: ${kind} rule ${r.name}. Why do you need it? (optional)`,
       );

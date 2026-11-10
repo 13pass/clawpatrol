@@ -429,6 +429,9 @@ type myRule struct {
 	Verdict    string   `json:"verdict,omitempty"`
 	Approve    []string `json:"approve,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
+	// NeedsReview lists the changes (disable, enable, delete) a member
+	// must ask an admin for.
+	NeedsReview []string `json:"needs_review,omitempty"`
 }
 
 // apiMyRules lists the rules declared in the caller's rules file.
@@ -465,6 +468,9 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 			}
 			for _, stage := range body.Approve {
 				rule.Approve = append(rule.Approve, stage.Name)
+			}
+			if !v.admin {
+				rule.NeedsReview = ruleChangesNeedingReview(body)
 			}
 			out = append(out, rule)
 		}
@@ -614,23 +620,27 @@ func (w *webMux) memberRulesPath(username string) string {
 	return filepath.Join(w.g.cfgPath, memberRulesFilePrefix+username+".hcl")
 }
 
-// archiveMemberRules renames a deleted user's rules file so its rules
-// keep applying but belong to no account — a later user of the same
-// name must not inherit them. The content is unchanged, so the config
-// stays valid.
-func (w *webMux) archiveMemberRules(username string) error {
+// formerMemberStamp is the time a deleted user's rules file and rule
+// requests are filed under.
+func formerMemberStamp(deleted time.Time) string {
+	return deleted.UTC().Format(formerMemberRulesTimeFormat)
+}
+
+// archiveMemberRulesLocked renames a deleted user's rules file so its
+// rules keep applying but belong to no account — a later user of the
+// same name must not inherit them. The content is unchanged, so the
+// config stays valid. g.configMu must be held.
+func (w *webMux) archiveMemberRulesLocked(username string, deleted time.Time) error {
 	path := w.memberRulesPath(username)
 	if path == "" {
 		return nil
 	}
-	w.g.configMu.Lock()
-	defer w.g.configMu.Unlock()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	archived := formerMemberRulesFilePrefix + username + "-" + time.Now().UTC().Format(formerMemberRulesTimeFormat) + ".hcl"
+	archived := formerMemberRulesFilePrefix + username + "-" + formerMemberStamp(deleted) + ".hcl"
 	if err := os.Rename(path, filepath.Join(w.g.cfgPath, archived)); err != nil {
 		return err
 	}

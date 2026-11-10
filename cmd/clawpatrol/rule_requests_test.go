@@ -267,3 +267,61 @@ func TestDeletingAUserRetiresTheirRequests(t *testing.T) {
 		t.Fatalf("the new alice sees the old one's requests: %+v", mine)
 	}
 }
+
+func TestEmptiedEditIsRefused(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	id := pendingRequestID(t, serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"allow"}`))
+	if rw := decideRequest(t, env, id, "approve", `,"hcl":"  "`); rw.Code != http.StatusBadRequest {
+		t.Fatalf("approving an emptied rule = %d %s, want 400", rw.Code, rw.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(env.w.g.cfgPath, "50-user-alice.hcl")); !os.IsNotExist(err) {
+		t.Fatal("an emptied edit applied the rule asked for")
+	}
+}
+
+func TestDeletingADisabledDenyNeedsNoReview(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	var mine struct {
+		Rules []myRule `json:"rules"`
+	}
+	_ = json.Unmarshal(serveAs(t, env.h, env.alice, http.MethodGet, "/api/my/rules", "").Body.Bytes(), &mine)
+	if len(mine.Rules) != 1 || strings.Join(mine.Rules[0].NeedsReview, ",") != "disable,delete" {
+		t.Fatalf("a live deny's review needs = %+v", mine.Rules)
+	}
+	name := mine.Rules[0].Name
+	approveRequest(t, env, serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/update", `{"name":"`+name+`","disabled":true}`))
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/delete", `{"name":"`+name+`"}`); rw.Code != http.StatusOK {
+		t.Fatalf("deleting a disabled deny = %d %s, want 200", rw.Code, rw.Body.String())
+	}
+}
+
+func TestApprovalRefusesAHostThatGainedAnEndpoint(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	id := pendingRequestID(t, serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceHost+`","verdict":"approve"}`))
+	files := map[string]string{
+		"40-example.hcl": `endpoint "https" "example" { hosts = ["example.org"] }
+credential "bearer_token" "ex" { endpoint = https.example }
+`,
+		"20-profiles.hcl": strings.Replace(rulesTestProfiles, "bearer_token.sentry-a]", "bearer_token.sentry-a, bearer_token.ex]", 1),
+	}
+	for name, src := range files {
+		if err := os.WriteFile(filepath.Join(env.w.g.cfgPath, name), []byte(src), 0o640); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env.w.g.configMu.Lock()
+	err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath)
+	env.w.g.configMu.Unlock()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rw := decideRequest(t, env, id, "approve", ""); rw.Code != http.StatusConflict || !strings.Contains(rw.Body.String(), `now has endpoint "example"`) {
+		t.Fatalf("approving a stale host rule = %d %s, want 409", rw.Code, rw.Body.String())
+	}
+}

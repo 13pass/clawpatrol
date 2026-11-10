@@ -16,8 +16,11 @@ import (
 	"strings"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
 )
@@ -48,6 +51,8 @@ const (
 	// ruleRequestDecideMaxBytes bounds a decision body, which may carry
 	// an edited rule.
 	ruleRequestDecideMaxBytes = 64 << 10
+	// ruleRequestWithdrawMaxBytes bounds a withdrawal body: an id.
+	ruleRequestWithdrawMaxBytes = 1 << 10
 )
 
 var (
@@ -86,18 +91,29 @@ func ruleCreateNeedsReview(verdict string) bool {
 // ruleEditNeedsReview reports whether a change to a member's existing
 // rule could loosen the profile: switching a rule off loosens it
 // unless the rule pre-approves, switching one on unless it denies.
-// A change that leaves the rule as it is needs no review.
+// A change that leaves the rule as it is — disabling a disabled rule,
+// deleting one — needs no review.
 func ruleEditNeedsReview(kind string, r *rules.Rule) bool {
 	allows := len(r.Approve) == 0 && r.Verdict == ruleVerdictAllow
 	denies := len(r.Approve) == 0 && r.Verdict == ruleVerdictDeny
 	switch kind {
 	case ruleChangeEnable:
 		return r.Disabled && !denies
-	case ruleChangeDisable:
-		return !r.Disabled && !allows
 	default:
-		return !allows
+		return !r.Disabled && !allows
 	}
+}
+
+// ruleChangesNeedingReview lists the changes to r a member must ask
+// an admin for, so the dashboard can say so before they try.
+func ruleChangesNeedingReview(r *rules.Rule) []string {
+	out := []string{}
+	for _, kind := range []string{ruleChangeDisable, ruleChangeEnable, ruleChangeDelete} {
+		if ruleEditNeedsReview(kind, r) {
+			out = append(out, kind)
+		}
+	}
+	return out
 }
 
 // ruleOutcomeLabel names what a rule does, for a request's summary.
@@ -140,36 +156,24 @@ func ruleEditSummary(kind, name string, r *rules.Rule) string {
 	return fmt.Sprintf("%s rule %s (%s)", kind, name, ruleOutcomeLabel(r))
 }
 
+// insertRuleRequest stores a pending request; the partial unique index
+// rule_requests_one_pending keeps it to one per member and rule.
 func insertRuleRequest(db *sql.DB, req *ruleChangeRequest) error {
-	tx, err := db.Begin()
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var pending int
-	if err := tx.QueryRow(
-		`SELECT COUNT(*) FROM rule_requests WHERE username = ? AND rule_name = ? AND status = ?`,
-		req.Username, req.RuleName, ruleRequestPending,
-	).Scan(&pending); err != nil {
-		return err
-	}
-	if pending > 0 {
-		return errRuleRequestPending
-	}
 	req.Status = ruleRequestPending
 	req.CreatedNs = time.Now().UnixNano()
-	res, err := tx.Exec(
+	res, err := db.Exec(
 		`INSERT INTO rule_requests (username, kind, rule_name, profile, summary, hcl, reason, status, created_ns)
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		req.Username, req.Kind, req.RuleName, req.Profile, req.Summary, req.HCL, req.Reason, req.Status, req.CreatedNs,
 	)
+	if isUniqueViolation(err) {
+		return errRuleRequestPending
+	}
 	if err != nil {
 		return err
 	}
-	if req.ID, err = res.LastInsertId(); err != nil {
-		return err
-	}
-	return tx.Commit()
+	req.ID, err = res.LastInsertId()
+	return err
 }
 
 const ruleRequestColumns = `id, username, kind, rule_name, profile, summary, hcl, reason, status,
@@ -275,7 +279,7 @@ func retireRuleRequests(db *sql.DB, username string, now time.Time) error {
 	); err != nil {
 		return err
 	}
-	former := fmt.Sprintf("%s (deleted %s)", username, now.UTC().Format(formerMemberRulesTimeFormat))
+	former := fmt.Sprintf("%s (deleted %s)", username, formerMemberStamp(now))
 	if _, err := tx.Exec(`UPDATE rule_requests SET username = ? WHERE username = ?`, former, username); err != nil {
 		return err
 	}
@@ -386,6 +390,7 @@ func (w *webMux) apiRuleRequestWithdraw(rw http.ResponseWriter, r *http.Request)
 	var body struct {
 		ID int64 `json:"id"`
 	}
+	r.Body = http.MaxBytesReader(rw, r.Body, ruleRequestWithdrawMaxBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
@@ -396,6 +401,10 @@ func (w *webMux) apiRuleRequestWithdraw(rw http.ResponseWriter, r *http.Request)
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	// Under the config lock, so a withdrawal cannot land between an
+	// approval's config write and its status update.
+	w.g.configMu.Lock()
+	defer w.g.configMu.Unlock()
 	req, err := getRuleRequest(w.g.db, body.ID)
 	if errors.Is(err, errRuleRequestNotFound) || (err == nil && req.Username != v.username) {
 		http.Error(rw, errRuleRequestNotFound.Error(), http.StatusNotFound)
@@ -406,7 +415,11 @@ func (w *webMux) apiRuleRequestWithdraw(rw http.ResponseWriter, r *http.Request)
 		return
 	}
 	if err := closeRuleRequest(w.g.db, req.ID, ruleRequestWithdrawn, v.username, "", "", false); err != nil {
-		http.Error(rw, err.Error(), http.StatusConflict)
+		status := http.StatusInternalServerError
+		if errors.Is(err, errRuleRequestNotPending) {
+			status = http.StatusConflict
+		}
+		http.Error(rw, err.Error(), status)
 		return
 	}
 	w.bustStateCache()
@@ -425,8 +438,8 @@ func (w *webMux) apiRuleRequestDecide(rw http.ResponseWriter, r *http.Request) {
 		ID       int64  `json:"id"`
 		Decision string `json:"decision"`
 		Note     string `json:"note"`
-		// HCL replaces the requested rule of a create.
-		HCL string `json:"hcl"`
+		// HCL, when present, replaces the requested rule of a create.
+		HCL *string `json:"hcl"`
 	}
 	r.Body = http.MaxBytesReader(rw, r.Body, ruleRequestDecideMaxBytes)
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
@@ -473,12 +486,16 @@ func (w *webMux) apiRuleRequestDecide(rw http.ResponseWriter, r *http.Request) {
 		req.Status, req.DecidedBy, req.DecisionNote = ruleRequestRejected, decidedBy, body.Note
 	case "approve":
 		hclText, edited := req.HCL, false
-		if body.HCL != "" && strings.TrimSpace(body.HCL) != strings.TrimSpace(req.HCL) {
+		if body.HCL != nil && strings.TrimSpace(*body.HCL) != strings.TrimSpace(req.HCL) {
 			if req.Kind != ruleChangeCreate {
 				http.Error(rw, "only a new rule can be edited; approve or reject this change", http.StatusBadRequest)
 				return
 			}
-			hclText, edited = body.HCL, true
+			if strings.TrimSpace(*body.HCL) == "" {
+				http.Error(rw, "the edited rule is empty; reject the request instead", http.StatusBadRequest)
+				return
+			}
+			hclText, edited = *body.HCL, true
 		}
 		changes, status, err := w.planRuleRequestLocked(req, hclText)
 		if err != nil {
@@ -537,6 +554,9 @@ func (w *webMux) planRuleRequestLocked(req ruleChangeRequest, hclText string) ([
 		}
 		return changes, 0, nil
 	}
+	if err := checkRequestedRuleStillFits(w.g.cfg.Load(), w.g.Policy(), req, hclText); err != nil {
+		return nil, http.StatusConflict, err
+	}
 	current, err := readConfigFileOrEmpty(path)
 	if err != nil {
 		return nil, http.StatusInternalServerError, err
@@ -546,6 +566,50 @@ func (w *webMux) planRuleRequestLocked(req ruleChangeRequest, hclText string) ([
 		return nil, http.StatusInternalServerError, err
 	}
 	return changes, 0, nil
+}
+
+// checkRequestedRuleStillFits repeats, at approval, the checks a rule
+// passed when it was asked for: its name is free, and an endpoint it
+// declares for a host does not shadow one the profile has gained since.
+func checkRequestedRuleStillFits(gw *config.Gateway, policy *config.CompiledPolicy, req ruleChangeRequest, hclText string) error {
+	if gw == nil || gw.Policy == nil || policy == nil {
+		return errors.New("no config is loaded")
+	}
+	if gw.Policy.Rules[req.RuleName] != nil {
+		return fmt.Errorf("rule %q already exists; reject the request", req.RuleName)
+	}
+	f, diags := hclsyntax.ParseConfig([]byte(hclText), "request.hcl", hcl.InitialPos)
+	if diags.HasErrors() {
+		return nil // validation reports it with the full config
+	}
+	body, ok := f.Body.(*hclsyntax.Body)
+	if !ok {
+		return nil
+	}
+	for _, blk := range body.Blocks {
+		if blk.Type != "endpoint" {
+			continue
+		}
+		attr := blk.Body.Attributes["hosts"]
+		if attr == nil {
+			continue
+		}
+		hosts, diags := attr.Expr.Value(nil)
+		if diags.HasErrors() || !hosts.CanIterateElements() {
+			continue
+		}
+		for it := hosts.ElementIterator(); it.Next(); {
+			_, h := it.Element()
+			if !h.Type().Equals(cty.String) || h.IsNull() {
+				continue
+			}
+			host := h.AsString()
+			if ep := runtime.HostEndpoint(policy, req.Profile, host); ep != nil {
+				return fmt.Errorf("%s now has endpoint %q in profile %q; reject the request and ask for a rule from a request made since", host, ep.Name, req.Profile)
+			}
+		}
+	}
+	return nil
 }
 
 // validateConfigChangesLocked checks the config would load with
@@ -568,6 +632,14 @@ func (g *Gateway) validateConfigChangesLocked(changes []configChange) error {
 // waits. Sent in the background: a slow channel must not hold up the
 // member's answer.
 func (w *webMux) notifyAdmins(req ruleChangeRequest) {
+	w.notifications.Add(1)
+	go func() {
+		defer w.notifications.Done()
+		w.sendToAdmins(req)
+	}()
+}
+
+func (w *webMux) sendToAdmins(req ruleChangeRequest) {
 	users, err := listDashboardUsers(w.g.db)
 	if err != nil {
 		log.Printf("dashboard rules: notify admins of request %d: %v", req.ID, err)
