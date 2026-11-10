@@ -112,7 +112,8 @@ func (g *Gateway) maybeStartAsyncHITLOperation(ctx context.Context, in hitlAsync
 		return hitlAsyncOperationStart{}, false, nil
 	}
 	if reason := hitlAsyncBodySkipReason(in, in.Approver.HITLAsyncMaxBodyBytes()); reason != "" {
-		log.Printf("hitl async grant skipped for %s %s%s (profile %s): %s; approval stays synchronous", in.HTTPRequest.Method, in.HTTPRequest.Host, in.HTTPRequest.URL.Path, in.ProfileID, reason)
+		// Host and path come from the agent: %q keeps them on one line.
+		log.Printf("hitl async grant skipped for %s %q %q (profile %s): %s; approval stays synchronous", in.HTTPRequest.Method, in.HTTPRequest.Host, in.HTTPRequest.URL.Path, in.ProfileID, reason)
 		return hitlAsyncOperationStart{}, false, nil
 	}
 	key, err := loadOrCreateHITLFingerprintKey(ctx, g.db)
