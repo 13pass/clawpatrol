@@ -49,6 +49,22 @@ type hitlAsyncOperationInput struct {
 	Now         time.Time
 }
 
+// hitlAsyncBodySkipReason says why the request body rules out an async
+// retry grant, or "" when the grant can bind it. The retry's body is
+// always buffered, so a grant over a cut, unbuffered or oversized body
+// could never match it. A missing MatchReq counts as not captured.
+func hitlAsyncBodySkipReason(in hitlAsyncOperationInput, maxBodyBytes int64) string {
+	switch {
+	case in.Truncated:
+		return "body truncated"
+	case in.MatchReq == nil || in.MatchReq.BodyNotCaptured:
+		return "body not captured"
+	case int64(len(in.RawBody)) > maxBodyBytes:
+		return "body over the async size limit"
+	}
+	return ""
+}
+
 type hitlAsyncOperationStart struct {
 	Operation       HITLOperation
 	SyncWaitTimeout time.Duration
@@ -92,7 +108,12 @@ func (g *Gateway) maybeStartAsyncHITLOperation(ctx context.Context, in hitlAsync
 	if syncWait <= 0 {
 		return hitlAsyncOperationStart{}, false, nil
 	}
-	if in.Approver.HITLAsyncFingerprintBody() != config.HITLAsyncFingerprintRawBody || in.Truncated || int64(len(in.RawBody)) > in.Approver.HITLAsyncMaxBodyBytes() {
+	if in.Approver.HITLAsyncFingerprintBody() != config.HITLAsyncFingerprintRawBody {
+		return hitlAsyncOperationStart{}, false, nil
+	}
+	if reason := hitlAsyncBodySkipReason(in, in.Approver.HITLAsyncMaxBodyBytes()); reason != "" {
+		// Host and path come from the agent: %q keeps them on one line.
+		log.Printf("hitl async grant skipped for %s %q %q (profile %s): %s; approval stays synchronous", in.HTTPRequest.Method, in.HTTPRequest.Host, in.HTTPRequest.URL.Path, in.ProfileID, reason)
 		return hitlAsyncOperationStart{}, false, nil
 	}
 	key, err := loadOrCreateHITLFingerprintKey(ctx, g.db)
