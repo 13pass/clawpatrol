@@ -42,15 +42,20 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   // The poller compares against the last list it showed to spot
   // requests decided elsewhere, timed out or abandoned, and skips the
   // ones decided here so an in-flight poll cannot bring them back.
+  // Polls can overlap, so a response older than one already applied
+  // is dropped.
   const shown = useRef<HITLPending[]>([]);
   const decided = useRef(new Set<string>());
 
   useEffect(() => {
     const stopped = new AbortController();
+    const polls = { sent: 0, applied: 0 };
     async function tick() {
+      const seq = ++polls.sent;
       try {
-        const r = await getHITLPending();
-        if (stopped.signal.aborted) return;
+        const r = await getHITLPending(stopped.signal);
+        if (stopped.signal.aborted || seq < polls.applied) return;
+        polls.applied = seq;
         const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
         const live = new Set(scoped.map((p) => p.id));
         for (const id of decided.current) if (!live.has(id)) decided.current.delete(id);
@@ -244,7 +249,7 @@ function HITLDetailsModal({
   const showHost = isHTTP && !!item.host && item.host !== item.endpoint;
   const headers = item.headers ?? {};
   const hasHeaders = Object.keys(headers).length > 0;
-  const hasBody = !!item.body_sample || !!item.body_not_captured;
+  const hasBody = !!item.body_sample || !!item.body_truncated || !!item.body_not_captured;
   // Go's zero time: the approval has no enforced deadline.
   const hasExpiry = !!item.expires_at && !item.expires_at.startsWith("0001-");
 
@@ -357,8 +362,11 @@ function DetailsNote({ children }: { children: ReactNode }) {
 // ApprovalBody shows the body exactly as sent. Formatting is opt-in and
 // labelled: re-serializing JSON keeps only the last of duplicate keys,
 // rounds large numbers and reorders integer-like keys, so the formatted
-// view can differ from the bytes that go upstream.
+// view can differ from the bytes that go upstream. Bytes that are not
+// valid UTF-8 reach the browser as U+FFFD, so the view says when it
+// holds any.
 function ApprovalBody({ text }: { text: string }) {
+  const hasNonText = text.includes("\uFFFD");
   const [formatted, setFormatted] = useState(false);
   const pretty = useMemo(() => {
     try {
@@ -370,6 +378,12 @@ function ApprovalBody({ text }: { text: string }) {
 
   return (
     <div>
+      {hasNonText && (
+        <DetailsNote>
+          The body contains bytes that are not text. They are shown as replacement characters (�),
+          and a copy holds those characters, not the original bytes.
+        </DetailsNote>
+      )}
       {pretty !== null && (
         <div className="flex flex-wrap items-center gap-2 px-4 pt-2 text-2xs text-text-muted">
           <Button variant="outline" size="xs" onClick={() => setFormatted((f) => !f)}>

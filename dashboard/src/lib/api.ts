@@ -426,8 +426,8 @@ export type HITLOperationState =
 
 export type HITLApprovalEffect = "execute_upstream" | "create_retry_grant";
 
-export async function getHITLPending(): Promise<HITLPending[]> {
-  const r = await api("/api/hitl/pending");
+export async function getHITLPending(signal?: AbortSignal): Promise<HITLPending[]> {
+  const r = await api("/api/hitl/pending", { signal });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
