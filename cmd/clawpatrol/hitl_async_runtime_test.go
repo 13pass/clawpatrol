@@ -17,6 +17,7 @@ func TestHITLAsyncBodySkipReason(t *testing.T) {
 		{"no body", hitlAsyncOperationInput{MatchReq: &match.Request{}}, ""},
 		{"truncated", hitlAsyncOperationInput{MatchReq: &match.Request{}, Truncated: true}, "body truncated"},
 		{"not captured", hitlAsyncOperationInput{MatchReq: &match.Request{BodyNotCaptured: true}}, "body not captured"},
+		{"no match request", hitlAsyncOperationInput{}, "body not captured"},
 		{"too large", hitlAsyncOperationInput{MatchReq: &match.Request{}, RawBody: []byte("abcde")}, "body over the async size limit"},
 	}
 	for _, c := range cases {

@@ -49,16 +49,21 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   const decided = useRef(new Set<string>());
 
   useEffect(() => {
-    const stopped = new AbortController();
-    const next: { timer?: ReturnType<typeof setTimeout> } = {};
     // Each poll is scheduled when the previous one ends, so polls never
-    // overlap and their responses arrive in order.
+    // overlap and their responses arrive in order. The poll in flight is
+    // aborted by its own timeout or by unmount.
+    const run: {
+      stopped?: boolean;
+      poll?: AbortController;
+      timer?: ReturnType<typeof setTimeout>;
+    } = {};
     async function tick() {
+      const poll = new AbortController();
+      const timeout = setTimeout(() => poll.abort(), POLL_TIMEOUT_MS);
+      run.poll = poll;
       try {
-        const r = await getHITLPending(
-          AbortSignal.any([stopped.signal, AbortSignal.timeout(POLL_TIMEOUT_MS)]),
-        );
-        if (stopped.signal.aborted) return;
+        const r = await getHITLPending(poll.signal);
+        if (run.stopped) return;
         const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
         const live = new Set(scoped.map((p) => p.id));
         for (const id of decided.current) if (!live.has(id)) decided.current.delete(id);
@@ -70,13 +75,16 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
         flash(setResolved, gone, "gone");
       } catch {
         /* ignore transient */
+      } finally {
+        clearTimeout(timeout);
       }
-      if (!stopped.signal.aborted) next.timer = setTimeout(tick, POLL_MS);
+      if (!run.stopped) run.timer = setTimeout(tick, POLL_MS);
     }
     tick();
     return () => {
-      stopped.abort();
-      clearTimeout(next.timer);
+      run.stopped = true;
+      run.poll?.abort();
+      clearTimeout(run.timer);
     };
   }, [agentIP]);
 

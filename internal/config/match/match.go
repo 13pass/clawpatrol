@@ -79,9 +79,9 @@ type Request struct {
 	// its other predicates still matches or no-matches honestly.
 	Truncated bool
 
-	// BodyNotCaptured is set when the request has a body the frontend
-	// did not buffer into Body (the HTTPS frontend buffers POST, PUT
-	// and PATCH bodies only). Matchers ignore it. Approval prompts use
+	// BodyNotCaptured is set when the request declares a body (a length
+	// or chunked encoding) the frontend did not buffer into Body (the
+	// HTTPS frontend buffers POST, PUT and PATCH bodies only). Matchers ignore it. Approval prompts use
 	// it to warn that the body they show is not the whole request.
 	BodyNotCaptured bool
 

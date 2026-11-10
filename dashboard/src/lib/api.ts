@@ -400,8 +400,8 @@ export type HITLPending = {
   body_sample?: string;
   // body_sample is only part of the body (buffer limit or read error).
   body_truncated?: boolean;
-  // The request has a body the gateway did not buffer (only POST, PUT
-  // and PATCH bodies are), so body_sample is empty.
+  // The request declares a body the gateway did not buffer (only POST,
+  // PUT and PATCH bodies are), so body_sample is empty.
   body_not_captured?: boolean;
   // Request headers as the agent sent them, sensitive values masked
   // server-side as "***".
