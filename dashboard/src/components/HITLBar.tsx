@@ -25,8 +25,13 @@ type DecideFn = (item: HITLPending, allow: boolean) => void;
 
 // agentIP, when set, scopes the bar to a single device's pending
 // approvals (used on the device page); unset shows every device's
-// (the home page).
+// (the home page). A new scope remounts the bar, so no dialog or
+// resolved card carries over from the previous device.
 export function HITLBar({ agentIP }: { agentIP?: string } = {}) {
+  return <ScopedHITLBar key={agentIP ?? ""} agentIP={agentIP} />;
+}
+
+function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   const [pending, setPending] = useState<HITLPending[]>([]);
   const [resolved, setResolved] = useState<Resolved[]>([]);
   const [notice, setNotice] = useState("");
@@ -64,8 +69,6 @@ export function HITLBar({ agentIP }: { agentIP?: string } = {}) {
     return () => {
       stopped.abort();
       clearInterval(t);
-      // A new agentIP scope starts empty, not with the old scope's cards.
-      shown.current = [];
     };
   }, [agentIP]);
 
@@ -82,8 +85,14 @@ export function HITLBar({ agentIP }: { agentIP?: string } = {}) {
     setPending((p) => p.filter((x) => x.id !== item.id));
     try {
       const result = await decideHITL(item.id, allow);
-      if (result.ok) flash(setResolved, [item], allow ? "approved" : "denied");
-      else setNotice(hitlDecisionNotice(result));
+      if (result.ok) {
+        flash(setResolved, [item], allow ? "approved" : "denied");
+      } else {
+        // The server may keep a request it refused to decide; let the
+        // next poll show it again.
+        decided.current.delete(item.id);
+        setNotice(hitlDecisionNotice(result));
+      }
     } catch (e: any) {
       decided.current.delete(item.id);
       setNotice("HITL decision failed: " + (e?.message ?? e));
@@ -306,7 +315,7 @@ function HITLDetailsModal({
           >
             {item.body_truncated && (
               <DetailsNote>
-                Cut at the gateway's body buffer limit. The rest goes upstream without being shown
+                Only part of the body was captured (size limit or read error). The rest is not shown
                 here.
               </DetailsNote>
             )}

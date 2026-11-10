@@ -574,10 +574,6 @@ type ApproveRequest struct {
 	UA         string
 	BodySample string
 	Reason     string
-	// BodyNotCaptured is true when the request has a body but the
-	// gateway did not buffer it for matching (only POST, PUT and PATCH
-	// bodies are), so BodySample is empty though a body goes upstream.
-	BodyNotCaptured bool
 	// ThreadTS, when set, asks HITL notifiers to post the approval
 	// prompt as a reply in this Slack thread rather than top-level.
 	// The gateway never takes it from the request: an agent must not
@@ -813,10 +809,9 @@ type HITLPending struct {
 	Family     string `json:"family,omitempty"`
 	UA         string `json:"ua,omitempty"`
 	BodySample string `json:"body_sample,omitempty"`
-	// BodyTruncated says BodySample stops at the body buffer limit.
-	// BodyNotCaptured says the request has a body that was never
-	// buffered (ApproveRequest.BodyNotCaptured). In both cases bytes
-	// the approver cannot see go upstream.
+	// BodyTruncated and BodyNotCaptured mirror match.Request: the body
+	// was only partly read (buffer limit or read error), or not read at
+	// all. Either way BodySample is not the whole body.
 	BodyTruncated   bool `json:"body_truncated,omitempty"`
 	BodyNotCaptured bool `json:"body_not_captured,omitempty"`
 	// Headers is the request as the agent sent it, before credential

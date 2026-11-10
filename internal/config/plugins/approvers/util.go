@@ -42,8 +42,8 @@ func buildPending(req runtime.ApproveRequest) runtime.HITLPending {
 	if req.Request != nil {
 		pending.Headers = runtime.MaskedHeaders(req.Request.Headers)
 		pending.BodyTruncated = req.Request.Truncated
+		pending.BodyNotCaptured = req.Request.BodyNotCaptured
 	}
-	pending.BodyNotCaptured = req.BodyNotCaptured
 	runtime.NormalizeHITLPendingApproval(&pending)
 	return pending
 }

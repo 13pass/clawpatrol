@@ -398,7 +398,7 @@ export type HITLPending = {
   family?: string;
   ua?: string;
   body_sample?: string;
-  // body_sample stops at the gateway's body buffer limit.
+  // body_sample is only part of the body (buffer limit or read error).
   body_truncated?: boolean;
   // The request has a body the gateway did not buffer (only POST, PUT
   // and PATCH bodies are), so body_sample is empty.

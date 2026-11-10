@@ -43,7 +43,7 @@ func TestBuildPendingWithoutRequestHasNoHeaders(t *testing.T) {
 func TestBuildPendingFlagsBodyTheApproverCannotSee(t *testing.T) {
 	req := approveRequestWithHeaders(nil)
 	req.Request.Truncated = true
-	req.BodyNotCaptured = true
+	req.Request.BodyNotCaptured = true
 
 	got := buildPending(req)
 
