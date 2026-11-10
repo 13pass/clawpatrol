@@ -17,9 +17,6 @@ import (
 
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
-	"github.com/hashicorp/hcl/v2"
-	"github.com/hashicorp/hcl/v2/hclwrite"
-	"github.com/zclconf/go-cty/cty"
 )
 
 const (
@@ -201,6 +198,9 @@ func (w *webMux) apiMyActions(rw http.ResponseWriter, r *http.Request) {
 type ruleRequestBody struct {
 	ActionID string `json:"action_id"`
 	RuleRequest
+	// Reason tells the admins why a member asks for a rule that waits
+	// for review.
+	Reason string `json:"reason,omitempty"`
 }
 
 // scopedRuleFor loads the action and generates the rule the caller
@@ -263,6 +263,7 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 		"recent_matches": matched,
 		"recent_sampled": sampled,
 		"writes_enabled": w.g.cfg.Load().DashboardConfigWrites() && fileErr == nil,
+		"needs_review":   !v.admin && ruleCreateNeedsReview(rule.Verdict),
 	}
 	if fileErr != nil {
 		out["writes_unavailable"] = fileErr.Error()
@@ -332,7 +333,8 @@ func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int,
 }
 
 // apiRuleCreate generates a rule from an action and appends it to the
-// caller's rules file.
+// caller's rules file. A member's rule that could loosen their profile
+// becomes a request for an admin instead (rule_requests.go).
 func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
@@ -340,13 +342,23 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	}
 	// Read the body before taking the config lock, so a slow client
 	// cannot hold up every other config write.
-	if _, err := readAndRestoreBody(rw, r, ruleRequestMaxBytes); err != nil {
+	raw, err := readAndRestoreBody(rw, r, ruleRequestMaxBytes)
+	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	var asked ruleRequestBody
+	if err := json.Unmarshal(raw, &asked); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if len(asked.Reason) > ruleRequestTextMaxLen {
+		http.Error(rw, fmt.Sprintf("the reason is longer than %d characters", ruleRequestTextMaxLen), http.StatusBadRequest)
 		return
 	}
 	w.g.configMu.Lock()
 	defer w.g.configMu.Unlock()
-	v, _, rule, ok := w.scopedRuleFor(rw, r)
+	v, ev, rule, ok := w.scopedRuleFor(rw, r)
 	if !ok {
 		return
 	}
@@ -372,6 +384,18 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	changes, err := planConfigAppend(w.g.cfgPath, file, current, rule.HCL)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !v.admin && ruleCreateNeedsReview(rule.Verdict) {
+		// Hand the admins a rule that loads today.
+		if err := w.g.validateConfigChangesLocked(changes); err != nil {
+			http.Error(rw, err.Error(), http.StatusBadRequest)
+			return
+		}
+		w.fileRuleRequest(rw, ruleChangeRequest{
+			Username: v.username, Kind: ruleChangeCreate, RuleName: rule.RuleName, Profile: rule.Profile,
+			Summary: ruleCreateSummary(rule.Verdict, asked.Scope, ev), HCL: rule.HCL, Reason: asked.Reason,
+		}, map[string]any{"file": file})
 		return
 	}
 	w.writeRuleChanges(rw, changes, map[string]any{"ok": true, "rule_name": rule.RuleName, "file": file})
@@ -405,6 +429,9 @@ type myRule struct {
 	Verdict    string   `json:"verdict,omitempty"`
 	Approve    []string `json:"approve,omitempty"`
 	Reason     string   `json:"reason,omitempty"`
+	// NeedsReview lists the changes (disable, enable, delete) a member
+	// must ask an admin for.
+	NeedsReview []string `json:"needs_review,omitempty"`
 }
 
 // apiMyRules lists the rules declared in the caller's rules file.
@@ -442,6 +469,9 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 			for _, stage := range body.Approve {
 				rule.Approve = append(rule.Approve, stage.Name)
 			}
+			if !v.admin {
+				rule.NeedsReview = ruleChangesNeedingReview(body)
+			}
 			out = append(out, rule)
 		}
 	}
@@ -454,13 +484,13 @@ func (w *webMux) apiMyRulesUpdate(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
 		Name     string `json:"name"`
 		Disabled bool   `json:"disabled"`
+		Reason   string `json:"reason,omitempty"`
 	}
-	w.editMyRule(rw, r, &body, func() string { return body.Name }, func(f *hclwrite.File, blk *hclwrite.Block) {
+	w.editMyRule(rw, r, &body, func() (string, string, string) {
 		if body.Disabled {
-			blk.Body().SetAttributeValue("disabled", cty.True)
-		} else {
-			blk.Body().RemoveAttribute("disabled")
+			return body.Name, ruleChangeDisable, body.Reason
 		}
+		return body.Name, ruleChangeEnable, body.Reason
 	})
 }
 
@@ -469,14 +499,19 @@ func (w *webMux) apiMyRulesUpdate(rw http.ResponseWriter, r *http.Request) {
 // another file may list that credential.
 func (w *webMux) apiMyRulesDelete(rw http.ResponseWriter, r *http.Request) {
 	var body struct {
-		Name string `json:"name"`
+		Name   string `json:"name"`
+		Reason string `json:"reason,omitempty"`
 	}
-	w.editMyRule(rw, r, &body, func() string { return body.Name }, func(f *hclwrite.File, blk *hclwrite.Block) {
-		f.Body().RemoveBlock(blk)
+	w.editMyRule(rw, r, &body, func() (string, string, string) {
+		return body.Name, ruleChangeDelete, body.Reason
 	})
 }
 
-func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, name func() string, edit func(*hclwrite.File, *hclwrite.Block)) {
+// editMyRule applies a change to a rule of the caller's file. A
+// member's change that could loosen their profile becomes a request
+// for an admin instead. change returns the rule's name, the kind of
+// change and the member's reason, once body is decoded.
+func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, change func() (string, string, string)) {
 	if r.Method != http.MethodPost {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
 		return
@@ -485,7 +520,12 @@ func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, n
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return
 	}
-	setAuditTarget(r, name())
+	name, kind, reason := change()
+	setAuditTarget(r, name)
+	if len(reason) > ruleRequestTextMaxLen {
+		http.Error(rw, fmt.Sprintf("the reason is longer than %d characters", ruleRequestTextMaxLen), http.StatusBadRequest)
+		return
+	}
 	v, err := w.viewerFor(r)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
@@ -502,41 +542,35 @@ func (w *webMux) editMyRule(rw http.ResponseWriter, r *http.Request, body any, n
 		http.Error(rw, errConfigWritesDisabled.Error(), http.StatusForbidden)
 		return
 	}
-	current, err := readConfigFileOrEmpty(path)
+	changes, err := memberRuleEditLocked(file, path, name, kind)
+	if errors.Is(err, errNoSuchMemberRule) {
+		http.Error(rw, err.Error(), http.StatusNotFound)
+		return
+	}
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	f, diags := hclwrite.ParseConfig(current, path, hcl.InitialPos)
-	if diags.HasErrors() {
-		http.Error(rw, diags.Error(), http.StatusInternalServerError)
-		return
-	}
-	var target *hclwrite.Block
-	for _, blk := range f.Body().Blocks() {
-		if blk.Type() == "rule" && len(blk.Labels()) == 1 && blk.Labels()[0] == name() {
-			target = blk
-			break
-		}
-	}
-	if target == nil {
-		http.Error(rw, "no rule "+strconv.Quote(name())+" in "+file, http.StatusNotFound)
-		return
-	}
 	if !v.admin {
-		var body *rules.Rule
+		var rule *rules.Rule
 		if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil {
-			if ent := gw.Policy.Rules[name()]; ent != nil {
-				body, _ = ent.Body.(*rules.Rule)
+			if ent := gw.Policy.Rules[name]; ent != nil {
+				rule, _ = ent.Body.(*rules.Rule)
 			}
 		}
-		if body == nil || !v.ownsRule(body) {
+		if rule == nil || !v.ownsRule(rule) {
 			http.Error(rw, "this rule is pinned to a profile you no longer own; ask an admin to change it", http.StatusForbidden)
 			return
 		}
+		if ruleEditNeedsReview(kind, rule) {
+			w.fileRuleRequest(rw, ruleChangeRequest{
+				Username: v.username, Kind: kind, RuleName: name, Profile: rule.Profile,
+				Summary: ruleEditSummary(kind, name, rule), Reason: reason,
+			}, map[string]any{"file": file})
+			return
+		}
 	}
-	edit(f, target)
-	w.writeRuleChanges(rw, []configChange{{Name: file, Content: f.Bytes()}}, map[string]any{"ok": true, "file": file})
+	w.writeRuleChanges(rw, changes, map[string]any{"ok": true, "file": file})
 }
 
 // ownsRule reports whether the viewer may change a rule of their file:
@@ -586,23 +620,27 @@ func (w *webMux) memberRulesPath(username string) string {
 	return filepath.Join(w.g.cfgPath, memberRulesFilePrefix+username+".hcl")
 }
 
-// archiveMemberRules renames a deleted user's rules file so its rules
-// keep applying but belong to no account — a later user of the same
-// name must not inherit them. The content is unchanged, so the config
-// stays valid.
-func (w *webMux) archiveMemberRules(username string) error {
+// formerMemberStamp is the time a deleted user's rules file and rule
+// requests are filed under.
+func formerMemberStamp(deleted time.Time) string {
+	return deleted.UTC().Format(formerMemberRulesTimeFormat)
+}
+
+// archiveMemberRulesLocked renames a deleted user's rules file so its
+// rules keep applying but belong to no account — a later user of the
+// same name must not inherit them. The content is unchanged, so the
+// config stays valid. g.configMu must be held.
+func (w *webMux) archiveMemberRulesLocked(username string, deleted time.Time) error {
 	path := w.memberRulesPath(username)
 	if path == "" {
 		return nil
 	}
-	w.g.configMu.Lock()
-	defer w.g.configMu.Unlock()
 	if _, err := os.Stat(path); errors.Is(err, os.ErrNotExist) {
 		return nil
 	} else if err != nil {
 		return err
 	}
-	archived := formerMemberRulesFilePrefix + username + "-" + time.Now().UTC().Format(formerMemberRulesTimeFormat) + ".hcl"
+	archived := formerMemberRulesFilePrefix + username + "-" + formerMemberStamp(deleted) + ".hcl"
 	if err := os.Rename(path, filepath.Join(w.g.cfgPath, archived)); err != nil {
 		return err
 	}

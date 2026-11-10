@@ -77,6 +77,7 @@ type RuleAuthor struct {
 // ScopedRule is a generated rule and what it takes to install it.
 type ScopedRule struct {
 	RuleName     string   `json:"rule_name"`
+	Verdict      string   `json:"verdict"`
 	EndpointName string   `json:"endpoint_name"`
 	Family       string   `json:"family"`
 	Condition    string   `json:"condition,omitempty"`
@@ -132,6 +133,7 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	}
 	rule := &ScopedRule{
 		RuleName:     scopedRuleName(author, req, ev, ep.Name),
+		Verdict:      req.Verdict,
 		EndpointName: ep.Name,
 		Family:       ep.Family,
 		Condition:    condition,
@@ -180,6 +182,7 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	credName := generatedPassthroughCredName(policy, endpointName)
 	rule := &ScopedRule{
 		RuleName:     scopedRuleName(author, req, ev, endpointName),
+		Verdict:      req.Verdict,
 		EndpointName: endpointName,
 		Family:       "http",
 		NewEndpoint:  true,

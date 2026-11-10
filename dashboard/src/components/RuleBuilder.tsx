@@ -4,6 +4,7 @@ import {
   listUsers,
   previewRule,
   type EventRecord,
+  type RuleChangeResult,
   type RulePreviewResp,
   type RuleScope,
   type RuleVerdict,
@@ -69,7 +70,8 @@ export function RuleBuilderModal({
   const [preview, setPreview] = useState<RulePreviewResp | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
-  const [created, setCreated] = useState<{ rule_name: string; file: string } | null>(null);
+  const [created, setCreated] = useState<RuleChangeResult | null>(null);
+  const [reason, setReason] = useState("");
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -114,7 +116,11 @@ export function RuleBuilderModal({
     setBusy(true);
     try {
       setCreated(
-        await createRule(ev.id, { verdict, scope, approver, pin_header: pinHeader || undefined }),
+        await createRule(
+          ev.id,
+          { verdict, scope, approver, pin_header: pinHeader || undefined },
+          preview?.needs_review ? reason : undefined,
+        ),
       );
       setErr(null);
     } catch (e) {
@@ -131,7 +137,22 @@ export function RuleBuilderModal({
   return (
     <Modal title="Create a rule from this request" size="lg" onClose={onClose}>
       <div className="p-4 space-y-4 overflow-auto">
-        {created ? (
+        {created?.pending ? (
+          <div className="space-y-2">
+            <p className="text-sm text-text">
+              Rule <code className="font-bold">{created.rule_name}</code> was sent to the admins for
+              review. It applies once one approves it; you get their answer on your notification
+              channel.
+            </p>
+            <p className="text-xs text-text-muted">
+              Follow it on the{" "}
+              <a href="#/rules" className="underline">
+                Rules
+              </a>{" "}
+              page.
+            </p>
+          </div>
+        ) : created ? (
           <div className="space-y-2">
             <p className="text-sm text-text">
               Rule <code className="font-bold">{created.rule_name}</code> was validated, written to{" "}
@@ -258,6 +279,23 @@ export function RuleBuilderModal({
                 <pre className="border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text overflow-auto max-h-[22rem]">
                   {preview.rule.hcl}
                 </pre>
+                {preview.needs_review && (
+                  <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
+                    <p>
+                      This rule could let through requests your profile's other rules stop, so an
+                      admin reviews it first. They may approve it, narrow it or reject it.
+                    </p>
+                    <label className="block space-y-1">
+                      <span className="text-text-muted">Why do you need it? (optional)</span>
+                      <textarea
+                        value={reason}
+                        onChange={(e) => setReason(e.target.value)}
+                        rows={2}
+                        className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
+                      />
+                    </label>
+                  </div>
+                )}
               </div>
             )}
           </>
@@ -274,7 +312,7 @@ export function RuleBuilderModal({
               Cancel
             </Button>
             <Button disabled={!preview?.writes_enabled || busy} onClick={create}>
-              {busy ? "Creating…" : "Create rule"}
+              {busy ? "Sending…" : preview?.needs_review ? "Send for review" : "Create rule"}
             </Button>
           </>
         )}

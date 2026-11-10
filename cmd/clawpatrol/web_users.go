@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
 )
@@ -410,8 +411,18 @@ func (w *webMux) apiUsersDelete(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, errDashboardUserNotFound.Error(), http.StatusNotFound)
 		return
 	}
-	if err := w.archiveMemberRules(body.Username); err != nil {
+	// One critical section: an approval of this user's request must not
+	// run between setting their rules aside and deleting them, or it
+	// would write a fresh rules file a later user of the name inherits.
+	w.g.configMu.Lock()
+	defer w.g.configMu.Unlock()
+	deleted := time.Now()
+	if err := w.archiveMemberRulesLocked(body.Username, deleted); err != nil {
 		http.Error(rw, "could not set the user's rules aside: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if err := retireRuleRequests(w.g.db, body.Username, deleted); err != nil {
+		http.Error(rw, "could not set the user's rule requests aside: "+err.Error(), http.StatusInternalServerError)
 		return
 	}
 	if err := deleteDashboardUser(w.g.db, body.Username); err != nil {

@@ -193,6 +193,7 @@ func TestMemberDecidesOnlyApprovalsOfTheirOwnRules(t *testing.T) {
 	env := newRulesTestEnv(t, true)
 	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
 		`{"action_id":"`+env.aliceNotes+`","verdict":"approve"}`)
+	approveRequest(t, env, rw)
 	var created struct {
 		RuleName string `json:"rule_name"`
 	}
@@ -298,6 +299,7 @@ func TestMemberRoutesAreReviewed(t *testing.T) {
 		"/api/onboard/approve",                                     // guardOnboardApprove
 		"/api/profiles", "/api/rules", "/api/state", "/api/status", // viewer filters
 		"/api/rules/create", "/api/rules/preview",
+		"/api/rule-requests", "/api/rule-requests/withdraw", // the caller's own requests
 		"/api/tailscale/connect", "/api/tailscale/disconnect", "/api/tailscale/status", // guardCredential
 		"/oauth/callback", // static page
 	}

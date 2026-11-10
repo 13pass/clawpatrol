@@ -56,6 +56,9 @@ type webMux struct {
 	// stateCacheTTL (1s). 99% of polls are RLock-only.
 	stateCacheMu sync.RWMutex
 	stateCache   map[string]stateCacheEntry
+
+	// notifications tracks rule-request messages still being sent.
+	notifications sync.WaitGroup
 }
 
 // lockCredentialSave takes the per-credential mutation lock (set and
@@ -282,6 +285,10 @@ var memberRoutes = map[string]bool{
 	"/api/hitl/pending": true,
 	"/api/hitl/decide":  true,
 	"/api/analytics":    true,
+
+	// Rule requests: a member lists and withdraws only their own.
+	"/api/rule-requests":          true,
+	"/api/rule-requests/withdraw": true,
 }
 
 // roleGate refuses every principal that is not an admin the operator
@@ -377,6 +384,9 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/users/channel/clear", Auth: authDashboard, Handler: w.apiUsersChannelClear},
 		{Method: http.MethodPost, Path: "/api/rules/preview", Auth: authDashboard, Handler: w.apiRulePreview},
 		{Method: http.MethodPost, Path: "/api/rules/create", Auth: authDashboard, Handler: w.apiRuleCreate},
+		{Method: http.MethodGet, Path: "/api/rule-requests", Auth: authDashboard, Handler: w.apiRuleRequests},
+		{Method: http.MethodPost, Path: "/api/rule-requests/withdraw", Auth: authDashboard, Handler: w.apiRuleRequestWithdraw},
+		{Method: http.MethodPost, Path: "/api/rule-requests/decide", Auth: authDashboard, Handler: w.apiRuleRequestDecide},
 		{Method: http.MethodPost, Path: "/api/onboard/start", Auth: authPublic, Handler: w.apiOnboardStart},
 		{Method: http.MethodPost, Path: "/api/onboard/poll", Auth: authPublic, Handler: w.apiOnboardPoll},
 		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.guardOnboardApprove(w.apiOnboardApprove)},
@@ -1364,6 +1374,14 @@ func (w *webMux) apiState(rw http.ResponseWriter, r *http.Request) {
 		"update":                  currentUpdateBanner.Load(),
 		"config_file":             filepath.Base(w.g.cfgPath),
 		"dashboard_config_writes": w.g.cfg.Load().DashboardConfigWrites(),
+	}
+	if v.admin {
+		pending, err := countPendingRuleRequests(w.g.db)
+		if err != nil {
+			http.Error(rw, err.Error(), 500)
+			return
+		}
+		state["rule_requests_pending"] = pending
 	}
 	body, err := json.Marshal(state)
 	if err != nil {

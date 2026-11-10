@@ -205,13 +205,13 @@ func TestMemberRulePreviewCreateAndManage(t *testing.T) {
 		t.Errorf("bob delete of alice's rule = %d, want 404", rw.Code)
 	}
 
-	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/update", `{"name":"`+ruleName+`","disabled":true}`); rw.Code != http.StatusOK {
-		t.Fatalf("disable = %d %s", rw.Code, rw.Body.String())
-	}
+	// Switching a deny off loosens the profile: it waits for an admin.
+	approveRequest(t, env, serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/update", `{"name":"`+ruleName+`","disabled":true}`))
 	ep = env.w.g.Policy().Endpoints["gitlab"]
 	if got := matchedRule(ep, httpReq("POST", "/api/v4/projects/5/issues/6/notes", "team-a", nil)); got != "" {
 		t.Fatalf("disabled rule still matched (%q)", got)
 	}
+	// Deleting a rule already switched off changes nothing: no review.
 	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/my/rules/delete", `{"name":"`+ruleName+`"}`); rw.Code != http.StatusOK {
 		t.Fatalf("delete = %d %s", rw.Code, rw.Body.String())
 	}
@@ -242,10 +242,8 @@ func TestMemberRuleOnUnknownHostClaimsOnlyTheirProfile(t *testing.T) {
 		`{"action_id":"`+env.aliceHost+`","verdict":"allow"}`); rw.Code != http.StatusBadRequest {
 		t.Fatalf("allow on a passthrough host = %d, want 400", rw.Code)
 	}
-	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
-		`{"action_id":"`+env.aliceHost+`","verdict":"approve"}`); rw.Code != http.StatusOK {
-		t.Fatalf("approve on a passthrough host = %d %s", rw.Code, rw.Body.String())
-	}
+	approveRequest(t, env, serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceHost+`","verdict":"approve"}`))
 	profiles := readCfgFile(t, env.w, "20-profiles.hcl")
 	teamA := profiles[:strings.Index(profiles, `profile "team-b"`)]
 	teamB := profiles[strings.Index(profiles, `profile "team-b"`):]
@@ -320,10 +318,8 @@ func TestRuleCreateTwiceIsAConflict(t *testing.T) {
 
 func TestMemberLosesRuleEditsWithTheProfile(t *testing.T) {
 	env := newRulesTestEnv(t, true)
-	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
-		`{"action_id":"`+env.aliceNotes+`","verdict":"allow"}`); rw.Code != http.StatusOK {
-		t.Fatal(rw.Body.String())
-	}
+	approveRequest(t, env, serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"allow"}`))
 	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/users/update", `{"username":"alice","profiles":[]}`); rw.Code != http.StatusOK {
 		t.Fatal(rw.Body.String())
 	}
