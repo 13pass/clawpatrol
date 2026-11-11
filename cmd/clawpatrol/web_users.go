@@ -233,11 +233,12 @@ func (w *webMux) createUserWithProfile(rw http.ResponseWriter, username, passwor
 	if !w.createUser(rw, username, password, role, links) {
 		return false
 	}
-	err = clearOrphanCredentialSecrets(g.db, plan.clones)
+	err = g.clearLeftoverCredentials(plan.clones)
 	if err == nil {
 		err = g.writeConfigFilesLocked(changes)
 	}
-	if err != nil {
+	var reloadErr *configReloadError
+	if err != nil && !errors.As(err, &reloadErr) {
 		if delErr := deleteDashboardUser(g.db, username); delErr != nil {
 			http.Error(rw, fmt.Sprintf("profile %q was not declared (%v), and removing user %q again failed: %v", req.Name, err, username, delErr), http.StatusInternalServerError)
 			return false
@@ -245,10 +246,18 @@ func (w *webMux) createUserWithProfile(rw http.ResponseWriter, username, passwor
 		http.Error(rw, err.Error(), userProfileErrorStatus(err))
 		return false
 	}
+	// From here the profile is in the config files, so the user stays
+	// and owns it even when the reload failed: the next reload that
+	// succeeds declares it.
 	log.Printf("dashboard config: profile %q declared from %q for user %q", req.Name, req.Template, username)
+	assignErr := assignNewProfile(g.db, username, req.Name)
 	w.bustStateCache()
-	if err := assignNewProfile(g.db, username, req.Name); err != nil {
-		http.Error(rw, fmt.Sprintf("user %q and profile %q were created, but the profile was not assigned (%v): tick it on the user's row", username, req.Name, err), http.StatusInternalServerError)
+	switch {
+	case assignErr != nil:
+		http.Error(rw, fmt.Sprintf("user %q and profile %q were created, but the profile was not assigned (%v): tick it on the user's row", username, req.Name, assignErr), http.StatusInternalServerError)
+		return false
+	case reloadErr != nil:
+		http.Error(rw, fmt.Sprintf("user %q was created and owns profile %q, but %v", username, req.Name, reloadErr), http.StatusInternalServerError)
 		return false
 	}
 	return true

@@ -77,6 +77,14 @@ func teamProfilesMux(t *testing.T, writes bool) *webMux {
 		t.Fatalf("OpenDB: %v", err)
 	}
 	t.Cleanup(func() { _ = db.Close() })
+	for _, owner := range []string{"vincenth", "sean", "gemma"} {
+		if err := createDashboardUser(db, owner, owner+"-passphrase-123456", dashboardRoleMember); err != nil {
+			t.Fatal(err)
+		}
+		if err := setDashboardUserProfiles(db, owner, []string{owner}); err != nil {
+			t.Fatal(err)
+		}
+	}
 	g := &Gateway{cfgPath: cfgDir, stateDir: dir, db: db}
 	g.cfg.Store(cfg)
 	g.policy.Store(policy)
@@ -253,6 +261,58 @@ func TestCreateUserProfileDropsLeftoversUnderTheName(t *testing.T) {
 	}
 	if got, _ := listDashboardUserProfiles(w.g.db, "olduser"); strings.Join(got, ",") != "gemma" {
 		t.Fatalf("olduser's profiles = %v, want only gemma", got)
+	}
+}
+
+func TestCreateUserProfileDropsLeftoverOAuthAndVerification(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	if _, err := w.g.db.Exec(`INSERT INTO credentials (id, access_token, updated_ns) VALUES ('gitlab-pat-frank', 'old-oauth-token', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if err := setCredentialVerification(w.g.db, "gitlab-pat-frank", "ok", ""); err != nil {
+		t.Fatal(err)
+	}
+	rw := postUsersCreate(w, `{"username":"frank","password":"frank-passphrase-1234","new_profile":{"name":"frank","template":"sean"}}`)
+	if rw.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	for _, table := range []string{"credentials WHERE id", "credential_verifications WHERE credential"} {
+		var n int
+		if err := w.g.db.QueryRow(`SELECT COUNT(*) FROM ` + table + ` = 'gitlab-pat-frank'`).Scan(&n); err != nil || n != 0 {
+			t.Fatalf("%s: %d rows left, err=%v", table, n, err)
+		}
+	}
+}
+
+func TestCreateUserProfileClonesACredentialOnlyItsOwnerShares(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	writeTeamFile(t, w, "20-sean-ci.hcl", `profile "sean-ci" {
+  credentials = [header_token.gitlab-pat-sean]
+}
+`)
+	if err := setDashboardUserProfiles(w.g.db, "sean", []string{"sean", "sean-ci"}); err != nil {
+		t.Fatal(err)
+	}
+	rw := postUsersCreate(w, `{"username":"frank","password":"frank-passphrase-1234","new_profile":{"name":"frank","template":"sean"}}`)
+	if rw.Code != http.StatusCreated {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	if got := strings.Join(profileCredentialNames(t, w, "frank"), ","); got != "header_token.gitlab-pat-frank,bearer_token.sentry-token" {
+		t.Fatalf("frank credentials = %s, want Sean's token cloned", got)
+	}
+}
+
+func TestCreateUserProfileRefusesANameDevicesStillUse(t *testing.T) {
+	w := teamProfilesMux(t, true)
+	if _, err := w.g.db.Exec(`INSERT INTO devices (id, name, profile, created_ns) VALUES ('10.55.0.9', 'old-laptop', 'frank', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	rw := postUsersCreate(w, `{"username":"frank","password":"frank-passphrase-1234","new_profile":{"name":"frank","template":"sean"}}`)
+	if rw.Code != http.StatusConflict || !strings.Contains(rw.Body.String(), "old-laptop") {
+		t.Fatalf("status = %d (%s)", rw.Code, rw.Body.String())
+	}
+	if _, exists, _ := lookupDashboardUserRole(w.g.db, "frank"); exists {
+		t.Fatal("a refused request created the user")
 	}
 }
 

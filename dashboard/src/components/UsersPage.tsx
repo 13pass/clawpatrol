@@ -255,9 +255,9 @@ function CreateUserForm({
         </Button>
         {withProfile && canCreateProfile && (
           <div className="basis-full text-xs text-text-muted">
-            Credentials only {chosenTemplate} uses get an empty copy that the new user fills in;
-            credentials shared with other profiles are reused. Rules written for {chosenTemplate} or
-            its own credentials are not copied.
+            Credentials that another user's profile also lists are reused; the others get an empty
+            copy that the new user fills in. Rules written for {chosenTemplate} or its own
+            credentials are not copied.
           </div>
         )}
         {err && <div className="basis-full text-xs text-danger-500">{err}</div>}
@@ -265,6 +265,7 @@ function CreateUserForm({
       {created && (
         <div className="px-4 pb-4">
           <CreatedUserJoin
+            key={created.username}
             username={created.username}
             profile={created.profile}
             url={url}

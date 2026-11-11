@@ -29,6 +29,15 @@ type configInvalidError struct{ err error }
 func (e *configInvalidError) Error() string { return e.err.Error() }
 func (e *configInvalidError) Unwrap() error { return e.err }
 
+// configReloadError reports a change that was written to the config
+// files but that the gateway then failed to reload.
+type configReloadError struct{ err error }
+
+func (e *configReloadError) Error() string {
+	return "the config files were written, but reloading them failed: " + e.err.Error()
+}
+func (e *configReloadError) Unwrap() error { return e.err }
+
 type configFileInfo struct {
 	Name     string `json:"name"`
 	Revision string `json:"revision"`
@@ -48,13 +57,9 @@ func configIsDir(cfgPath string) bool {
 // configFiles lists the files the loader reads from cfgPath, in load
 // order: the file itself, or the directory's `*.hcl` files.
 func configFiles(cfgPath string) ([]configFileInfo, error) {
-	dir, names := filepath.Dir(cfgPath), []string{filepath.Base(cfgPath)}
-	if configIsDir(cfgPath) {
-		var err error
-		if names, err = config.DirFileNames(cfgPath); err != nil {
-			return nil, err
-		}
-		dir = cfgPath
+	dir, names, err := configLoadOrder(cfgPath)
+	if err != nil {
+		return nil, err
 	}
 	out := make([]configFileInfo, 0, len(names))
 	for _, name := range names {
@@ -65,6 +70,16 @@ func configFiles(cfgPath string) ([]configFileInfo, error) {
 		out = append(out, configFileInfo{Name: name, Revision: revisionForBytes(b), Size: len(b)})
 	}
 	return out, nil
+}
+
+// configLoadOrder returns the directory holding the config and the
+// names of the files the loader reads from it, in load order.
+func configLoadOrder(cfgPath string) (string, []string, error) {
+	if !configIsDir(cfgPath) {
+		return filepath.Dir(cfgPath), []string{filepath.Base(cfgPath)}, nil
+	}
+	names, err := config.DirFileNames(cfgPath)
+	return cfgPath, names, err
 }
 
 // resolveConfigFile maps a requested file name to the name and path it
@@ -140,7 +155,7 @@ func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
 		if err := writeSingleConfigFile(g.cfgPath, changes[0].Content); err != nil {
 			return err
 		}
-		return g.reloadConfigFromFileLocked(g.cfgPath)
+		return g.reloadWrittenConfigLocked()
 	}
 
 	overrides := make(map[string][]byte, len(changes))
@@ -153,7 +168,14 @@ func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
 	if err := replaceConfigFiles(g.cfgPath, changes); err != nil {
 		return err
 	}
-	return g.reloadConfigFromFileLocked(g.cfgPath)
+	return g.reloadWrittenConfigLocked()
+}
+
+func (g *Gateway) reloadWrittenConfigLocked() error {
+	if err := g.reloadConfigFromFileLocked(g.cfgPath); err != nil {
+		return &configReloadError{err}
+	}
+	return nil
 }
 
 type stagedConfigFile struct {

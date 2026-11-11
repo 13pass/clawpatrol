@@ -502,7 +502,10 @@ func (w *webMux) apiRuleRequestDecide(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), status)
 			return
 		}
-		if err := w.g.writeConfigFilesLocked(changes); err != nil {
+		// A change written but not reloaded is still in the member's
+		// file, so the request counts as approved either way.
+		var reloadErr *configReloadError
+		if err := w.g.writeConfigFilesLocked(changes); err != nil && !errors.As(err, &reloadErr) {
 			var invalid *configInvalidError
 			if errors.As(err, &invalid) {
 				http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -516,6 +519,13 @@ func (w *webMux) apiRuleRequestDecide(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 		req.Status, req.DecidedBy, req.DecisionNote, req.Edited = ruleRequestApproved, decidedBy, body.Note, edited
+		if reloadErr != nil {
+			log.Printf("dashboard rules: %s approved request %d of %s: %v", decidedBy, req.ID, req.Username, reloadErr)
+			w.bustStateCache()
+			w.notifyRequester(req)
+			http.Error(rw, "the request is approved, but "+reloadErr.Error(), http.StatusInternalServerError)
+			return
+		}
 	default:
 		http.Error(rw, "decision must be approve or reject", http.StatusBadRequest)
 		return

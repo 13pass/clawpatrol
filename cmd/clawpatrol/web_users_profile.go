@@ -4,7 +4,6 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
-	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -36,12 +35,14 @@ type userProfilePlan struct {
 }
 
 // planUserProfile returns the HCL declaring profile req.Name with the
-// template's credentials. A credential only the template uses is the
-// template owner's own: it is cloned under a name for the new profile,
-// and its secret starts empty for the new owner to fill. A credential
-// other profiles use too is shared as is. Rules that name the template
-// profile or its credentials are not copied.
-func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserProfile) (userProfilePlan, error) {
+// template's credentials. A credential is shared as is when a profile
+// owned by someone other than the template's owners lists it too;
+// owners maps each profile to the users owning it. Any other template
+// credential may be its owner's own: it is cloned under a name for the
+// new profile, and its secret starts empty for the new owner to fill.
+// Rules that name the template profile or its credentials are not
+// copied.
+func planUserProfile(cfgPath string, policy *config.CompiledPolicy, owners map[string][]string, req newUserProfile) (userProfilePlan, error) {
 	if !validDashboardUsername(req.Name) {
 		return userProfilePlan{}, fmt.Errorf("%w: profile name must match %s", errUserProfileInvalid, dashboardUsernameRe)
 	}
@@ -68,7 +69,7 @@ func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserP
 		return userProfilePlan{}, fmt.Errorf("%w: profile %q sets per-credential options inline; declare the new profile by hand", errUserProfileInvalid, req.Template)
 	}
 
-	users := credentialProfileCounts(policy)
+	shared := sharedCredentials(policy, owners, req.Template)
 	out := hclwrite.NewEmptyFile()
 	body := out.Body()
 	body.AppendUnstructuredTokens(commentTokens(fmt.Sprintf("Profile %q, created on the dashboard from profile %q.", req.Name, req.Template)))
@@ -76,7 +77,7 @@ func planUserProfile(cfgPath string, policy *config.CompiledPolicy, req newUserP
 	cloned := map[string]string{}
 	for _, ent := range template.Credentials {
 		sym := ent.Symbol
-		if users[sym.Name] > 1 {
+		if shared[sym.Name] {
 			refs = append(refs, sym.Type+"."+sym.Name)
 			continue
 		}
@@ -112,20 +113,34 @@ func cloneCredentialName(name, template, profile string) string {
 	return strings.TrimSuffix(name, "-"+template) + "-" + profile
 }
 
-// credentialProfileCounts maps each credential to the number of
-// profiles listing it.
-func credentialProfileCounts(policy *config.CompiledPolicy) map[string]int {
-	counts := map[string]int{}
-	for _, p := range policy.Profiles {
-		seen := map[string]bool{}
+// sharedCredentials returns the credentials that a profile owned by
+// someone other than template's owners lists. A profile with no owner
+// is no sign of sharing: one person's token listed in two of their
+// profiles, or in one an admin left unassigned, stays theirs.
+func sharedCredentials(policy *config.CompiledPolicy, owners map[string][]string, template string) map[string]bool {
+	templateOwner := map[string]bool{}
+	for _, u := range owners[template] {
+		templateOwner[u] = true
+	}
+	shared := map[string]bool{}
+	for name, p := range policy.Profiles {
+		if name == template || !hasOtherOwner(owners[name], templateOwner) {
+			continue
+		}
 		for _, ent := range p.Credentials {
-			if name := ent.Symbol.Name; !seen[name] {
-				seen[name] = true
-				counts[name]++
-			}
+			shared[ent.Symbol.Name] = true
 		}
 	}
-	return counts
+	return shared
+}
+
+func hasOtherOwner(users []string, excluded map[string]bool) bool {
+	for _, u := range users {
+		if !excluded[u] {
+			return true
+		}
+	}
+	return false
 }
 
 // profileHasInlineCredentials reports whether a profile's credentials
@@ -175,13 +190,9 @@ func (bs configBlocks) find(typeName string, labels ...string) *hclwrite.Block {
 // configTopLevelBlocks parses every file the config loads, in load
 // order, and returns their top-level blocks.
 func configTopLevelBlocks(cfgPath string) (configBlocks, error) {
-	dir, names := filepath.Dir(cfgPath), []string{filepath.Base(cfgPath)}
-	if configIsDir(cfgPath) {
-		var err error
-		if names, err = config.DirFileNames(cfgPath); err != nil {
-			return nil, err
-		}
-		dir = cfgPath
+	dir, names, err := configLoadOrder(cfgPath)
+	if err != nil {
+		return nil, err
 	}
 	var out configBlocks
 	for _, name := range names {
@@ -205,8 +216,15 @@ func (g *Gateway) planUserProfileLocked(req newUserProfile) (userProfilePlan, []
 	if !g.cfg.Load().DashboardConfigWrites() {
 		return userProfilePlan{}, nil, fmt.Errorf("%w: dashboard config writes are disabled (gateway.dashboard_config_writes)", errUserProfileInvalid)
 	}
-	plan, err := planUserProfile(g.cfgPath, g.Policy(), req)
+	owners, err := profileOwners(g.db)
 	if err != nil {
+		return userProfilePlan{}, nil, err
+	}
+	plan, err := planUserProfile(g.cfgPath, g.Policy(), owners, req)
+	if err != nil {
+		return userProfilePlan{}, nil, err
+	}
+	if err := checkNoDevicesOnProfile(g.db, req.Name); err != nil {
 		return userProfilePlan{}, nil, err
 	}
 	target, targetPath, err := resolveConfigFile(g.cfgPath, "")
@@ -224,23 +242,67 @@ func (g *Gateway) planUserProfileLocked(req newUserProfile) (userProfilePlan, []
 	return plan, changes, nil
 }
 
-// clearOrphanCredentialSecrets drops secrets still stored under names
-// the plan is about to declare. Those names are undeclared, so the
-// rows are left over from an earlier config; the new credentials must
-// start empty, not inherit another person's token.
-func clearOrphanCredentialSecrets(db *sql.DB, names []string) error {
+// profileOwners maps each profile to the users owning it.
+func profileOwners(db *sql.DB) (map[string][]string, error) {
+	byUser, err := allDashboardUserProfiles(db)
+	if err != nil {
+		return nil, err
+	}
+	owners := map[string][]string{}
+	for user, profiles := range byUser {
+		for _, p := range profiles {
+			owners[p] = append(owners[p], user)
+		}
+	}
+	return owners, nil
+}
+
+// checkNoDevicesOnProfile refuses a profile name that devices are still
+// joined to, from an earlier profile of that name: they would get the
+// new user's credentials.
+func checkNoDevicesOnProfile(db *sql.DB, profile string) error {
+	rows, err := db.Query(`SELECT COALESCE(NULLIF(name, ''), id) FROM devices WHERE profile = ? ORDER BY 1`, profile)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = rows.Close() }()
+	var devices []string
+	for rows.Next() {
+		var d string
+		if err := rows.Scan(&d); err != nil {
+			return err
+		}
+		devices = append(devices, d)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if len(devices) > 0 {
+		return fmt.Errorf("%w: devices still joined to an earlier profile %q: %s; remove them on the Devices page first",
+			errUserProfileConflict, profile, strings.Join(devices, ", "))
+	}
+	return nil
+}
+
+// clearLeftoverCredentials drops what is still stored under names the
+// plan is about to declare: secrets, OAuth tokens and verification
+// results. Those names are undeclared, so the rows are left over from
+// an earlier config; the new credentials must start empty, not inherit
+// another person's token.
+func (g *Gateway) clearLeftoverCredentials(names []string) error {
 	for _, name := range names {
-		_, found, err := readCredentialSecrets(db, name)
-		if err != nil {
+		if err := clearCredentialSecrets(g.db, name); err != nil {
 			return err
 		}
-		if !found {
-			continue
+		if g.oauth != nil {
+			g.oauth.Revoke(name)
 		}
-		if err := clearCredentialSecrets(db, name); err != nil {
+		if _, err := g.db.Exec(`DELETE FROM credentials WHERE id = ?`, name); err != nil {
 			return err
 		}
-		log.Printf("dashboard config: cleared the stored secret left under undeclared credential %q", name)
+		if err := clearCredentialVerification(g.db, name); err != nil {
+			return err
+		}
 	}
 	return nil
 }
