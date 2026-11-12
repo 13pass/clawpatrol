@@ -203,6 +203,9 @@ func TestScopedRuleRefusals(t *testing.T) {
 		{"condition unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method == 'GET'"}},
 		{"condition does not compile", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method =="}},
 		{"condition unknown variable", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "k8s.verb == 'get'"}},
+		{"condition too long", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.path == '" + strings.Repeat("a", ruleRequestTextMaxLen) + "'"}},
+		{"member condition loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "['/a', '/b'].exists(p, http.path == p)"}},
 	}
 	for _, tc := range cases {
 		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, &RuleAuthor{Username: "alice"}); err == nil {
@@ -318,6 +321,41 @@ func TestScopedRuleKeepsTemplateSequencesAndQuotedAndsLiteral(t *testing.T) {
 	}
 }
 
+func TestScopedRuleAdminConditionMayLoop(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	cond := "['/a', '/b'].exists(p, http.path == p)"
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: cond}, nil)
+	if err != nil || rule.Condition != cond {
+		t.Fatalf("admin loop condition = %+v, %v", rule, err)
+	}
+}
+
+func TestScopedRuleHandWrittenConditionIsWrittenAsTyped(t *testing.T) {
+	dir, cp := scopedRuleTestDir(t)
+	// Split at the `&&`, the comment would end on the first line and
+	// the second clause would become live.
+	cond := "http.method == 'POST' // only posts && http.path == '/nope'"
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: cond}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := installRule(t, dir, rule)
+	if got := matchedRule(ep, httpReq("POST", "/api/v4/projects", "team-a", nil)); got != rule.RuleName {
+		t.Errorf("POST matched %q, want %q\n%s", got, rule.RuleName, rule.HCL)
+	}
+}
+
+func TestScopedRuleWarnsTheReplayHasNoBody(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.body.contains('x')"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.Warnings) != 1 || !strings.Contains(rule.Warnings[0], "without their bodies") {
+		t.Errorf("warnings = %q, want the replay-has-no-body warning", rule.Warnings)
+	}
+}
+
 func TestSplitCELAnd(t *testing.T) {
 	cases := map[string][]string{
 		"a && b":                 {"a", "b"},
@@ -326,6 +364,8 @@ func TestSplitCELAnd(t *testing.T) {
 		"a == r'x && y' && b":    {"a == r'x && y' && b"},
 		"a == '''x && y''' && b": {"a == '''x && y''' && b"},
 		"a == 'open && b":        {"a == 'open && b"},
+		"a // c && b":            {"a // c && b"},
+		"a.`x && y` && b":        {"a.`x && y` && b"},
 	}
 	for in, want := range cases {
 		if got := splitCELAnd(in); !slices.Equal(got, want) {

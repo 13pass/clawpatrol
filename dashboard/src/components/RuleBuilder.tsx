@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   createRule,
   listUsers,
@@ -80,6 +80,8 @@ export function RuleBuilderModal({
   // uses the generated condition and Matching applies again.
   const [conditionText, setConditionText] = useState<string | null>(null);
   const condition = conditionText?.trim() ? conditionText : undefined;
+  const prefillOnPreview = useRef(false);
+  const conditionId = useId();
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -111,14 +113,18 @@ export function RuleBuilderModal({
   useEffect(() => {
     if (!ev.id || created) return;
     const id = ev.id;
-    const key = JSON.stringify(request);
+    // An object, not a let: the linter forbids reassigning a local after render.
     const ctl = { cancelled: false };
     const t = setTimeout(() => {
       previewRule(id, request)
         .then((p) => {
           if (ctl.cancelled) return;
-          setPreviewed({ key, resp: p });
+          setPreviewed({ key: requestKey, resp: p });
           setErr(null);
+          if (prefillOnPreview.current) {
+            prefillOnPreview.current = false;
+            setConditionText((text) => (text === "" ? (p.rule.condition ?? "") : text));
+          }
         })
         .catch((e: Error) => {
           if (ctl.cancelled) return;
@@ -130,7 +136,19 @@ export function RuleBuilderModal({
       ctl.cancelled = true;
       clearTimeout(t);
     };
-  }, [ev.id, request, created]);
+  }, [ev.id, request, requestKey, created]);
+
+  // editCondition opens the editor on the generated condition. While
+  // the preview is behind, it opens empty and the next preview fills it.
+  function editCondition() {
+    prefillOnPreview.current = !fresh;
+    setConditionText(fresh ? (preview?.rule.condition ?? "") : "");
+  }
+
+  function closeConditionEditor() {
+    prefillOnPreview.current = false;
+    setConditionText(null);
+  }
 
   async function create() {
     if (!ev.id || !fresh) return;
@@ -272,18 +290,21 @@ export function RuleBuilderModal({
             </div>
 
             {ev.endpoint && conditionText !== null && (
-              <label className="block space-y-1">
-                <span className="flex items-baseline justify-between gap-2">
-                  <span className={labelClass}>Condition (CEL)</span>
+              <div className="space-y-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <label htmlFor={conditionId} className={labelClass}>
+                    Condition (CEL)
+                  </label>
                   <button
                     type="button"
-                    onClick={() => setConditionText(null)}
+                    onClick={closeConditionEditor}
                     className="text-2xs underline text-text-muted"
                   >
                     Use the generated condition
                   </button>
-                </span>
+                </div>
                 <textarea
+                  id={conditionId}
                   value={conditionText}
                   onChange={(e) => setConditionText(e.target.value)}
                   rows={4}
@@ -296,14 +317,13 @@ export function RuleBuilderModal({
                     : "Replaces what Matching generates; it applies again while this is empty."}{" "}
                   The rule keeps its endpoint{isAdmin ? "" : ", your profile and its credential"}.
                 </span>
-              </label>
+              </div>
             )}
             {ev.endpoint && conditionText === null && (
               <button
                 type="button"
-                disabled={previewed !== null && !fresh}
-                onClick={() => setConditionText(fresh ? (preview?.rule.condition ?? "") : "")}
-                className="text-xs underline text-text-muted disabled:opacity-60"
+                onClick={editCondition}
+                className="text-xs underline text-text-muted"
               >
                 Edit the condition
               </button>

@@ -7,11 +7,14 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/facet"
 	"github.com/denoland/clawpatrol/internal/config/match"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
+	"github.com/google/cel-go/cel"
+	celast "github.com/google/cel-go/common/ast"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -143,12 +146,22 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		req.Condition = ""
 	}
 	if req.Condition != "" {
-		if _, err := facet.NewMatcher(ep.Family, req.Condition); err != nil {
+		if len(req.Condition) > ruleRequestTextMaxLen {
+			return nil, fmt.Errorf("the condition is longer than %d characters", ruleRequestTextMaxLen)
+		}
+		if author != nil && usesComprehension(req.Condition) {
+			return nil, fmt.Errorf("condition: all, exists, exists_one, map and filter are for admins only, as they run on every request")
+		}
+		m, err := facet.NewMatcher(ep.Family, req.Condition)
+		if err != nil {
 			return nil, fmt.Errorf("condition: %w", err)
 		}
 		// The condition replaces what the scope and header pin generate,
 		// so neither is checked nor part of the name.
 		condition, warnings = req.Condition, nil
+		if m.InspectsTruncatableFacet() {
+			warnings = append(warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
+		}
 		req.Scope, req.PinHeader = "", ""
 	} else if genErr != nil {
 		return nil, genErr
@@ -258,7 +271,11 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 	if rule.Profile != "" {
 		b.SetAttributeRaw("profile", config.TraversalTokens("profile."+rule.Profile))
 	}
-	if rule.Condition != "" {
+	switch {
+	case rule.HandWritten:
+		// Written as typed: re-laying it out could change its meaning.
+		b.SetAttributeValue("condition", cty.StringVal(rule.Condition))
+	case rule.Condition != "":
 		setCELCondition(b, rule.Condition)
 	}
 	by := "an admin"
@@ -284,6 +301,24 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 		}
 		b.SetAttributeRaw("approve", approverListTokens(approver))
 	}
+}
+
+var parseOnlyCELEnv = sync.OnceValues(func() (*cel.Env, error) { return cel.NewEnv() })
+
+// usesComprehension reports whether condition calls a macro that loops
+// (all, exists, exists_one, map, filter). A condition that does not
+// parse reports false: compiling it reports the error.
+func usesComprehension(condition string) bool {
+	env, err := parseOnlyCELEnv()
+	if err != nil {
+		return false
+	}
+	parsed, iss := env.Parse(condition)
+	if iss.Err() != nil {
+		return false
+	}
+	loops := celast.MatchDescendants(celast.NavigateAST(parsed.NativeRep()), celast.KindMatcher(celast.ComprehensionKind))
+	return len(loops) > 0
 }
 
 func approverListTokens(ref string) hclwrite.Tokens {

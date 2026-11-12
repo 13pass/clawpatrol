@@ -252,8 +252,8 @@ const celHeredocMarker = "CEL"
 var heredocTemplateEscaper = strings.NewReplacer("${", "$${", "%{", "%%{")
 
 // splitCELAnd splits a condition at each ` && ` outside a string
-// literal. A raw or triple-quoted literal, or an unterminated one,
-// leaves the condition whole.
+// literal. A raw or triple-quoted literal, an unterminated one, a
+// comment or a backtick-quoted name leaves the condition whole.
 func splitCELAnd(condition string) []string {
 	var parts []string
 	start := 0
@@ -274,6 +274,8 @@ func splitCELAnd(condition string) []string {
 				return []string{condition}
 			}
 			quote = c
+		case c == '`' || strings.HasPrefix(condition[i:], "//"):
+			return []string{condition}
 		case strings.HasPrefix(condition[i:], " && "):
 			parts = append(parts, condition[start:i])
 			i += len(" && ") - 1
