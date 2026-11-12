@@ -18,6 +18,7 @@ import (
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
+	"golang.org/x/net/http/httpguts"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/credentials"
@@ -34,8 +35,6 @@ var (
 	// configNameRE is what the form accepts as a credential or endpoint
 	// name: an HCL identifier, so `<type>.<name>` stays a reference.
 	configNameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
-	// httpHeaderNameRE is an RFC 9110 field name.
-	httpHeaderNameRE = regexp.MustCompile("^[!#$%&'*+.^_`|~0-9A-Za-z-]+$")
 	// endpointHostRE is a lowercase DNS name, optionally `*.`-prefixed.
 	endpointHostRE = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 
@@ -284,13 +283,21 @@ func (l *profileCredentials) without(name string) []byte {
 			continue
 		}
 		start, end := e.start, e.end
+		afterComma := end
 		if j := skipBlanks(src, end); j < len(src) && src[j] == ',' {
-			end = skipBlanks(src, j+1)
-		} else if k := lastNonBlank(src, start); k >= 0 && src[k] == ',' {
-			start = k
+			afterComma = j + 1
 		}
-		if ls, le := lineStart(src, start), lineEnd(src, end); isBlank(src[ls:start]) && isBlank(src[end:le]) && le < len(src) {
+		ls, le := lineStart(src, start), lineEnd(src, afterComma)
+		switch {
+		case isBlank(src[ls:start]) && isBlankOrComment(src[afterComma:le]) && le < len(src):
+			// Alone on its line: the line goes, with the entry's comment.
 			start, end = ls, le+1
+		case afterComma != end:
+			end = skipBlanks(src, afterComma)
+		default:
+			if k := lastNonBlank(src, start); k >= 0 && src[k] == ',' {
+				start = k
+			}
 		}
 		src = append(src[:start:start], src[end:]...)
 	}
@@ -355,6 +362,11 @@ func isBlank(b []byte) bool {
 	return len(bytes.Trim(b, " \t")) == 0
 }
 
+func isBlankOrComment(b []byte) bool {
+	b = bytes.Trim(b, " \t")
+	return len(b) == 0 || b[0] == '#' || bytes.HasPrefix(b, []byte("//"))
+}
+
 // setProfileCredentialsSource replaces a profile's `credentials` list
 // with src.
 func setProfileCredentialsSource(profile *hclwrite.Block, src []byte) error {
@@ -395,7 +407,13 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 		}
 		list, err := parseProfileCredentials(profile)
 		if err != nil {
-			return err
+			// The form cannot read this list, so it leaves it alone; a
+			// request to add the credential to it is refused. If the
+			// list still names a removed credential, the reload says so.
+			if wanted[labels[0]] {
+				return fmt.Errorf("%w: profile %q: %v; change it in the config", errBadCredentialRequest, labels[0], err)
+			}
+			continue
 		}
 		has := list.has(credName)
 		switch {
@@ -432,7 +450,7 @@ func endpointHost(raw string) (string, error) {
 		if u.Scheme != "https" {
 			return "", fmt.Errorf("%w: host: only https URLs can be declared here", errBadCredentialRequest)
 		}
-		if u.Port() != "" {
+		if port := u.Port(); port != "" && port != "443" {
 			return "", fmt.Errorf("%w: host: a port other than 443 needs an endpoint written in the config", errBadCredentialRequest)
 		}
 		raw = u.Hostname()
@@ -491,7 +509,7 @@ func setCredentialFields(blk *hclwrite.Block, typ credentialTypeOption, req cred
 		return fmt.Errorf("%w: a %s credential has no header settings", errBadCredentialRequest, typ.Type)
 	}
 	if req.Header != nil {
-		if !httpHeaderNameRE.MatchString(*req.Header) {
+		if !httpguts.ValidHeaderFieldName(*req.Header) {
 			return fmt.Errorf("%w: %q is not an HTTP header name", errBadCredentialRequest, *req.Header)
 		}
 		blk.Body().SetAttributeValue("header", cty.StringVal(*req.Header))
@@ -576,15 +594,17 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		if len(labels) != 1 {
 			continue
 		}
-		list, err := parseProfileCredentials(blk)
-		if err != nil {
-			http.Error(rw, err.Error(), http.StatusInternalServerError)
-			return
-		}
-		profiles = append(profiles, credentialConfigProfile{
+		prof := credentialConfigProfile{
 			credentialConfigFile: credentialConfigFile{Name: labels[0], File: files[i], ReadOnly: tree.readOnly(files[i])},
-			Credentials:          list.names(),
-		})
+			Credentials:          []string{},
+		}
+		if list, err := parseProfileCredentials(blk); err == nil {
+			prof.Credentials = list.names()
+		} else {
+			// A list the form cannot read is one it cannot change.
+			prof.ReadOnly = true
+		}
+		profiles = append(profiles, prof)
 	}
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
 
@@ -627,9 +647,11 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 }
 
 // credentialPlan is a planned credential change: the files to write,
-// and what to do once they are written, still under the config lock.
+// and what to do just before and just after writing them, still under
+// the config lock.
 type credentialPlan struct {
 	changes []configChange
+	before  func() error
 	after   func() error
 }
 
@@ -679,8 +701,8 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 			return credentialPlan{}, err
 		}
 		// A secret left under this name by an earlier credential must
-		// not become the new one's.
-		return credentialPlan{changes: tree.changes(target, ""), after: w.clearCredentialState(req.Name)}, nil
+		// never become the new one's, not even for the first requests.
+		return credentialPlan{changes: tree.changes(target, ""), before: w.clearCredentialState(req.Name)}, nil
 	})
 }
 
@@ -698,7 +720,8 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return credentialPlan{}, err
 		}
-		if req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil {
+		settings := req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil
+		if settings {
 			typ, ok := editableCredentialType(credType)
 			if !ok {
 				return credentialPlan{}, fmt.Errorf("%w: the form cannot change a %s credential's settings; change them in %s", errBadCredentialRequest, credType, file)
@@ -726,7 +749,12 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			// that references it.
 			first = target
 		}
-		return credentialPlan{changes: tree.changes(first, "")}, nil
+		p := credentialPlan{changes: tree.changes(first, "")}
+		if settings {
+			// The last verification checked the old header or endpoint.
+			p.after = func() error { return clearCredentialVerification(w.g.db, req.Name) }
+		}
+		return p, nil
 	})
 }
 
@@ -751,14 +779,22 @@ func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// clearCredentialState returns a step that drops a credential's stored
-// secret and verification result. It runs under the config lock, so no
-// credential of that name can be declared and given a secret meanwhile.
+// clearCredentialState returns a step that drops everything stored for
+// a credential name: its secret slots, an OAuth token (the secret store
+// falls back to one under the same name) and its verification result.
+// It runs under the config lock, so no credential of that name can be
+// declared and given a secret meanwhile.
 func (w *webMux) clearCredentialState(name string) func() error {
 	return func() error {
 		defer w.lockCredentialSave(name)()
 		if err := clearCredentialSecrets(w.g.db, name); err != nil {
 			return fmt.Errorf("clear the stored secret of %s: %w", name, err)
+		}
+		if w.g.oauth != nil {
+			w.g.oauth.Revoke(name)
+		}
+		if _, err := w.g.db.Exec("DELETE FROM credentials WHERE id=?", name); err != nil {
+			return fmt.Errorf("clear the stored OAuth token of %s: %w", name, err)
 		}
 		if err := clearCredentialVerification(w.g.db, name); err != nil {
 			return fmt.Errorf("clear the verification result of %s: %w", name, err)
@@ -810,6 +846,12 @@ func (w *webMux) editCredentialConfig(rw http.ResponseWriter, r *http.Request,
 	files := make([]string, 0, len(p.changes))
 	for _, c := range p.changes {
 		files = append(files, c.Name)
+	}
+	if p.before != nil {
+		if err := p.before(); err != nil {
+			http.Error(rw, "nothing was written: "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	if len(p.changes) > 0 && !w.applyConfigChanges(rw, p.changes) {
 		return

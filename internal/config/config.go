@@ -183,9 +183,10 @@ type GatewaySettings struct {
 	// change the gateway HCL: append generated rules, and add, edit
 	// or remove header and bearer token credentials from a device's
 	// Credentials panel. Default false: config remains read-only and
-	// changes happen out-of-band. In a config directory, a file with
-	// a `# clawpatrol:dashboard-readonly` comment line is never
-	// written, for a file a deploy script renders from a template.
+	// changes happen out-of-band. A config file (one of a directory,
+	// or the single file) with a `# clawpatrol:dashboard-readonly`
+	// comment line is never written, for a file a deploy script
+	// renders from a template.
 	// Enabling it hands every dashboard login full control of the
 	// gateway: rules, credential bindings, and tunnels, including
 	// `local_command` tunnels that run a program as the gateway's

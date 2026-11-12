@@ -351,8 +351,10 @@ func TestProfileCredentialsEdits(t *testing.T) {
 		{"[a.b, a.c]", "a.x", "b", "[a.b, a.c, a.x]", "[a.c]"},
 		{"[a.b, a.c]", "a.x", "c", "[a.b, a.c, a.x]", "[a.b]"},
 		{"[\n  a.b,\n  a.c,\n]", "a.x", "b", "[\n  a.b,\n  a.c,\n  a.x,\n]", "[\n  a.c,\n]"},
-		{"[\n  a.b,\n  a.c\n]", "a.x", "c", "[\n  a.b,\n  a.c,\n  a.x\n]", "[\n  a.b\n]"},
+		{"[\n  a.b,\n  a.c\n]", "a.x", "c", "[\n  a.b,\n  a.c,\n  a.x\n]", "[\n  a.b,\n]"},
 		{"[\n  a.b, # keep\n  a.c]", "a.x", "c", "[\n  a.b, # keep\n  a.c,\n  a.x]", "[\n  a.b, # keep\n  ]"},
+		{"[\n  a.b, # one\n  a.c, # two\n]", "a.x", "b", "[\n  a.b, # one\n  a.c, # two\n  a.x,\n]", "[\n  a.c, # two\n]"},
+		{"[\n  a.b,\n  a.c // two\n]", "a.x", "c", "[\n  a.b,\n  a.c, // two\n  a.x\n]", "[\n  a.b,\n]"},
 	}
 	for _, c := range cases {
 		f, diags := hclwrite.ParseConfig([]byte("profile \"p\" {\n  credentials = "+c.src+"\n}\n"), "", hcl.InitialPos)
@@ -401,5 +403,62 @@ func TestCredentialDeclareClearsStaleSecret(t *testing.T) {
 	}
 	if _, found, err := readCredentialSecrets(w.g.db, "gl"); err != nil || found {
 		t.Errorf("a secret from before the declaration survived (found=%v err=%v)", found, err)
+	}
+}
+
+func TestCredentialEditSettingsClearsVerification(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	if rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "header_token", "name": "gh-pat", "header": "Authorization", "endpoint": "gitlab",
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if err := setCredentialVerification(w.g.db, "gh-pat", "ok", ""); err != nil {
+		t.Fatal(err)
+	}
+	if rw := credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "gh-pat", "profiles": []string{}}); rw.Code != http.StatusOK {
+		t.Fatalf("profiles-only edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if _, found := getCredentialVerification(w.g.db, "gh-pat"); !found {
+		t.Error("a profiles-only edit cleared the verification result")
+	}
+	if rw := credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "gh-pat", "header": "PRIVATE-TOKEN"}); rw.Code != http.StatusOK {
+		t.Fatalf("header edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if _, found := getCredentialVerification(w.g.db, "gh-pat"); found {
+		t.Error("the verification of the old header survived the edit")
+	}
+}
+
+func TestCredentialDeclareAcceptsDefaultPort(t *testing.T) {
+	if host, err := endpointHost("https://Git.Example.org:443/group"); err != nil || host != "git.example.org" {
+		t.Errorf("endpointHost(:443) = %q, %v", host, err)
+	}
+	if _, err := endpointHost("https://git.example.org:8443"); err == nil {
+		t.Error("endpointHost accepted port 8443")
+	}
+}
+
+func TestCredentialProfilesSkipUnreadableList(t *testing.T) {
+	dir := t.TempDir()
+	src := `profile "odd" { credentials = some_list }
+profile "ok" { credentials = [bearer_token.tok] }
+`
+	if err := os.WriteFile(filepath.Join(dir, "20-profiles.hcl"), []byte(src), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	tree, err := loadConfigTree(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := tree.setCredentialProfiles("bearer_token", "tok", nil); err != nil {
+		t.Fatalf("removing from every profile: %v", err)
+	}
+	if got := string(tree.changes("", "")[0].Content); !strings.Contains(got, "credentials = some_list") || strings.Contains(got, "bearer_token.tok") {
+		t.Errorf("profiles = %q, want odd untouched and tok gone from ok", got)
+	}
+	if err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
+		t.Errorf("adding to the unreadable list: err = %v, want it refused", err)
 	}
 }
