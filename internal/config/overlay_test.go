@@ -158,3 +158,46 @@ rule "pinned" {
 		t.Fatalf("pin to an undeclared profile: diags = %v", diags)
 	}
 }
+
+func TestReadSourcesRejectsRemovingANonConfigName(t *testing.T) {
+	dir := t.TempDir()
+	writeHCL(t, dir, "00-gateway.hcl", overlayGatewayHCL)
+	for _, name := range []string{"../x.hcl", "notes.txt"} {
+		if _, diags := config.ReadSources(dir, map[string][]byte{name: nil}); !diags.HasErrors() {
+			t.Errorf("removing %q was accepted", name)
+		}
+	}
+}
+
+func TestReadSourcesReportsEveryUnreadableFile(t *testing.T) {
+	dir := t.TempDir()
+	writeHCL(t, dir, "00-gateway.hcl", overlayGatewayHCL)
+	writeHCL(t, dir, "10-a.hcl", overlayEndpointsHCL)
+	writeHCL(t, dir, "20-b.hcl", "")
+	for _, name := range []string{"10-a.hcl", "20-b.hcl"} {
+		if err := os.Chmod(filepath.Join(dir, name), 0); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err := os.ReadFile(filepath.Join(dir, "10-a.hcl")); err == nil {
+		t.Skip("this user reads files with no permissions")
+	}
+	_, diags := config.ReadSources(dir, nil)
+	if len(diags) != 2 {
+		t.Errorf("diagnostics = %s, want one per unreadable file", diags.Error())
+	}
+}
+
+func TestReadSourcesSingleFileTakesNoOverrides(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "gateway.hcl")
+	if err := os.WriteFile(path, []byte(overlayGatewayHCL), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, diags := config.ReadSources(path, map[string][]byte{"x.hcl": nil}); !diags.HasErrors() {
+		t.Error("a single-file config accepted overrides")
+	}
+	sources, diags := config.ReadSources(path, nil)
+	if diags.HasErrors() || string(sources["gateway.hcl"]) != overlayGatewayHCL {
+		t.Errorf("sources = %q, %s", sources, diags.Error())
+	}
+}

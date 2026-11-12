@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -99,13 +101,14 @@ func loadConfigTree(cfgPath string) (*configTree, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
+	paths := &configTree{cfgPath: cfgPath}
+	sources := map[string][]byte{}
 	for _, info := range infos {
-		if err := t.add(info.Name); err != nil {
+		if sources[info.Name], err = readConfigFileOrEmpty(paths.path(info.Name)); err != nil {
 			return nil, err
 		}
 	}
-	return t, nil
+	return newConfigTree(cfgPath, sources)
 }
 
 func (t *configTree) path(name string) string {
@@ -530,7 +533,7 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 	for _, def := range t.newEndpointRules() {
 		label := def.Labels()[0]
 		if seen[label] {
-			return fmt.Errorf("defaults declares new_endpoint_rule %q more than once", label)
+			return fmt.Errorf("%w: defaults declares new_endpoint_rule %q more than once", errBadCredentialRequest, label)
 		}
 		seen[label] = true
 		ruleName := newEndpointRuleName(name, label)
@@ -539,7 +542,12 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 		}
 		rule := appendBlock(f, "rule", []string{ruleName})
 		rule.Body().SetAttributeTraversal("endpoint", entityRef(newEndpointType, name))
-		body := def.Body().BuildTokens(nil)
+		// Copies: formatting the file rewrites tokens' spacing in place,
+		// which would re-indent the defaults block too.
+		var body hclwrite.Tokens
+		for _, tok := range def.Body().BuildTokens(nil) {
+			body = append(body, &hclwrite.Token{Type: tok.Type, Bytes: slices.Clone(tok.Bytes), SpacesBefore: tok.SpacesBefore})
+		}
 		for len(body) > 0 && body[0].Type == hclsyntax.TokenNewline {
 			body = body[1:]
 		}
@@ -583,6 +591,12 @@ func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Ga
 	if gw.Defaults == nil || len(gw.Defaults.NewEndpointRules) == 0 {
 		return nil
 	}
+	sum := configSourcesSum(path, sources)
+	newEndpointRulesChecked.Lock()
+	defer newEndpointRulesChecked.Unlock()
+	if newEndpointRulesChecked.sum == sum {
+		return nil
+	}
 	tree, err := newConfigTree(path, sources)
 	if err != nil {
 		return err
@@ -611,7 +625,26 @@ func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Ga
 		return fmt.Errorf("defaults.new_endpoint_rule: the rules a host added on the dashboard gets would not load "+
 			"(checked by adding endpoint %q to %s in memory, so positions there are not in the file): %w", name, target, err)
 	}
+	newEndpointRulesChecked.sum = sum
 	return nil
+}
+
+// newEndpointRulesChecked holds the sum of the last config that passed
+// checkNewEndpointRules: a dashboard write validates a change, then
+// reloads the same files, and the check runs once.
+var newEndpointRulesChecked struct {
+	sync.Mutex
+	sum [sha256.Size]byte
+}
+
+func configSourcesSum(path string, sources map[string][]byte) [sha256.Size]byte {
+	h := sha256.New()
+	fmt.Fprintf(h, "%q\n", path)
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		fmt.Fprintf(h, "%q %d\n", name, len(sources[name]))
+		h.Write(sources[name])
+	}
+	return [sha256.Size]byte(h.Sum(nil))
 }
 
 // probeNameTaken reports whether the probe endpoint name, or a rule

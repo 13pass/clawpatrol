@@ -298,3 +298,40 @@ profile "default" { credentials = [] }
 		t.Fatalf("loadConfig in a read-only directory: %v", err)
 	}
 }
+
+func TestDeclareNewHostLeavesTheDefaultsBlockAsWritten(t *testing.T) {
+	w := configDirTestMux(t)
+	// In the file the form writes to, so formatting that file would
+	// reach the defaults block.
+	if err := os.WriteFile(filepath.Join(w.g.cfgPath, dashboardConfigFile), []byte(testNewEndpointRules), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.g.reloadConfigFromFileLocked(w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "forge-tok",
+		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
+	})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, w, dashboardConfigFile); !strings.HasPrefix(got, testNewEndpointRules) {
+		t.Errorf("the defaults block was rewritten:\n%s", got)
+	}
+}
+
+func TestDeclareWithDuplicateLabelIsABadRequest(t *testing.T) {
+	w := configDirTestMux(t)
+	dup := "defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n"
+	if err := setNewEndpointRules(t, w, dup); err == nil {
+		t.Fatal("a duplicated label loaded")
+	}
+	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "forge-tok",
+		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
+	})
+	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "more than once") {
+		t.Fatalf("status=%d body=%s, want 400 naming the duplicated label", rw.Code, rw.Body.String())
+	}
+}

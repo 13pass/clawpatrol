@@ -1209,6 +1209,57 @@ func IsDirConfigFileName(name string) bool {
 // is LoadDir's, so a candidate change can be validated in place
 // before it is written.
 func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	sources, diags := ReadDirSources(dir, overrides)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	return LoadDirSources(dir, sources)
+}
+
+// ReadSources reads the config at path, keyed by file name, for
+// LoadSources: the single file, or a directory's files with overrides
+// applied as for LoadDirOverlay. A single file takes no overrides.
+func ReadSources(path string, overrides map[string][]byte) (map[string][]byte, hcl.Diagnostics) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Cannot read config path",
+			Detail:   err.Error(),
+		}}
+	}
+	if info.IsDir() {
+		return ReadDirSources(path, overrides)
+	}
+	if len(overrides) > 0 {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Overrides need a config directory",
+			Detail:   fmt.Sprintf("%q is a single file; only a config directory takes replaced files.", path),
+		}}
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Cannot read config file",
+			Detail:   err.Error(),
+		}}
+	}
+	return map[string][]byte{filepath.Base(path): src}, nil
+}
+
+// LoadSources loads the config at path from ReadSources' result.
+func LoadSources(path string, sources map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return LoadDirSources(path, sources)
+	}
+	return LoadBytes(sources[filepath.Base(path)], path)
+}
+
+// ReadDirSources reads the files LoadDirOverlay would load, keyed by
+// file name. Every file that cannot be read is reported.
+func ReadDirSources(dir string, overrides map[string][]byte) (map[string][]byte, hcl.Diagnostics) {
 	onDisk, err := DirFileNames(dir)
 	if err != nil {
 		return nil, hcl.Diagnostics{{
@@ -1254,7 +1305,7 @@ func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diag
 	if diags.HasErrors() {
 		return nil, diags
 	}
-	return LoadDirSources(dir, sources)
+	return sources, nil
 }
 
 // LoadDirSources loads a config directory from file contents already

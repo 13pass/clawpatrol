@@ -204,22 +204,17 @@ func newReqID() string {
 // through config's package-global PluginLoader, installed once at
 // process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
-	return loadConfigWithOverrides(path, nil)
+	return loadConfigOverlay(path, nil)
 }
 
 // loadConfigOverlay is loadConfig for a config directory with some
 // files' contents replaced in memory (nil removes a file). Used to
-// validate a candidate change before writing it.
-func loadConfigOverlay(dir string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
-	return loadConfigWithOverrides(dir, overrides)
-}
-
-// loadConfigWithOverrides reads the config's files once, loads them,
-// and checks defaults.new_endpoint_rule against the same contents.
-func loadConfigWithOverrides(path string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
-	sources, err := readConfigSources(path, overrides)
-	if err != nil {
-		return nil, nil, err
+// validate a candidate change before writing it. The files are read
+// once; defaults.new_endpoint_rule is checked against that copy.
+func loadConfigOverlay(path string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	sources, diags := config.ReadSources(path, overrides)
+	if diags.HasErrors() {
+		return nil, nil, fmt.Errorf("%s", diags.Error())
 	}
 	gw, cp, err := compileConfigSources(path, sources)
 	if err != nil {
@@ -231,15 +226,10 @@ func loadConfigWithOverrides(path string, overrides map[string][]byte) (*config.
 	return gw, cp, nil
 }
 
-// compileConfigSources loads and compiles config files already read,
-// keyed by name: a directory's files, or the single file's.
+// compileConfigSources loads and compiles config files already read
+// by config.ReadSources.
 func compileConfigSources(path string, sources map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
-	if configIsDir(path) {
-		gw, diags := config.LoadDirSources(path, sources)
-		return compileLoadedConfig(gw, diags)
-	}
-	gw, diags := config.LoadBytes(sources[filepath.Base(path)], path)
-	return compileLoadedConfig(gw, diags)
+	return compileLoadedConfig(config.LoadSources(path, sources))
 }
 
 func compileLoadedConfig(gw *config.Gateway, diags hcl.Diagnostics) (*config.Gateway, *config.CompiledPolicy, error) {

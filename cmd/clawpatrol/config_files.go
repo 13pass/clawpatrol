@@ -121,43 +121,6 @@ func planConfigAppend(cfgPath, target string, current []byte, snippet string) ([
 	return append([]configChange{{Name: target, Content: appendConfigSnippet(current, snippet)}}, profileChanges...), nil
 }
 
-// readConfigSources reads the config at path, keyed by file name: every
-// file of a directory, or the single file. In a directory, overrides
-// replace or add files (nil content removes one).
-func readConfigSources(path string, overrides map[string][]byte) (map[string][]byte, error) {
-	if !configIsDir(path) {
-		if len(overrides) > 0 {
-			return nil, fmt.Errorf("single-file config: overrides need a config directory")
-		}
-		b, err := os.ReadFile(path)
-		if err != nil {
-			return nil, err
-		}
-		return map[string][]byte{filepath.Base(path): b}, nil
-	}
-	names, err := config.DirFileNames(path)
-	if err != nil {
-		return nil, err
-	}
-	sources := map[string][]byte{}
-	for _, name := range names {
-		if _, overridden := overrides[name]; overridden {
-			continue
-		}
-		b, err := os.ReadFile(filepath.Join(path, name))
-		if err != nil {
-			return nil, err
-		}
-		sources[name] = b
-	}
-	for name, b := range overrides {
-		if b != nil {
-			sources[name] = b
-		}
-	}
-	return sources, nil
-}
-
 // readConfigFileOrEmpty reads a config file; one that does not exist
 // yet reads as empty, so it has the revision of empty content.
 func readConfigFileOrEmpty(path string) ([]byte, error) {
