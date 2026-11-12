@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclwrite"
 )
 
 func credentialConfigCall(t *testing.T, handler http.HandlerFunc, body map[string]any) *httptest.ResponseRecorder {
@@ -287,5 +290,116 @@ func TestConfigFileReadOnlyMarker(t *testing.T) {
 		if got := configFileReadOnly([]byte(content)); got != want {
 			t.Errorf("configFileReadOnly(%q) = %v, want %v", content, got, want)
 		}
+	}
+}
+
+// writeProfilesFile replaces the fixture's profiles file and reloads.
+func writeProfilesFile(t *testing.T, w *webMux, src string) {
+	t.Helper()
+	if err := os.WriteFile(filepath.Join(w.g.cfgPath, configDirProfilesFile), []byte(src), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.g.reloadConfigFromFileLocked(w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestCredentialProfilesKeepObjectEntriesCommentsAndLayout(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	writeProfilesFile(t, w, `profile "default" {
+  credentials = [
+    # the GitHub token
+    { credential = bearer_token.tok },
+  ]
+}
+profile "other" { credentials = [] }
+`)
+	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "gl", "endpoint": "gitlab", "profiles": []string{"default", "other"},
+	})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	got := readCfgFile(t, w, configDirProfilesFile)
+	for _, want := range []string{"# the GitHub token", "{ credential = bearer_token.tok }", "    bearer_token.gl,\n  ]", `profile "other" { credentials = [bearer_token.gl] }`} {
+		if !strings.Contains(got, want) {
+			t.Errorf("after declare, %s = %q, want %q", configDirProfilesFile, got, want)
+		}
+	}
+
+	opts := httptest.NewRecorder()
+	w.apiCredentialOptions(opts, httptest.NewRequest(http.MethodGet, "/api/credentials/options", nil))
+	if opts.Code != http.StatusOK || !strings.Contains(opts.Body.String(), `"credentials":["tok","gl"]`) {
+		t.Errorf("options: status=%d body=%s, want default listing tok and gl", opts.Code, opts.Body.String())
+	}
+
+	// other then binds gl and tok (different endpoints), default only gl.
+	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "tok", "profiles": []string{"other"}})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	got = readCfgFile(t, w, configDirProfilesFile)
+	if strings.Contains(got, "{ credential = bearer_token.tok }") || !strings.Contains(got, "bearer_token.gl") {
+		t.Errorf("after moving tok, %s = %q, want its object entry gone and gl kept", configDirProfilesFile, got)
+	}
+}
+
+func TestProfileCredentialsEdits(t *testing.T) {
+	cases := []struct{ src, add, remove, wantAdd, wantRemove string }{
+		{"[]", "a.x", "x", "[a.x]", "[]"},
+		{"[a.b, a.c]", "a.x", "b", "[a.b, a.c, a.x]", "[a.c]"},
+		{"[a.b, a.c]", "a.x", "c", "[a.b, a.c, a.x]", "[a.b]"},
+		{"[\n  a.b,\n  a.c,\n]", "a.x", "b", "[\n  a.b,\n  a.c,\n  a.x,\n]", "[\n  a.c,\n]"},
+		{"[\n  a.b,\n  a.c\n]", "a.x", "c", "[\n  a.b,\n  a.c,\n  a.x\n]", "[\n  a.b\n]"},
+		{"[\n  a.b, # keep\n  a.c]", "a.x", "c", "[\n  a.b, # keep\n  a.c,\n  a.x]", "[\n  a.b, # keep\n  ]"},
+	}
+	for _, c := range cases {
+		f, diags := hclwrite.ParseConfig([]byte("profile \"p\" {\n  credentials = "+c.src+"\n}\n"), "", hcl.InitialPos)
+		if diags.HasErrors() {
+			t.Fatalf("%q: %s", c.src, diags.Error())
+		}
+		list, err := parseProfileCredentials(f.Body().Blocks()[0])
+		if err != nil {
+			t.Fatalf("%q: %v", c.src, err)
+		}
+		if got := strings.TrimSpace(string(list.with(c.add))); got != c.wantAdd {
+			t.Errorf("%q with %s = %q, want %q", c.src, c.add, got, c.wantAdd)
+		}
+		if got := strings.TrimSpace(string(list.without(c.remove))); got != c.wantRemove {
+			t.Errorf("%q without %s = %q, want %q", c.src, c.remove, got, c.wantRemove)
+		}
+	}
+}
+
+func TestCredentialEditWithoutProfilesKeepsThem(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	if rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "header_token", "name": "gh-pat", "header": "Authorization", "endpoint": "gitlab", "profiles": []string{"default"},
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if rw := credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "gh-pat", "header": "PRIVATE-TOKEN"}); rw.Code != http.StatusOK {
+		t.Fatalf("edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, w, configDirProfilesFile); !strings.Contains(got, "header_token.gh-pat") {
+		t.Errorf("%s = %q, want gh-pat still listed", configDirProfilesFile, got)
+	}
+}
+
+func TestCredentialDeclareClearsStaleSecret(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	if err := setCredentialSlot(w.g.db, "gl", "", "old-token"); err != nil {
+		t.Fatal(err)
+	}
+	if rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "gl", "endpoint": "gitlab",
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if _, found, err := readCredentialSecrets(w.g.db, "gl"); err != nil || found {
+		t.Errorf("a secret from before the declaration survived (found=%v err=%v)", found, err)
 	}
 }

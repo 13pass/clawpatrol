@@ -190,7 +190,9 @@ export type CredentialConfigChange = {
   prefix?: string;
   endpoint?: string;
   new_endpoint?: { name: string; host: string };
-  profiles: string[];
+  // profiles: every profile that should list it; omitted on an edit, the
+  // profiles stay as they are.
+  profiles?: string[];
 };
 
 export async function getCredentialConfigOptions(): Promise<CredentialConfigOptions> {

@@ -67,7 +67,7 @@ func editableCredentialType(typ string) (credentialTypeOption, bool) {
 
 // credentialConfigRequest declares or edits a credential. Profiles is
 // the full set of profiles that list it afterwards. On an edit, a nil
-// Header, Prefix or Endpoint keeps the current value.
+// Header, Prefix, Endpoint or Profiles keeps the current value.
 type credentialConfigRequest struct {
 	Type        string              `json:"type,omitempty"`
 	Name        string              `json:"name"`
@@ -75,7 +75,7 @@ type credentialConfigRequest struct {
 	Prefix      *string             `json:"prefix,omitempty"`
 	Endpoint    *string             `json:"endpoint,omitempty"`
 	NewEndpoint *newEndpointRequest `json:"new_endpoint,omitempty"`
-	Profiles    []string            `json:"profiles"`
+	Profiles    *[]string           `json:"profiles,omitempty"`
 }
 
 // newEndpointRequest declares an https endpoint for one host,
@@ -91,6 +91,7 @@ type configTree struct {
 	names   []string
 	files   map[string]*hclwrite.File
 	orig    map[string][]byte
+	ro      map[string]bool
 }
 
 func loadConfigTree(cfgPath string) (*configTree, error) {
@@ -98,7 +99,7 @@ func loadConfigTree(cfgPath string) (*configTree, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}}
+	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
 	for _, info := range infos {
 		if err := t.add(info.Name); err != nil {
 			return nil, err
@@ -126,6 +127,7 @@ func (t *configTree) add(name string) error {
 	t.names = append(t.names, name)
 	t.files[name] = f
 	t.orig[name] = content
+	t.ro[name] = configFileReadOnly(content)
 	return nil
 }
 
@@ -169,7 +171,7 @@ func (t *configTree) blocks(blockType string) (files []string, blocks []*hclwrit
 }
 
 func (t *configTree) readOnly(file string) bool {
-	return configFileReadOnly(t.orig[file])
+	return t.ro[file]
 }
 
 // changes returns the files whose content changed, first file first,
@@ -196,14 +198,28 @@ func (t *configTree) changes(first, last string) []configChange {
 	return append(append(head, mid...), tail...)
 }
 
-// profileCredentialRefs returns the references in a profile block's
-// `credentials` list.
-func profileCredentialRefs(profile *hclwrite.Block) ([]hcl.Traversal, error) {
-	attr := profile.Body().GetAttribute("credentials")
-	if attr == nil {
-		return nil, nil
+// profileCredentials is a profile's `credentials` list as written: its
+// source, and the credential each entry names. An entry may be a
+// reference (`header_token.gh`) or an object
+// (`{ credential = header_token.gh, placeholder = "..." }`); one the form
+// cannot read names "" and is left as it is. Edits splice the source,
+// so the other entries, their comments and the list's layout stay.
+type profileCredentials struct {
+	src     []byte
+	closeAt int // offset of the closing bracket
+	entries []profileCredentialEntry
+}
+
+type profileCredentialEntry struct {
+	name       string
+	start, end int // offsets of the entry in src
+}
+
+func parseProfileCredentials(profile *hclwrite.Block) (*profileCredentials, error) {
+	src := []byte("[]")
+	if attr := profile.Body().GetAttribute("credentials"); attr != nil {
+		src = attr.Expr().BuildTokens(nil).Bytes()
 	}
-	src := attr.Expr().BuildTokens(nil).Bytes()
 	expr, diags := hclsyntax.ParseExpression(src, "", hcl.InitialPos)
 	if diags.HasErrors() {
 		return nil, errors.New(diags.Error())
@@ -212,15 +228,142 @@ func profileCredentialRefs(profile *hclwrite.Block) ([]hcl.Traversal, error) {
 	if !ok {
 		return nil, fmt.Errorf("profile %q: credentials is not a list", profile.Labels()[0])
 	}
-	refs := make([]hcl.Traversal, 0, len(tuple.Exprs))
+	l := &profileCredentials{src: src, closeAt: tuple.SrcRange.End.Byte - 1}
 	for _, item := range tuple.Exprs {
-		ref, diags := hcl.AbsTraversalForExpr(item)
-		if diags.HasErrors() {
-			return nil, fmt.Errorf("profile %q: credentials holds something other than references", profile.Labels()[0])
-		}
-		refs = append(refs, ref)
+		r := item.Range()
+		l.entries = append(l.entries, profileCredentialEntry{name: credentialEntryName(item), start: r.Start.Byte, end: r.End.Byte})
 	}
-	return refs, nil
+	return l, nil
+}
+
+// credentialEntryName is the credential a list entry names, or "".
+func credentialEntryName(e hclsyntax.Expression) string {
+	if obj, ok := e.(*hclsyntax.ObjectConsExpr); ok {
+		for _, item := range obj.Items {
+			if hcl.ExprAsKeyword(item.KeyExpr) == "credential" {
+				return credentialEntryName(item.ValueExpr)
+			}
+		}
+		return ""
+	}
+	ref, diags := hcl.AbsTraversalForExpr(e)
+	if diags.HasErrors() || len(ref) == 0 {
+		return ""
+	}
+	switch step := ref[len(ref)-1].(type) {
+	case hcl.TraverseAttr:
+		return step.Name
+	case hcl.TraverseRoot:
+		return step.Name
+	}
+	return ""
+}
+
+func (l *profileCredentials) names() []string {
+	out := []string{}
+	for _, e := range l.entries {
+		if e.name != "" {
+			out = append(out, e.name)
+		}
+	}
+	return out
+}
+
+func (l *profileCredentials) has(name string) bool {
+	return slices.Contains(l.names(), name)
+}
+
+// without returns the list's source with the entries naming name
+// removed, each with its comma, and with its line when it had one to
+// itself.
+func (l *profileCredentials) without(name string) []byte {
+	src := slices.Clone(l.src)
+	for i := len(l.entries) - 1; i >= 0; i-- {
+		e := l.entries[i]
+		if e.name != name {
+			continue
+		}
+		start, end := e.start, e.end
+		if j := skipBlanks(src, end); j < len(src) && src[j] == ',' {
+			end = skipBlanks(src, j+1)
+		} else if k := lastNonBlank(src, start); k >= 0 && src[k] == ',' {
+			start = k
+		}
+		if ls, le := lineStart(src, start), lineEnd(src, end); isBlank(src[ls:start]) && isBlank(src[end:le]) && le < len(src) {
+			start, end = ls, le+1
+		}
+		src = append(src[:start:start], src[end:]...)
+	}
+	return src
+}
+
+// with returns the list's source with ref appended: on a line of its
+// own in a multi-line list, after ", " in a one-line list.
+func (l *profileCredentials) with(ref string) []byte {
+	src := slices.Clone(l.src)
+	closeAt := l.closeAt
+	if len(l.entries) == 0 {
+		return slices.Concat(src[:closeAt], []byte(ref), src[closeAt:])
+	}
+	last := l.entries[len(l.entries)-1]
+	comma := skipBlanks(src, last.end)
+	trailingComma := comma < len(src) && src[comma] == ','
+	if !trailingComma {
+		src = slices.Concat(src[:last.end], []byte(","), src[last.end:])
+		comma, closeAt = last.end, closeAt+1
+	}
+	if !bytes.Contains(src[:closeAt], []byte("\n")) {
+		return slices.Concat(src[:comma+1], []byte(" "+ref), src[comma+1:])
+	}
+	indent := src[lineStart(src, last.start):last.start]
+	if !isBlank(indent) {
+		indent = []byte("  ")
+	}
+	entry := "\n" + string(indent) + ref
+	if trailingComma {
+		entry += ","
+	}
+	at := min(lineEnd(src, comma+1), closeAt)
+	return slices.Concat(src[:at], []byte(entry), src[at:])
+}
+
+func skipBlanks(src []byte, i int) int {
+	for i < len(src) && (src[i] == ' ' || src[i] == '\t') {
+		i++
+	}
+	return i
+}
+
+func lastNonBlank(src []byte, i int) int {
+	for i--; i >= 0 && (src[i] == ' ' || src[i] == '\t' || src[i] == '\n'); i-- {
+	}
+	return i
+}
+
+func lineStart(src []byte, i int) int {
+	return bytes.LastIndexByte(src[:i], '\n') + 1
+}
+
+func lineEnd(src []byte, i int) int {
+	if j := bytes.IndexByte(src[i:], '\n'); j >= 0 {
+		return i + j
+	}
+	return len(src)
+}
+
+func isBlank(b []byte) bool {
+	return len(bytes.Trim(b, " \t")) == 0
+}
+
+// setProfileCredentialsSource replaces a profile's `credentials` list
+// with src.
+func setProfileCredentialsSource(profile *hclwrite.Block, src []byte) error {
+	f, diags := hclwrite.ParseConfig(slices.Concat([]byte("credentials = "), src, []byte("\n")), "", hcl.InitialPos)
+	if diags.HasErrors() {
+		return fmt.Errorf("profile %q: edited credentials list does not parse: %s", profile.Labels()[0], diags.Error())
+	}
+	profile.Body().SetAttributeRaw("credentials", f.Body().GetAttribute("credentials").Expr().BuildTokens(nil))
+	return nil
 }
 
 // appendBlock appends a block to a file, after a blank line unless
@@ -230,28 +373,6 @@ func appendBlock(f *hclwrite.File, blockType string, labels []string) *hclwrite.
 		f.Body().AppendNewline()
 	}
 	return f.Body().AppendNewBlock(blockType, labels)
-}
-
-func setProfileCredentialRefs(profile *hclwrite.Block, refs []hcl.Traversal) {
-	items := make([]hclwrite.Tokens, 0, len(refs))
-	for _, ref := range refs {
-		items = append(items, hclwrite.TokensForTraversal(ref))
-	}
-	profile.Body().SetAttributeRaw("credentials", hclwrite.TokensForTuple(items))
-}
-
-// refNames reports whether a reference's last step is name.
-func refNames(ref hcl.Traversal, name string) bool {
-	if len(ref) == 0 {
-		return false
-	}
-	switch step := ref[len(ref)-1].(type) {
-	case hcl.TraverseAttr:
-		return step.Name == name
-	case hcl.TraverseRoot:
-		return step.Name == name
-	}
-	return false
 }
 
 func entityRef(typ, name string) hcl.Traversal {
@@ -272,16 +393,19 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 		if len(labels) != 1 {
 			continue
 		}
-		refs, err := profileCredentialRefs(profile)
+		list, err := parseProfileCredentials(profile)
 		if err != nil {
 			return err
 		}
-		has := slices.ContainsFunc(refs, func(ref hcl.Traversal) bool { return refNames(ref, credName) })
+		has := list.has(credName)
 		switch {
 		case wanted[labels[0]] && !has:
-			setProfileCredentialRefs(profile, append(refs, entityRef(credType, credName)))
+			err = setProfileCredentialsSource(profile, list.with(credType+"."+credName))
 		case !wanted[labels[0]] && has:
-			setProfileCredentialRefs(profile, slices.DeleteFunc(refs, func(ref hcl.Traversal) bool { return refNames(ref, credName) }))
+			err = setProfileCredentialsSource(profile, list.without(credName))
+		}
+		if err != nil {
+			return err
 		}
 		delete(wanted, labels[0])
 	}
@@ -414,17 +538,18 @@ type credentialConfigEntry struct {
 // apiCredentialOptions lists what the credential form needs: the types
 // it declares, the endpoints and profiles to pick from, and where each
 // credential and profile is declared, so the form can tell which ones
-// it may change.
+// it may change. The loaded config and the files are read under the
+// config lock, so both describe the same revision.
 func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
+	w.g.configMu.Lock()
 	gw := w.g.cfg.Load()
+	tree, err := loadConfigTree(w.g.cfgPath)
+	target, _, terr := resolveConfigFile(w.g.cfgPath, "")
+	w.g.configMu.Unlock()
 	if gw == nil || gw.Policy == nil {
 		http.Error(rw, "no config loaded", http.StatusServiceUnavailable)
 		return
 	}
-	w.g.configMu.Lock()
-	tree, err := loadConfigTree(w.g.cfgPath)
-	target, _, terr := resolveConfigFile(w.g.cfgPath, "")
-	w.g.configMu.Unlock()
 	if err == nil {
 		err = terr
 	}
@@ -451,30 +576,33 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		if len(labels) != 1 {
 			continue
 		}
-		prof := credentialConfigProfile{
-			credentialConfigFile: credentialConfigFile{Name: labels[0], File: files[i], ReadOnly: tree.readOnly(files[i])},
-			Credentials:          []string{},
-		}
-		refs, err := profileCredentialRefs(blk)
+		list, err := parseProfileCredentials(blk)
 		if err != nil {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
-		for _, ref := range refs {
-			if attr, ok := ref[len(ref)-1].(hcl.TraverseAttr); ok {
-				prof.Credentials = append(prof.Credentials, attr.Name)
-			}
-		}
-		profiles = append(profiles, prof)
+		profiles = append(profiles, credentialConfigProfile{
+			credentialConfigFile: credentialConfigFile{Name: labels[0], File: files[i], ReadOnly: tree.readOnly(files[i])},
+			Credentials:          list.names(),
+		})
 	}
 	sort.Slice(profiles, func(i, j int) bool { return profiles[i].Name < profiles[j].Name })
 
+	declaredIn := map[string]string{}
+	files, blocks = tree.blocks("credential")
+	for i, blk := range blocks {
+		if labels := blk.Labels(); len(labels) == 2 {
+			if _, seen := declaredIn[labels[1]]; !seen {
+				declaredIn[labels[1]] = files[i]
+			}
+		}
+	}
 	creds := map[string]credentialConfigEntry{}
 	for name, ent := range gw.Policy.Credentials {
 		if ent == nil || ent.Symbol == nil {
 			continue
 		}
-		file, _ := tree.find("credential", name)
+		file := declaredIn[name]
 		entry := credentialConfigEntry{
 			credentialConfigFile: credentialConfigFile{Name: name, File: file, ReadOnly: file == "" || tree.readOnly(file)},
 			Type:                 ent.Symbol.Type,
@@ -498,48 +626,61 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// credentialPlan is a planned credential change: the files to write,
+// and what to do once they are written, still under the config lock.
+type credentialPlan struct {
+	changes []configChange
+	after   func() error
+}
+
 // apiCredentialDeclare declares a credential in the dashboard's file,
 // optionally with a new https endpoint for it, and adds it to the
 // requested profiles wherever they are declared.
 func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
-	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) ([]configChange, error) {
+	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
 		typ, ok := editableCredentialType(req.Type)
 		if !ok {
-			return nil, fmt.Errorf("%w: the form cannot declare a %q credential", errBadCredentialRequest, req.Type)
+			return credentialPlan{}, fmt.Errorf("%w: the form cannot declare a %q credential", errBadCredentialRequest, req.Type)
 		}
 		if !configNameRE.MatchString(req.Name) {
-			return nil, fmt.Errorf("%w: credential name %q: use letters, digits, - and _, starting with a letter", errBadCredentialRequest, req.Name)
+			return credentialPlan{}, fmt.Errorf("%w: credential name %q: use letters, digits, - and _, starting with a letter", errBadCredentialRequest, req.Name)
 		}
 		if _, exists := gw.Policy.Credentials[req.Name]; exists {
-			return nil, fmt.Errorf("%w: a credential named %q already exists", errBadCredentialRequest, req.Name)
+			return credentialPlan{}, fmt.Errorf("%w: a credential named %q already exists", errBadCredentialRequest, req.Name)
 		}
 		if slices.Contains(typ.Fields, "header") && (req.Header == nil || *req.Header == "") {
-			return nil, fmt.Errorf("%w: a %s credential needs a header", errBadCredentialRequest, typ.Type)
+			return credentialPlan{}, fmt.Errorf("%w: a %s credential needs a header", errBadCredentialRequest, typ.Type)
 		}
 		target, _, err := resolveConfigFile(w.g.cfgPath, "")
 		if err != nil {
-			return nil, err
+			return credentialPlan{}, err
 		}
 		ref, err := tree.credentialEndpointRef(gw, typ, req, target)
 		if err != nil {
-			return nil, err
+			return credentialPlan{}, err
 		}
 		if ref == nil {
-			return nil, fmt.Errorf("%w: pick an endpoint or declare a new host", errBadCredentialRequest)
+			return credentialPlan{}, fmt.Errorf("%w: pick an endpoint or declare a new host", errBadCredentialRequest)
 		}
 		f, err := tree.file(target)
 		if err != nil {
-			return nil, err
+			return credentialPlan{}, err
 		}
 		blk := appendBlock(f, "credential", []string{typ.Type, req.Name})
 		if err := setCredentialFields(blk, typ, req); err != nil {
-			return nil, err
+			return credentialPlan{}, err
 		}
 		blk.Body().SetAttributeTraversal("endpoint", ref)
-		if err := tree.setCredentialProfiles(typ.Type, req.Name, req.Profiles); err != nil {
-			return nil, err
+		var profiles []string
+		if req.Profiles != nil {
+			profiles = *req.Profiles
 		}
-		return tree.changes(target, ""), nil
+		if err := tree.setCredentialProfiles(typ.Type, req.Name, profiles); err != nil {
+			return credentialPlan{}, err
+		}
+		// A secret left under this name by an earlier credential must
+		// not become the new one's.
+		return credentialPlan{changes: tree.changes(target, ""), after: w.clearCredentialState(req.Name)}, nil
 	})
 }
 
@@ -547,44 +688,45 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 // the profiles that list it. Settings and endpoint change only for the
 // types the form declares; profiles change for any credential.
 func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
-	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) ([]configChange, error) {
+	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
 		file, blk := tree.find("credential", req.Name)
 		if blk == nil || len(blk.Labels()) != 2 {
-			return nil, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
+			return credentialPlan{}, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
 		}
 		credType := blk.Labels()[0]
-		changesSettings := req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil
-		if changesSettings {
+		target, _, err := resolveConfigFile(w.g.cfgPath, "")
+		if err != nil {
+			return credentialPlan{}, err
+		}
+		if req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil {
 			typ, ok := editableCredentialType(credType)
 			if !ok {
-				return nil, fmt.Errorf("%w: the form cannot change a %s credential's settings; change them in %s", errBadCredentialRequest, credType, file)
+				return credentialPlan{}, fmt.Errorf("%w: the form cannot change a %s credential's settings; change them in %s", errBadCredentialRequest, credType, file)
 			}
 			if err := setCredentialFields(blk, typ, req); err != nil {
-				return nil, err
-			}
-			target, _, err := resolveConfigFile(w.g.cfgPath, "")
-			if err != nil {
-				return nil, err
+				return credentialPlan{}, err
 			}
 			ref, err := tree.credentialEndpointRef(gw, typ, req, target)
 			if err != nil {
-				return nil, err
+				return credentialPlan{}, err
 			}
 			if ref != nil {
 				blk.Body().RemoveAttribute("endpoints")
 				blk.Body().SetAttributeTraversal("endpoint", ref)
 			}
 		}
-		if err := tree.setCredentialProfiles(credType, req.Name, req.Profiles); err != nil {
-			return nil, err
+		if req.Profiles != nil {
+			if err := tree.setCredentialProfiles(credType, req.Name, *req.Profiles); err != nil {
+				return credentialPlan{}, err
+			}
 		}
 		first := file
 		if req.NewEndpoint != nil {
 			// The new endpoint's file lands before the credential
 			// that references it.
-			first, _, _ = resolveConfigFile(w.g.cfgPath, "")
+			first = target
 		}
-		return tree.changes(first, ""), nil
+		return credentialPlan{changes: tree.changes(first, "")}, nil
 	})
 }
 
@@ -592,45 +734,48 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 // profile lists, then clears its stored secret. Only the types the
 // form declares can be removed: their secret is a plain slot.
 func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
-	var removed string
-	ok := w.editCredentialConfig(rw, r, func(tree *configTree, _ *config.Gateway, req credentialConfigRequest) ([]configChange, error) {
+	w.editCredentialConfig(rw, r, func(tree *configTree, _ *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
 		file, blk := tree.find("credential", req.Name)
 		if blk == nil || len(blk.Labels()) != 2 {
-			return nil, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
+			return credentialPlan{}, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
 		}
 		credType := blk.Labels()[0]
 		if _, ok := editableCredentialType(credType); !ok {
-			return nil, fmt.Errorf("%w: the form cannot remove a %s credential; remove it from %s", errBadCredentialRequest, credType, file)
+			return credentialPlan{}, fmt.Errorf("%w: the form cannot remove a %s credential; remove it from %s", errBadCredentialRequest, credType, file)
 		}
 		if err := tree.setCredentialProfiles(credType, req.Name, nil); err != nil {
-			return nil, err
+			return credentialPlan{}, err
 		}
 		tree.files[file].Body().RemoveBlock(blk)
-		removed = req.Name
-		return tree.changes("", file), nil
+		return credentialPlan{changes: tree.changes("", file), after: w.clearCredentialState(req.Name)}, nil
 	})
-	if !ok || removed == "" {
-		return
-	}
-	unlock := w.lockCredentialSave(removed)
-	defer unlock()
-	if err := clearCredentialSecrets(w.g.db, removed); err != nil {
-		log.Printf("credentials: clear secrets of removed credential %s: %v", removed, err)
-	}
-	if err := clearCredentialVerification(w.g.db, removed); err != nil {
-		log.Printf("credentials: clear verification of removed credential %s: %v", removed, err)
+}
+
+// clearCredentialState returns a step that drops a credential's stored
+// secret and verification result. It runs under the config lock, so no
+// credential of that name can be declared and given a secret meanwhile.
+func (w *webMux) clearCredentialState(name string) func() error {
+	return func() error {
+		defer w.lockCredentialSave(name)()
+		if err := clearCredentialSecrets(w.g.db, name); err != nil {
+			return fmt.Errorf("clear the stored secret of %s: %w", name, err)
+		}
+		if err := clearCredentialVerification(w.g.db, name); err != nil {
+			return fmt.Errorf("clear the verification result of %s: %w", name, err)
+		}
+		return nil
 	}
 }
 
 // editCredentialConfig decodes a credential request, plans the change
-// with the config lock held, writes it and answers. It reports whether
-// the change was written.
+// with the config lock held, writes it, runs the plan's after step and
+// answers.
 func (w *webMux) editCredentialConfig(rw http.ResponseWriter, r *http.Request,
-	plan func(*configTree, *config.Gateway, credentialConfigRequest) ([]configChange, error)) bool {
+	plan func(*configTree, *config.Gateway, credentialConfigRequest) (credentialPlan, error)) {
 	var req credentialConfigRequest
 	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, credentialConfigMaxBytes)).Decode(&req); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return false
+		return
 	}
 	setAuditTarget(r, req.Name)
 
@@ -639,36 +784,42 @@ func (w *webMux) editCredentialConfig(rw http.ResponseWriter, r *http.Request,
 	gw := w.g.cfg.Load()
 	if !gw.DashboardConfigWrites() {
 		http.Error(rw, errConfigWritesDisabled.Error(), http.StatusForbidden)
-		return false
+		return
 	}
 	if gw.Policy == nil {
 		http.Error(rw, "no config loaded", http.StatusServiceUnavailable)
-		return false
+		return
 	}
 	tree, err := loadConfigTree(w.g.cfgPath)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return false
+		return
 	}
-	changes, err := plan(tree, gw, req)
+	p, err := plan(tree, gw, req)
 	switch {
 	case errors.Is(err, errNoSuchCredential):
 		http.Error(rw, err.Error(), http.StatusNotFound)
-		return false
+		return
 	case errors.Is(err, errBadCredentialRequest):
 		http.Error(rw, err.Error(), http.StatusBadRequest)
-		return false
+		return
 	case err != nil:
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return false
+		return
 	}
-	files := make([]string, 0, len(changes))
-	for _, c := range changes {
+	files := make([]string, 0, len(p.changes))
+	for _, c := range p.changes {
 		files = append(files, c.Name)
 	}
-	if len(changes) > 0 && !w.applyConfigChanges(rw, changes) {
-		return false
+	if len(p.changes) > 0 && !w.applyConfigChanges(rw, p.changes) {
+		return
+	}
+	if p.after != nil {
+		if err := p.after(); err != nil {
+			log.Printf("credentials: %s written, then: %v", req.Name, err)
+			http.Error(rw, "the config change was written, but "+err.Error(), http.StatusInternalServerError)
+			return
+		}
 	}
 	writeJSON(rw, map[string]any{"ok": true, "name": req.Name, "files": files})
-	return true
 }

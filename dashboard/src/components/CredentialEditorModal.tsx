@@ -79,8 +79,10 @@ export function CredentialEditorModal({
             setEndpoint(c.endpoint ?? "");
           }
           setProfiles(o.profiles.filter((p) => p.credentials.includes(name)).map((p) => p.name));
-        } else if (defaultProfile && o.profiles.some((p) => p.name === defaultProfile)) {
-          setProfiles([defaultProfile]);
+        } else if (o.profiles.some((p) => p.name === defaultProfile && !p.read_only)) {
+          // Pre-tick the device's profile, unless the form cannot change
+          // it: a read-only box ticked could not be unticked.
+          setProfiles([defaultProfile!]);
         }
       })
       .catch((e) => setLoadErr(String(e.message ?? e)));
@@ -157,6 +159,16 @@ export function CredentialEditorModal({
   }
 
   const title = editing ? `Edit credential ${name}` : "Add credential";
+  if (opts && editing && !current) {
+    return (
+      <Modal size="md" title={title} onClose={onClose}>
+        <div className="p-5 text-sm text-text-muted">
+          The gateway's config has no credential named <span className="font-mono">{name}</span>{" "}
+          that the form can read. Reload the page; if it persists, change it in the config files.
+        </div>
+      </Modal>
+    );
+  }
   if (!opts) {
     return (
       <Modal size="md" title={title} onClose={onClose}>
