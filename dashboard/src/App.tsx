@@ -68,6 +68,7 @@ export default function App() {
   const [whoami, setWhoami] = useState<Whoami | null>(null);
   const [update, setUpdate] = useState<UpdateBanner | null>(null);
   const [configFile, setConfigFile] = useState<string>("gateway.hcl");
+  const [configWrites, setConfigWrites] = useState(false);
   const [ruleRequestsPending, setRuleRequestsPending] = useState(0);
   const [connectId, setConnectId] = useState<string | null>(null);
   const [route, setRoute] = useState(parseRoute());
@@ -90,6 +91,7 @@ export default function App() {
       setWhoami(s.whoami);
       setUpdate(s.update ?? null);
       if (s.config_file) setConfigFile(s.config_file);
+      setConfigWrites(!!s.dashboard_config_writes);
       setRuleRequestsPending(s.rule_requests_pending ?? 0);
     } catch {
       /* swallow */
@@ -165,6 +167,7 @@ export default function App() {
           agents={agents}
           integrations={integrations}
           configFile={configFile}
+          canEditCredentials={!isMember && configWrites}
           onBack={() => navigate("")}
           onConnect={(id) => setConnectId(id)}
           onRefresh={refresh}

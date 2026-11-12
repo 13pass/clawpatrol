@@ -359,6 +359,11 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/tailscale/disconnect", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiTailscaleDisconnect)},
 		{Method: http.MethodPost, Path: "/api/credentials/set", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsSet)},
 		{Method: http.MethodPost, Path: "/api/credentials/clear", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsClear)},
+		// Credential declarations: admin-only (not in memberRoutes).
+		{Method: http.MethodGet, Path: "/api/credentials/options", Auth: authDashboard, Handler: w.apiCredentialOptions},
+		{Method: http.MethodPost, Path: "/api/credentials/declare", Auth: authDashboard, Handler: w.apiCredentialDeclare},
+		{Method: http.MethodPost, Path: "/api/credentials/edit", Auth: authDashboard, Handler: w.apiCredentialEdit},
+		{Method: http.MethodPost, Path: "/api/credentials/remove", Auth: authDashboard, Handler: w.apiCredentialRemove},
 		{Method: http.MethodGet, Path: "/api/events", Auth: authDashboard, Handler: w.apiEventsSSE},
 		{Method: http.MethodPost, Path: "/api/actions/rule-preview", Auth: authDashboard, Handler: w.apiActionRulePreview},
 		{Method: http.MethodGet, Path: "/api/actions/", Auth: authDashboard, Handler: w.apiActionByID},

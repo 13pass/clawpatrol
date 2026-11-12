@@ -402,17 +402,26 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 }
 
 func (w *webMux) writeRuleChanges(rw http.ResponseWriter, changes []configChange, ok map[string]any) {
+	if w.applyConfigChanges(rw, changes) {
+		writeJSON(rw, ok)
+	}
+}
+
+// applyConfigChanges writes changes and reports whether they landed.
+// On failure it has answered the request: 400 for a change the config
+// refuses, 500 otherwise. g.configMu must be held.
+func (w *webMux) applyConfigChanges(rw http.ResponseWriter, changes []configChange) bool {
 	if err := w.g.writeConfigFilesLocked(changes); err != nil {
 		var invalid *configInvalidError
 		if errors.As(err, &invalid) {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
-			return
+			return false
 		}
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
-		return
+		return false
 	}
 	w.bustStateCache()
-	writeJSON(rw, ok)
+	return true
 }
 
 type myRule struct {

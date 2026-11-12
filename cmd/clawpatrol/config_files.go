@@ -20,6 +20,11 @@ const dashboardConfigFile = "90-dashboard.hcl"
 // the mode of a config file the dashboard creates.
 const newConfigFileExecBits fs.FileMode = 0o111
 
+// readOnlyConfigMarker, alone in a comment line, marks a config file
+// the dashboard must not change, such as one a deploy script renders
+// from a template: the next render would undo the change.
+const readOnlyConfigMarker = "clawpatrol:dashboard-readonly"
+
 var errUnknownConfigFile = errors.New("unknown config file")
 
 // configInvalidError wraps a candidate config that failed to load, so
@@ -133,6 +138,9 @@ func readConfigFileOrEmpty(path string) ([]byte, error) {
 // changes so a file declaring an entity lands before a file
 // referencing it.
 func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
+	if err := checkConfigFilesWritable(g.cfgPath, changes); err != nil {
+		return &configInvalidError{err}
+	}
 	if !configIsDir(g.cfgPath) {
 		if len(changes) != 1 || changes[0].Name != filepath.Base(g.cfgPath) {
 			return fmt.Errorf("single-file config: only %q can change", filepath.Base(g.cfgPath))
@@ -154,6 +162,45 @@ func (g *Gateway) writeConfigFilesLocked(changes []configChange) error {
 		return err
 	}
 	return g.reloadConfigFromFileLocked(g.cfgPath)
+}
+
+// checkConfigFilesWritable refuses changes to a file that carries
+// readOnlyConfigMarker.
+func checkConfigFilesWritable(cfgPath string, changes []configChange) error {
+	for _, c := range changes {
+		path := cfgPath
+		if configIsDir(cfgPath) {
+			path = filepath.Join(cfgPath, c.Name)
+		}
+		current, err := readConfigFileOrEmpty(path)
+		if err != nil {
+			return err
+		}
+		if configFileReadOnly(current) {
+			return fmt.Errorf("%s is read-only for the dashboard (it carries %q): change it where it is generated", c.Name, readOnlyConfigMarker)
+		}
+	}
+	return nil
+}
+
+// configFileReadOnly reports whether a comment line of the file is
+// readOnlyConfigMarker.
+func configFileReadOnly(content []byte) bool {
+	for _, line := range strings.Split(string(content), "\n") {
+		text := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(text, "#"):
+			text = text[1:]
+		case strings.HasPrefix(text, "//"):
+			text = text[2:]
+		default:
+			continue
+		}
+		if strings.TrimSpace(text) == readOnlyConfigMarker {
+			return true
+		}
+	}
+	return false
 }
 
 type stagedConfigFile struct {

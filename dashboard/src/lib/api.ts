@@ -164,6 +164,62 @@ export async function clearCredential(id: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
+// Credential declarations the dashboard may change. The gateway
+// refuses a change to a config file marked read-only (one a deploy
+// script renders), so read_only tells the form what to disable.
+export type CredentialConfigFile = { name: string; file: string; read_only: boolean };
+
+export type CredentialConfigOptions = {
+  writes: boolean;
+  // file new declarations are written to.
+  file: string;
+  types: { type: string; fields: string[]; families: string[] }[];
+  endpoints: { name: string; type: string; family: string; hosts?: string }[];
+  // credentials: the names the profile's list holds.
+  profiles: (CredentialConfigFile & { credentials: string[] })[];
+  credentials: Record<
+    string,
+    CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
+  >;
+};
+
+export type CredentialConfigChange = {
+  type?: string;
+  name: string;
+  header?: string;
+  prefix?: string;
+  endpoint?: string;
+  new_endpoint?: { name: string; host: string };
+  profiles: string[];
+};
+
+export async function getCredentialConfigOptions(): Promise<CredentialConfigOptions> {
+  const r = await api("/api/credentials/options");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+async function postCredentialConfig(path: string, body: object): Promise<void> {
+  const r = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+}
+
+export function declareCredential(change: CredentialConfigChange): Promise<void> {
+  return postCredentialConfig("/api/credentials/declare", change);
+}
+
+export function editCredential(change: CredentialConfigChange): Promise<void> {
+  return postCredentialConfig("/api/credentials/edit", change);
+}
+
+export function removeCredential(name: string): Promise<void> {
+  return postCredentialConfig("/api/credentials/remove", { name });
+}
+
 export type Session = {
   id: string;
   title?: string;
