@@ -9,6 +9,8 @@ import {
 } from "../lib/api";
 import { fmtBytes } from "../lib/format";
 import { Button } from "./Button";
+import { CredentialEditorModal } from "./CredentialEditorModal";
+import { CredentialSecretsModal } from "./CredentialSecretsModal";
 import { HITLBar } from "./HITLBar";
 import { IntegrationsCards } from "./IntegrationsCards";
 import { LiveRequests } from "./LiveRequests";
@@ -25,6 +27,7 @@ export function DevicePage({
   agents,
   integrations,
   configFile,
+  canEditCredentials,
   onBack,
   onConnect,
   onRefresh,
@@ -33,6 +36,9 @@ export function DevicePage({
   agents: Agent[];
   integrations: Integration[];
   configFile: string;
+  // canEditCredentials: an admin, on a gateway that lets the dashboard
+  // write its config.
+  canEditCredentials: boolean;
   onBack: () => void;
   onConnect: (id: string) => void;
   onRefresh: () => void;
@@ -42,6 +48,11 @@ export function DevicePage({
   const [profileSaving, setProfileSaving] = useState(false);
   const [profileErr, setProfileErr] = useState<string | null>(null);
   const [pendingProfile, setPendingProfile] = useState<string | null>(null);
+  // credentialEditor: undefined = closed, null = adding, a name = editing.
+  const [credentialEditor, setCredentialEditor] = useState<string | null | undefined>(undefined);
+  // secretFor names a credential just added, whose secret is asked for
+  // once the refreshed state lists it.
+  const [secretFor, setSecretFor] = useState<string | null>(null);
   // Per-profile credential list — server-filters to only the
   // credentials referenced by endpoints in this device's profile,
   // so a "writer" device doesn't see the readonly's pg-cred and vice
@@ -81,6 +92,7 @@ export function DevicePage({
   const dev = a;
   const total = dev.bytes_in + dev.bytes_out;
   const allForUser = profileCreds ?? integrations;
+  const secretTarget = secretFor ? integrations.find((i) => i.name === secretFor) : undefined;
 
   async function remove() {
     if (
@@ -213,8 +225,9 @@ export function DevicePage({
       <LiveRequests agentIP={a.ip} height="360px" />
 
       {/* credentials for this device's profile — header makes the
-          profile→credentials linkage explicit and points operators at
-          gateway.hcl since the dashboard is read-only for declarations. */}
+          profile→credentials linkage explicit and names the config they
+          are declared in. Admins on a gateway with dashboard config
+          writes add and edit declarations here too. */}
       <section className="bg-canvas border-1.5 border-navy">
         <div className="flex items-center px-4 py-2.5 bg-navy-100 border-b border-navy gap-2">
           <div className="font-mono text-xs uppercase tracking-wider text-navy font-bold">
@@ -228,11 +241,40 @@ export function DevicePage({
           <span className="ml-auto text-2xs text-navy/70">
             declared in <span className="font-mono">{configFile}</span>
           </span>
+          {canEditCredentials && (
+            <Button size="xs" variant="outline" onClick={() => setCredentialEditor(null)}>
+              + Add
+            </Button>
+          )}
         </div>
         <div className="p-3">
-          <IntegrationsCards list={allForUser} onConnect={onConnect} onRefresh={onRefresh} />
+          <IntegrationsCards
+            list={allForUser}
+            onConnect={onConnect}
+            onRefresh={onRefresh}
+            onEdit={canEditCredentials ? (i) => setCredentialEditor(i.name) : undefined}
+          />
         </div>
       </section>
+
+      {credentialEditor !== undefined && (
+        <CredentialEditorModal
+          name={credentialEditor ?? undefined}
+          defaultProfile={a.profile}
+          onClose={() => setCredentialEditor(undefined)}
+          onSaved={(name, needsSecret) => {
+            if (needsSecret) setSecretFor(name);
+            onRefresh();
+          }}
+        />
+      )}
+      {secretTarget && (secretTarget.slots?.length ?? 0) > 0 && (
+        <CredentialSecretsModal
+          integration={secretTarget}
+          onClose={() => setSecretFor(null)}
+          onSaved={onRefresh}
+        />
+      )}
 
       {/* rules — per-device scope (with global rules layered in) */}
       <RulesPanel deviceIP={a.ip} profile={a.profile} />

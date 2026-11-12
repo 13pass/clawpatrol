@@ -164,6 +164,70 @@ export async function clearCredential(id: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
+// Credential declarations the dashboard may change. The gateway
+// refuses a change to a config file marked read-only (one a deploy
+// script renders), so read_only tells the form what to disable.
+export type CredentialConfigFile = { name: string; file: string; read_only: boolean };
+
+export type CredentialConfigOptions = {
+  writes: boolean;
+  // file new declarations are written to.
+  file: string;
+  types: { type: string; fields: string[]; families: string[] }[];
+  endpoints: { name: string; type: string; family: string; hosts?: string }[];
+  // credentials: the names the profile's list holds.
+  profiles: (CredentialConfigFile & { credentials: string[] })[];
+  credentials: Record<
+    string,
+    CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
+  >;
+};
+
+export type CredentialConfigChange = {
+  type?: string;
+  name: string;
+  header?: string;
+  prefix?: string;
+  endpoint?: string;
+  new_endpoint?: { name: string; host: string };
+  // profiles: every profile that should list it; omitted on an edit, the
+  // profiles stay as they are.
+  profiles?: string[];
+};
+
+export async function getCredentialConfigOptions(): Promise<CredentialConfigOptions> {
+  const r = await api("/api/credentials/options");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// CredentialConfigResult: secret_cleared means the credential's stored
+// secret was dropped (a new credential, or one moved to another endpoint)
+// and has to be pasted again.
+export type CredentialConfigResult = { name: string; files: string[]; secret_cleared: boolean };
+
+async function postCredentialConfig(path: string, body: object): Promise<CredentialConfigResult> {
+  const r = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function declareCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/declare", change);
+}
+
+export function editCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/edit", change);
+}
+
+export function removeCredential(name: string): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/remove", { name });
+}
+
 export type Session = {
   id: string;
   title?: string;

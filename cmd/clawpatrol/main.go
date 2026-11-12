@@ -3833,9 +3833,9 @@ func runGateway(args []string) {
 		return g.dialer.Dial(network, addr)
 	})
 	if cfg.DashboardConfigWrites() {
-		log.Printf("config: dashboard writes enabled (generated rules can be appended to gateway.hcl)")
+		log.Printf("config: dashboard writes enabled (the dashboard can add rules and manage credentials in %s)", filepath.Base(cfgPath))
 	} else {
-		log.Printf("config: read-only (the dashboard cannot edit gateway.hcl)")
+		log.Printf("config: read-only (the dashboard cannot edit %s)", filepath.Base(cfgPath))
 	}
 	g.secrets = newGatewaySecretStore(db, oauthReg)
 	g.hitl.asyncGrantResolver = g.resolveAsyncHITLGrant
