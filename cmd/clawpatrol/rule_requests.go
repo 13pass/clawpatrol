@@ -130,13 +130,16 @@ func ruleOutcomeLabel(r *rules.Rule) string {
 
 // ruleCreateSummary describes a new rule in a line: what it does to
 // which requests.
-func ruleCreateSummary(verdict, scope string, ev *Event) string {
+func ruleCreateSummary(req RuleRequest, ev *Event) string {
 	what := map[string]string{
 		ruleVerdictDeny:    "block",
 		ruleVerdictAllow:   "pre-approve",
 		ruleVerdictApprove: "require approval for",
-	}[verdict]
+	}[req.Verdict]
 	target := strings.TrimSpace(ev.Method + " " + ev.Path)
+	if req.Scope == ruleScopeAnyPath {
+		target = ev.Method
+	}
 	if target == "" {
 		target = ev.Host
 	}
@@ -146,9 +149,13 @@ func ruleCreateSummary(verdict, scope string, ev *Event) string {
 	}
 	scopeLabel := map[string]string{
 		ruleScopeAnyMethod: ", any method",
+		ruleScopeAnyPath:   ", any path",
 		ruleScopePattern:   ", IDs generalized",
 		ruleScopeAnyName:   ", any object name",
-	}[scope]
+	}[req.Scope]
+	if strings.TrimSpace(req.Condition) != "" {
+		return fmt.Sprintf("%s requests on %s matching a condition written by hand", what, where)
+	}
 	return fmt.Sprintf("%s %s on %s%s", what, target, where, scopeLabel)
 }
 

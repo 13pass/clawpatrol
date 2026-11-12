@@ -669,13 +669,16 @@ export function updateUser(
 
 // A request turned into a rule: what it does and how much it matches.
 export type RuleVerdict = "deny" | "allow" | "approve";
-export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
+export type RuleScope = "exact" | "any_method" | "any_path" | "pattern" | "any_name";
 export type RuleRequest = {
   verdict: RuleVerdict;
   scope: RuleScope;
   // approver applies to admins only; a member's own approver is used.
   approver?: string;
   pin_header?: string;
+  // condition: a CEL condition written by hand, in place of the one
+  // scope and pin_header generate.
+  condition?: string;
 };
 
 export type ScopedRule = {

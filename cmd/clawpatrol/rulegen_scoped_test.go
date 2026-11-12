@@ -121,6 +121,8 @@ func TestScopedRuleScopes(t *testing.T) {
 		{ruleScopePattern, "POST", "/api/v4/projects/999/issues/1/notes", true},
 		{ruleScopePattern, "POST", "/api/v4/projects/999/issues/1/notes/7", false},
 		{ruleScopePattern, "GET", "/api/v4/projects/999/issues/1/notes", false},
+		{ruleScopeAnyPath, "POST", "/api/v4/projects/999/merge_requests", true},
+		{ruleScopeAnyPath, "GET", "/api/v4/projects/123/issues/45/notes", false},
 	}
 	for _, tc := range cases {
 		rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictAllow, Scope: tc.scope}, &RuleAuthor{Username: "alice"})
@@ -197,11 +199,55 @@ func TestScopedRuleRefusals(t *testing.T) {
 		{"no profile", noProfile, RuleRequest{Verdict: ruleVerdictDeny}},
 		{"allow unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictAllow}},
 		{"pattern unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopePattern}},
+		{"condition unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method == 'GET'"}},
+		{"condition does not compile", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method =="}},
+		{"condition unknown variable", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "k8s.verb == 'get'"}},
 	}
 	for _, tc := range cases {
 		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, &RuleAuthor{Username: "alice"}); err == nil {
 			t.Errorf("%s: accepted", tc.name)
 		}
+	}
+}
+
+func TestScopedRuleHandWrittenCondition(t *testing.T) {
+	dir, cp := scopedRuleTestDir(t)
+	// The `${` would be a template interpolation inside a heredoc.
+	cond := "http.method in ['POST', 'PUT']\n  && !http.path.contains('${x}')"
+	rule, err := GenerateScopedRule(cp, notesEvent(),
+		RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeExact, Condition: "  " + cond + "\n"},
+		&RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rule.Condition != cond {
+		t.Errorf("condition = %q, want the hand-written one trimmed", rule.Condition)
+	}
+	if !strings.Contains(rule.HCL, "profile    = profile.team-a") {
+		t.Errorf("a hand-written condition dropped the member's profile pin:\n%s", rule.HCL)
+	}
+	ep := installRule(t, dir, rule)
+	cases := []struct {
+		method, path, profile string
+		want                  bool
+	}{
+		{"PUT", "/api/v4/projects/1/anything", "team-a", true},
+		{"POST", "/api/v4/projects/1/${x}", "team-a", false},
+		{"GET", "/api/v4/projects/123/issues/45/notes", "team-a", false},
+		{"PUT", "/api/v4/projects/1/anything", "team-b", false},
+	}
+	for _, tc := range cases {
+		if got := matchedRule(ep, httpReq(tc.method, tc.path, tc.profile, nil)) == rule.RuleName; got != tc.want {
+			t.Errorf("%s %s (%s): matched = %v, want %v\n%s", tc.method, tc.path, tc.profile, got, tc.want, rule.HCL)
+		}
+	}
+
+	generated, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeExact}, &RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.RuleName == rule.RuleName {
+		t.Error("a hand-written condition got the generated rule's name")
 	}
 }
 

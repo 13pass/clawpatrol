@@ -36,6 +36,7 @@ function scopesFor(ev: EventRecord): { value: RuleScope; label: string }[] {
       return [
         { value: "exact", label: "This method and path" },
         { value: "any_method", label: "This path, any method" },
+        { value: "any_path", label: "This method, any path" },
         { value: "pattern", label: "This method, same path shape (IDs generalized)" },
       ];
     case "k8s":
@@ -72,6 +73,9 @@ export function RuleBuilderModal({
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
+  // condition is null while the rule uses the generated condition.
+  const [condition, setCondition] = useState<string | null>(null);
+  const editingCondition = condition !== null;
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -93,7 +97,7 @@ export function RuleBuilderModal({
     if (!ev.id || created) return;
     let cancelled = false;
     const t = setTimeout(() => {
-      previewRule(ev.id!, { verdict, scope, approver, pin_header: pinHeader || undefined })
+      previewRule(ev.id!, request())
         .then((p) => {
           if (cancelled) return;
           setPreview(p);
@@ -109,18 +113,24 @@ export function RuleBuilderModal({
       cancelled = true;
       clearTimeout(t);
     };
-  }, [ev.id, verdict, scope, pinHeader, approver, created]);
+  }, [ev.id, verdict, scope, pinHeader, approver, condition, created]);
+
+  function request() {
+    return {
+      verdict,
+      scope,
+      approver,
+      pin_header: pinHeader || undefined,
+      condition: condition ?? undefined,
+    };
+  }
 
   async function create() {
     if (!ev.id) return;
     setBusy(true);
     try {
       setCreated(
-        await createRule(
-          ev.id,
-          { verdict, scope, approver, pin_header: pinHeader || undefined },
-          preview?.needs_review ? reason : undefined,
-        ),
+        await createRule(ev.id, request(), preview?.needs_review ? reason : undefined),
       );
       setErr(null);
     } catch (e) {
@@ -199,8 +209,9 @@ export function RuleBuilderModal({
                 <span className={labelClass}>Matching</span>
                 <select
                   value={scope}
+                  disabled={editingCondition}
                   onChange={(e) => setScope(e.target.value as RuleScope)}
-                  className={selectClass}
+                  className={selectClass + " disabled:opacity-60"}
                 >
                   {scopes.map((s) => (
                     <option key={s.value} value={s.value}>
@@ -214,8 +225,9 @@ export function RuleBuilderModal({
                   <span className={labelClass}>Only when header</span>
                   <select
                     value={pinHeader}
+                    disabled={editingCondition}
                     onChange={(e) => setPinHeader(e.target.value)}
-                    className={selectClass}
+                    className={selectClass + " disabled:opacity-60"}
                   >
                     <option value="">— any request —</option>
                     {pinnable.map((h) => (
@@ -254,6 +266,35 @@ export function RuleBuilderModal({
               )}
             </div>
 
+            {ev.endpoint && editingCondition && (
+              <label className="block space-y-1">
+                <span className="flex items-baseline justify-between gap-2">
+                  <span className={labelClass}>Condition (CEL)</span>
+                  <button
+                    type="button"
+                    onClick={() => setCondition(null)}
+                    className="text-2xs underline text-text-muted"
+                  >
+                    Use the generated condition
+                  </button>
+                </span>
+                <textarea
+                  value={condition}
+                  onChange={(e) => setCondition(e.target.value)}
+                  rows={4}
+                  spellCheck={false}
+                  className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
+                />
+                <span className="block text-2xs text-text-subtle">
+                  Replaces what{" "}
+                  {pinnable.length > 0 ? "Matching and Only when header generate" : "Matching generates"}
+                  . The rule keeps its endpoint
+                  {isAdmin ? "" : ", your profile and its credential"}. Leave it empty to use the
+                  generated condition.
+                </span>
+              </label>
+            )}
+
             {err && <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>}
             {preview && (
               <div className="space-y-2">
@@ -279,6 +320,15 @@ export function RuleBuilderModal({
                 <pre className="border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text overflow-auto max-h-[22rem]">
                   {preview.rule.hcl}
                 </pre>
+                {ev.endpoint && !editingCondition && (
+                  <button
+                    type="button"
+                    onClick={() => setCondition(preview.rule.condition ?? "")}
+                    className="text-xs underline text-text-muted"
+                  >
+                    Edit the condition
+                  </button>
+                )}
                 {preview.needs_review && (
                   <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
                     <p>

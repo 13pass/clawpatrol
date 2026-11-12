@@ -325,3 +325,16 @@ credential "bearer_token" "ex" { endpoint = https.example }
 		t.Fatalf("approving a stale host rule = %d %s, want 409", rw.Code, rw.Body.String())
 	}
 }
+
+func TestRuleCreateSummaryNamesScopeAndHandWrittenCondition(t *testing.T) {
+	ev := &Event{Endpoint: "gitlab", Method: "POST", Path: "/api/v4/projects"}
+	cases := map[string]RuleRequest{
+		"block POST on gitlab, any path":                                      {Verdict: ruleVerdictDeny, Scope: ruleScopeAnyPath},
+		"pre-approve requests on gitlab matching a condition written by hand": {Verdict: ruleVerdictAllow, Scope: ruleScopeAnyPath, Condition: "true"},
+	}
+	for want, req := range cases {
+		if got := ruleCreateSummary(req, ev); got != want {
+			t.Errorf("summary = %q, want %q", got, want)
+		}
+	}
+}

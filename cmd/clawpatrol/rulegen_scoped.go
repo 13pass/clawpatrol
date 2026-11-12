@@ -27,6 +27,7 @@ const (
 	ruleScopeExact     = "exact"      // the request's method and path (or SQL / k8s facets)
 	ruleScopeAnyMethod = "any_method" // HTTP: the path, any method
 	ruleScopePattern   = "pattern"    // HTTP: the method, path with ID segments generalized
+	ruleScopeAnyPath   = "any_path"   // HTTP: the method, any path
 	ruleScopeAnyName   = "any_name"   // k8s: verb, resource and namespace, any object name
 )
 
@@ -64,6 +65,10 @@ type RuleRequest struct {
 	// PinHeader, when set, limits an HTTP rule to requests carrying the
 	// recorded value of this header — e.g. the API service's caller ID.
 	PinHeader string `json:"pin_header,omitempty"`
+	// Condition, when set, is the rule's CEL condition as the user wrote
+	// it, in place of the one Scope and PinHeader generate. The rule's
+	// endpoint, pins and priority stay as generated.
+	Condition string `json:"condition,omitempty"`
 }
 
 // RuleAuthor scopes a generated rule to a member. A nil author is an
@@ -131,6 +136,12 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	if err != nil {
 		return nil, err
 	}
+	if req.Condition = strings.TrimSpace(req.Condition); req.Condition != "" {
+		if _, err := facet.NewMatcher(ep.Family, req.Condition); err != nil {
+			return nil, fmt.Errorf("condition: %w", err)
+		}
+		condition, warnings = req.Condition, nil
+	}
 	rule := &ScopedRule{
 		RuleName:     scopedRuleName(author, req, ev, ep.Name),
 		Verdict:      req.Verdict,
@@ -163,8 +174,8 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	if req.Verdict == ruleVerdictAllow {
 		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny or approve apply")
 	}
-	if req.Scope != ruleScopeExact {
-		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact)")
+	if req.Scope != ruleScopeExact || strings.TrimSpace(req.Condition) != "" {
+		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact, no condition)")
 	}
 	host := canonicalObservedHost(ev.Host)
 	if host == "" {
@@ -235,7 +246,12 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 	if rule.Profile != "" {
 		b.SetAttributeRaw("profile", config.TraversalTokens("profile."+rule.Profile))
 	}
-	if rule.Condition != "" {
+	switch {
+	case req.Condition != "":
+		// Quoted, not a heredoc: the user's text may hold `${` or a
+		// line reading CEL, which a heredoc would not keep literal.
+		b.SetAttributeValue("condition", cty.StringVal(rule.Condition))
+	case rule.Condition != "":
 		setCELCondition(b, rule.Condition)
 	}
 	by := "an admin"
@@ -275,7 +291,7 @@ func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName
 		ruleVerdictAllow:   "allow",
 		ruleVerdictApprove: "approve",
 	}[req.Verdict]
-	sumInput := strings.Join([]string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader}, "\x00")
+	sumInput := strings.Join([]string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader, req.Condition}, "\x00")
 	sum := sha256.Sum256([]byte(sumInput))
 	name := fmt.Sprintf("%s_%s_%x", prefix, safeRuleNamePart(endpointName), sum[:3])
 	if author != nil {
@@ -348,6 +364,11 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 			return "", nil, fmt.Errorf("no request path was recorded")
 		}
 		parts = append(parts, "http.path == "+celString(path))
+	case ruleScopeAnyPath:
+		if method == "" {
+			return "", nil, fmt.Errorf("no request method was recorded")
+		}
+		parts = append(parts, "http.method == "+celString(method))
 	case ruleScopePattern:
 		if path == "" {
 			return "", nil, fmt.Errorf("no request path was recorded")
@@ -361,7 +382,7 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 			warnings = append(warnings, "No segment of this path looks like an ID, so the pattern matches only this path.")
 		}
 	default:
-		return "", nil, fmt.Errorf("HTTP rules take scope exact, any_method or pattern")
+		return "", nil, fmt.Errorf("HTTP rules take scope exact, any_method, any_path or pattern")
 	}
 	if req.PinHeader != "" {
 		name := http.CanonicalHeaderKey(strings.TrimSpace(req.PinHeader))
