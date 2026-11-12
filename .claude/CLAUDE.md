@@ -10,7 +10,7 @@ Render every timestamp in the UI as `yyyy-MM-dd HH:mm:ss.SSS` (24-hour,
 locale-independent, millisecond precision). When only the time-of-day
 is shown, use `HH:mm:ss.SSS`.
 
-Helpers live in `cmd/clawpatrol/www/src/lib/format.ts`:
+Helpers live in `dashboard/src/lib/format.ts`:
 
 - `fmtDateTime(t)` — full timestamp.
 - `fmtTime(t)` — time-of-day only.
@@ -37,7 +37,7 @@ run. Cheap to check locally; expensive in CI round-trips.
 
 ## `cmd/clawpatrol/testdata/`
 
-The self-test corpus for `clawpatrol test` (see `doc/test.md`).
+The self-test corpus for `clawpatrol test` (see `site/doc/clawpatrol-test.md`).
 `example.hcl` is the policy under test; the `*.json` files are
 action fixtures. The intent is one fixture per CEL branch in
 `example.hcl` — every rule's `allow` and `deny` arm exercised at
