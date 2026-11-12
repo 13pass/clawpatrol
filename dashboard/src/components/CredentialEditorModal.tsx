@@ -354,16 +354,14 @@ export function CredentialEditorModal({
                     <span key={r}>
                       {i > 0 && ", "}
                       <span className="font-mono">
-                        {(newEndpointName.trim() || "<endpoint>") + "-" + r}
+                        {(newEndpointName.trim() || "<endpoint>") + r}
                       </span>
                     </span>
                   ))}{" "}
                   from <span className="font-mono">defaults.new_endpoint_rule</span>.
                 </>
               ) : (
-                <>
-                  . It has no rules, so every request to it is allowed until you add some.
-                </>
+                <>. It has no rules, so every request to it is allowed until you add some.</>
               )}
             </span>
           </div>

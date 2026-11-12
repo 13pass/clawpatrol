@@ -1231,11 +1231,46 @@ func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diag
 		}
 		present[n] = src != nil
 	}
-	var names []string
+	sources := map[string][]byte{}
+	var diags hcl.Diagnostics
 	for n, ok := range present {
-		if ok {
-			names = append(names, n)
+		if !ok {
+			continue
 		}
+		src, overridden := overrides[n]
+		if !overridden {
+			path := filepath.Join(dir, n)
+			if src, err = os.ReadFile(path); err != nil {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Cannot read config file",
+					Detail:   fmt.Sprintf("%s: %v", path, err),
+				})
+				continue
+			}
+		}
+		sources[n] = src
+	}
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	return LoadDirSources(dir, sources)
+}
+
+// LoadDirSources loads a config directory from file contents already
+// read, keyed by file name: exactly those files, nothing from disk.
+// dir anchors relative paths, as for LoadDir.
+func LoadDirSources(dir string, sources map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	names := make([]string, 0, len(sources))
+	for n := range sources {
+		if !IsDirConfigFileName(n) {
+			return nil, hcl.Diagnostics{{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid config file name",
+				Detail:   fmt.Sprintf("%q is not a `*.hcl` file name the directory loader reads.", n),
+			}}
+		}
+		names = append(names, n)
 	}
 	sort.Strings(names)
 	if len(names) == 0 {
@@ -1250,20 +1285,7 @@ func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diag
 	var diags hcl.Diagnostics
 	files := make([]*hcl.File, 0, len(names))
 	for _, name := range names {
-		path := filepath.Join(dir, name)
-		src, overridden := overrides[name]
-		if !overridden {
-			src, err = os.ReadFile(path)
-			if err != nil {
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Cannot read config file",
-					Detail:   fmt.Sprintf("%s: %v", path, err),
-				})
-				continue
-			}
-		}
-		file, parseDiags := parser.ParseHCL(src, path)
+		file, parseDiags := parser.ParseHCL(sources[name], filepath.Join(dir, name))
 		diags = append(diags, parseDiags...)
 		if file != nil {
 			files = append(files, file)

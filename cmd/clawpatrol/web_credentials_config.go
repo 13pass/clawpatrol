@@ -6,9 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
-	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -115,11 +115,27 @@ func (t *configTree) path(name string) string {
 	return t.cfgPath
 }
 
+// newConfigTree builds a tree from file contents already read, keyed
+// by file name.
+func newConfigTree(cfgPath string, sources map[string][]byte) (*configTree, error) {
+	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		if err := t.addContent(name, sources[name]); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
+}
+
 func (t *configTree) add(name string) error {
 	content, err := readConfigFileOrEmpty(t.path(name))
 	if err != nil {
 		return err
 	}
+	return t.addContent(name, content)
+}
+
+func (t *configTree) addContent(name string, content []byte) error {
 	f, diags := hclwrite.ParseConfig(content, name, hcl.InitialPos)
 	if diags.HasErrors() {
 		return errors.New(diags.Error())
@@ -510,8 +526,14 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name, host string) error {
 	blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
 	blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
+	seen := map[string]bool{}
 	for _, def := range t.newEndpointRules() {
-		ruleName := newEndpointRuleName(name, def.Labels()[0])
+		label := def.Labels()[0]
+		if seen[label] {
+			return fmt.Errorf("defaults declares new_endpoint_rule %q more than once", label)
+		}
+		seen[label] = true
+		ruleName := newEndpointRuleName(name, label)
 		if _, exists := gw.Policy.Rules[ruleName]; exists {
 			return fmt.Errorf("%w: endpoint %q would add the rule %q, which already exists", errBadCredentialRequest, name, ruleName)
 		}
@@ -520,6 +542,10 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 		body := def.Body().BuildTokens(nil)
 		for len(body) > 0 && body[0].Type == hclsyntax.TokenNewline {
 			body = body[1:]
+		}
+		if len(body) > 0 && body[len(body)-1].Type != hclsyntax.TokenNewline {
+			// A one-line block's body ends at its closing brace.
+			body = append(body, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
 		}
 		rule.Body().AppendUnstructuredTokens(body)
 	}
@@ -549,15 +575,15 @@ func newEndpointRuleName(endpoint, rule string) string {
 // declares; a number is appended while the config already has one.
 const newEndpointRuleProbe = "new-endpoint-rule-probe"
 
-// checkNewEndpointRules declares a probe endpoint in the config at path
-// the way the dashboard declares a new host, and loads the result. A
-// defaults.new_endpoint_rule that cannot become a rule then fails this
-// load, not the first host added on the dashboard.
-func checkNewEndpointRules(path string, gw *config.Gateway) error {
+// checkNewEndpointRules declares a probe endpoint in the config's
+// sources the way the dashboard declares a new host, and loads the
+// result. A defaults.new_endpoint_rule that cannot become a rule then
+// fails this load, not the first host added on the dashboard.
+func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Gateway) error {
 	if gw.Defaults == nil || len(gw.Defaults.NewEndpointRules) == 0 {
 		return nil
 	}
-	tree, err := loadConfigTree(path)
+	tree, err := newConfigTree(path, sources)
 	if err != nil {
 		return err
 	}
@@ -565,37 +591,41 @@ func checkNewEndpointRules(path string, gw *config.Gateway) error {
 	if err != nil {
 		return err
 	}
-	f, err := tree.file(target)
-	if err != nil {
-		return err
-	}
-	name := newEndpointRuleProbe
-	for i := 2; gw.Policy.Endpoints[name] != nil; i++ {
-		name = fmt.Sprintf("%s%d", newEndpointRuleProbe, i)
-	}
-	if err := tree.declareEndpoint(gw, f, name, "probe.invalid"); err != nil {
-		return fmt.Errorf("defaults.new_endpoint_rule: %w", err)
-	}
-	if configIsDir(path) {
-		overrides := map[string][]byte{}
-		for _, c := range tree.changes(target, "") {
-			overrides[c.Name] = c.Content
-		}
-		_, _, err = loadConfigOverlay(path, overrides)
-	} else {
-		var tmpPath string
-		tmpPath, err = writeTempConfig(filepath.Dir(path), f.Bytes())
-		if err != nil {
+	if _, ok := tree.files[target]; !ok {
+		if err := tree.addContent(target, nil); err != nil {
 			return err
 		}
-		defer func() { _ = os.Remove(tmpPath) }()
-		probed, diags := config.Load(tmpPath)
-		_, _, err = compileLoadedConfig(probed, diags)
 	}
-	if err != nil {
-		return fmt.Errorf("defaults.new_endpoint_rule: a new endpoint with these rules would not load: %w", err)
+	name := newEndpointRuleProbe
+	for i := 2; probeNameTaken(tree, gw, name); i++ {
+		name = fmt.Sprintf("%s%d", newEndpointRuleProbe, i)
+	}
+	if err := tree.declareEndpoint(gw, tree.files[target], name, "probe.invalid"); err != nil {
+		return fmt.Errorf("defaults.new_endpoint_rule: %w", err)
+	}
+	probe := maps.Clone(sources)
+	for _, c := range tree.changes(target, "") {
+		probe[c.Name] = c.Content
+	}
+	if _, _, err := compileConfigSources(path, probe); err != nil {
+		return fmt.Errorf("defaults.new_endpoint_rule: the rules a host added on the dashboard gets would not load "+
+			"(checked by adding endpoint %q to %s in memory, so positions there are not in the file): %w", name, target, err)
 	}
 	return nil
+}
+
+// probeNameTaken reports whether the probe endpoint name, or a rule
+// name derived from it, is already declared.
+func probeNameTaken(tree *configTree, gw *config.Gateway, name string) bool {
+	if gw.Policy.Endpoints[name] != nil {
+		return true
+	}
+	for _, def := range tree.newEndpointRules() {
+		if gw.Policy.Rules[newEndpointRuleName(name, def.Labels()[0])] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // setCredentialFields applies the request's type-specific settings to
@@ -732,9 +762,10 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		creds[name] = entry
 	}
 
+	// The form shows each rule as the new endpoint's name + its suffix.
 	newEndpointRules := []string{}
 	for _, def := range tree.newEndpointRules() {
-		newEndpointRules = append(newEndpointRules, def.Labels()[0])
+		newEndpointRules = append(newEndpointRules, newEndpointRuleName("", def.Labels()[0]))
 	}
 
 	writeJSON(rw, map[string]any{
