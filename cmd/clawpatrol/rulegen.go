@@ -217,10 +217,16 @@ func generatedRuleHCL(name, endpoint, condition string) (string, error) {
 // heredoc when the expression has multiple `&&`-joined clauses,
 // matching the convention in examples/*.hcl. Splitting on ` && `
 // keeps the marker line-anchored so future readers diff each clause
-// independently.
+// independently. A heredoc is a template, so `${` and `%{` are
+// escaped; a condition with a line break, or a clause that would read
+// as the closing marker, stays quoted.
 func setCELCondition(b *hclwrite.Body, condition string) {
-	parts := strings.Split(condition, " && ")
-	if len(parts) < 2 {
+	parts := splitCELAnd(condition)
+	quoted := len(parts) < 2 || strings.ContainsAny(condition, "\r\n")
+	for _, p := range parts {
+		quoted = quoted || strings.TrimSpace(p) == celHeredocMarker
+	}
+	if quoted {
 		b.SetAttributeValue("condition", cty.StringVal(condition))
 		return
 	}
@@ -230,14 +236,54 @@ func setCELCondition(b *hclwrite.Body, condition string) {
 		if i > 0 {
 			body.WriteString("&& ")
 		}
-		body.WriteString(p)
+		body.WriteString(heredocTemplateEscaper.Replace(p))
 		body.WriteString("\n")
 	}
 	b.SetAttributeRaw("condition", hclwrite.Tokens{
-		{Type: hclsyntax.TokenOHeredoc, Bytes: []byte("<<-CEL\n")},
+		{Type: hclsyntax.TokenOHeredoc, Bytes: []byte("<<-" + celHeredocMarker + "\n")},
 		{Type: hclsyntax.TokenStringLit, Bytes: []byte(body.String())},
-		{Type: hclsyntax.TokenCHeredoc, Bytes: []byte("  CEL")},
+		{Type: hclsyntax.TokenCHeredoc, Bytes: []byte("  " + celHeredocMarker)},
 	})
+}
+
+const celHeredocMarker = "CEL"
+
+// heredocTemplateEscaper keeps `${` and `%{` literal in a heredoc.
+var heredocTemplateEscaper = strings.NewReplacer("${", "$${", "%{", "%%{")
+
+// splitCELAnd splits a condition at each ` && ` outside a string
+// literal. A raw or triple-quoted literal, or an unterminated one,
+// leaves the condition whole.
+func splitCELAnd(condition string) []string {
+	var parts []string
+	start := 0
+	var quote byte
+	for i := 0; i < len(condition); i++ {
+		c := condition[i]
+		switch {
+		case quote != 0:
+			if c == '\\' {
+				i++
+			} else if c == quote {
+				quote = 0
+			}
+		case c == '\'' || c == '"':
+			rest := condition[i:]
+			if strings.HasPrefix(rest, "'''") || strings.HasPrefix(rest, `"""`) ||
+				(i > 0 && (condition[i-1] == 'r' || condition[i-1] == 'R')) {
+				return []string{condition}
+			}
+			quote = c
+		case strings.HasPrefix(condition[i:], " && "):
+			parts = append(parts, condition[start:i])
+			i += len(" && ") - 1
+			start = i + 1
+		}
+	}
+	if quote != 0 {
+		return []string{condition}
+	}
+	return append(parts, condition[start:])
 }
 
 func generatedEndpointBlockRuleHCL(endpointName, credName, host string, profiles []string, ruleName string) (string, error) {

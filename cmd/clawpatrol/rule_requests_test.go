@@ -328,13 +328,21 @@ credential "bearer_token" "ex" { endpoint = https.example }
 
 func TestRuleCreateSummaryNamesScopeAndHandWrittenCondition(t *testing.T) {
 	ev := &Event{Endpoint: "gitlab", Method: "POST", Path: "/api/v4/projects"}
-	cases := map[string]RuleRequest{
-		"block POST on gitlab, any path":                                      {Verdict: ruleVerdictDeny, Scope: ruleScopeAnyPath},
-		"pre-approve requests on gitlab matching a condition written by hand": {Verdict: ruleVerdictAllow, Scope: ruleScopeAnyPath, Condition: "true"},
+	cases := []struct {
+		req  RuleRequest
+		rule *ScopedRule
+		want string
+	}{
+		{RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeAnyPath}, &ScopedRule{}, "block POST on gitlab, any path"},
+		{RuleRequest{Verdict: ruleVerdictAllow, Scope: ruleScopeAnyPath, Condition: "true"}, &ScopedRule{HandWritten: true},
+			"pre-approve requests on gitlab matching a condition written by hand"},
+		// An unedited condition is the generated rule.
+		{RuleRequest{Verdict: ruleVerdictAllow, Scope: ruleScopeAnyPath, Condition: "http.method == 'POST'"}, &ScopedRule{},
+			"pre-approve POST on gitlab, any path"},
 	}
-	for want, req := range cases {
-		if got := ruleCreateSummary(req, ev); got != want {
-			t.Errorf("summary = %q, want %q", got, want)
+	for _, tc := range cases {
+		if got := ruleCreateSummary(tc.req, tc.rule, ev); got != tc.want {
+			t.Errorf("summary = %q, want %q", got, tc.want)
 		}
 	}
 }

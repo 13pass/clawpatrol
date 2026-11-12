@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   createRule,
   listUsers,
@@ -6,6 +6,7 @@ import {
   type EventRecord,
   type RuleChangeResult,
   type RulePreviewResp,
+  type RuleRequest,
   type RuleScope,
   type RuleVerdict,
   type Whoami,
@@ -68,14 +69,17 @@ export function RuleBuilderModal({
   const [pinHeader, setPinHeader] = useState("");
   const [approver, setApprover] = useState("");
   const [approvers, setApprovers] = useState<string[]>([]);
-  const [preview, setPreview] = useState<RulePreviewResp | null>(null);
+  // preview answers the request whose JSON is key; a preview for an
+  // older request stays on screen but cannot be acted on.
+  const [previewed, setPreviewed] = useState<{ key: string; resp: RulePreviewResp } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
-  // condition is null while the rule uses the generated condition.
-  const [condition, setCondition] = useState<string | null>(null);
-  const editingCondition = condition !== null;
+  // conditionText is null while the editor is closed. Blank, the rule
+  // uses the generated condition and Matching applies again.
+  const [conditionText, setConditionText] = useState<string | null>(null);
+  const condition = conditionText?.trim() ? conditionText : undefined;
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -93,45 +97,46 @@ export function RuleBuilderModal({
     }
   }, [isAdmin]);
 
+  // scope and pin_header go along with a condition: the server ignores
+  // them then, but uses them to tell an unedited condition from one
+  // written by hand.
+  const request = useMemo<RuleRequest>(
+    () => ({ verdict, scope, approver, pin_header: pinHeader || undefined, condition }),
+    [verdict, scope, approver, pinHeader, condition],
+  );
+  const requestKey = JSON.stringify(request);
+  const preview = previewed?.resp ?? null;
+  const fresh = previewed?.key === requestKey;
+
   useEffect(() => {
     if (!ev.id || created) return;
-    let cancelled = false;
+    const id = ev.id;
+    const key = JSON.stringify(request);
+    const ctl = { cancelled: false };
     const t = setTimeout(() => {
-      previewRule(ev.id!, request())
+      previewRule(id, request)
         .then((p) => {
-          if (cancelled) return;
-          setPreview(p);
+          if (ctl.cancelled) return;
+          setPreviewed({ key, resp: p });
           setErr(null);
         })
         .catch((e: Error) => {
-          if (cancelled) return;
-          setPreview(null);
+          if (ctl.cancelled) return;
+          setPreviewed(null);
           setErr(e.message || "preview failed");
         });
     }, PREVIEW_DEBOUNCE_MS);
     return () => {
-      cancelled = true;
+      ctl.cancelled = true;
       clearTimeout(t);
     };
-  }, [ev.id, verdict, scope, pinHeader, approver, condition, created]);
-
-  function request() {
-    return {
-      verdict,
-      scope,
-      approver,
-      pin_header: pinHeader || undefined,
-      condition: condition ?? undefined,
-    };
-  }
+  }, [ev.id, request, created]);
 
   async function create() {
-    if (!ev.id) return;
+    if (!ev.id || !fresh) return;
     setBusy(true);
     try {
-      setCreated(
-        await createRule(ev.id, request(), preview?.needs_review ? reason : undefined),
-      );
+      setCreated(await createRule(ev.id, request, preview?.needs_review ? reason : undefined));
       setErr(null);
     } catch (e) {
       setErr((e as Error).message || "create failed");
@@ -209,7 +214,7 @@ export function RuleBuilderModal({
                 <span className={labelClass}>Matching</span>
                 <select
                   value={scope}
-                  disabled={editingCondition}
+                  disabled={condition !== undefined}
                   onChange={(e) => setScope(e.target.value as RuleScope)}
                   className={selectClass + " disabled:opacity-60"}
                 >
@@ -225,7 +230,7 @@ export function RuleBuilderModal({
                   <span className={labelClass}>Only when header</span>
                   <select
                     value={pinHeader}
-                    disabled={editingCondition}
+                    disabled={condition !== undefined}
                     onChange={(e) => setPinHeader(e.target.value)}
                     className={selectClass + " disabled:opacity-60"}
                   >
@@ -266,38 +271,47 @@ export function RuleBuilderModal({
               )}
             </div>
 
-            {ev.endpoint && editingCondition && (
+            {ev.endpoint && conditionText !== null && (
               <label className="block space-y-1">
                 <span className="flex items-baseline justify-between gap-2">
                   <span className={labelClass}>Condition (CEL)</span>
                   <button
                     type="button"
-                    onClick={() => setCondition(null)}
+                    onClick={() => setConditionText(null)}
                     className="text-2xs underline text-text-muted"
                   >
                     Use the generated condition
                   </button>
                 </span>
                 <textarea
-                  value={condition}
-                  onChange={(e) => setCondition(e.target.value)}
+                  value={conditionText}
+                  onChange={(e) => setConditionText(e.target.value)}
                   rows={4}
                   spellCheck={false}
                   className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
                 />
                 <span className="block text-2xs text-text-subtle">
-                  Replaces what{" "}
-                  {pinnable.length > 0 ? "Matching and Only when header generate" : "Matching generates"}
-                  . The rule keeps its endpoint
-                  {isAdmin ? "" : ", your profile and its credential"}. Leave it empty to use the
-                  generated condition.
+                  {pinnable.length > 0
+                    ? "Replaces what Matching and Only when header generate; they apply again while it is empty."
+                    : "Replaces what Matching generates; it applies again while this is empty."}{" "}
+                  The rule keeps its endpoint{isAdmin ? "" : ", your profile and its credential"}.
                 </span>
               </label>
+            )}
+            {ev.endpoint && conditionText === null && (
+              <button
+                type="button"
+                disabled={previewed !== null && !fresh}
+                onClick={() => setConditionText(fresh ? (preview?.rule.condition ?? "") : "")}
+                className="text-xs underline text-text-muted disabled:opacity-60"
+              >
+                Edit the condition
+              </button>
             )}
 
             {err && <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>}
             {preview && (
-              <div className="space-y-2">
+              <div className={"space-y-2" + (fresh ? "" : " opacity-60")}>
                 <p className="text-xs text-text">
                   Would have matched{" "}
                   <span className="font-bold">
@@ -320,15 +334,7 @@ export function RuleBuilderModal({
                 <pre className="border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text overflow-auto max-h-[22rem]">
                   {preview.rule.hcl}
                 </pre>
-                {ev.endpoint && !editingCondition && (
-                  <button
-                    type="button"
-                    onClick={() => setCondition(preview.rule.condition ?? "")}
-                    className="text-xs underline text-text-muted"
-                  >
-                    Edit the condition
-                  </button>
-                )}
+
                 {preview.needs_review && (
                   <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
                     <p>
@@ -361,7 +367,7 @@ export function RuleBuilderModal({
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button disabled={!preview?.writes_enabled || busy} onClick={create}>
+            <Button disabled={!fresh || !preview?.writes_enabled || busy} onClick={create}>
               {busy ? "Sending…" : preview?.needs_review ? "Send for review" : "Create rule"}
             </Button>
           </>

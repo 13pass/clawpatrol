@@ -95,6 +95,9 @@ type ScopedRule struct {
 	// ProfileAdditions.
 	NewEndpoint      bool     `json:"new_endpoint,omitempty"`
 	ProfileAdditions []string `json:"profile_additions,omitempty"`
+	// HandWritten is set when Condition is the user's own, not the one
+	// the scope and header pin generate.
+	HandWritten bool `json:"hand_written,omitempty"`
 
 	// credentialRef is Credential as a typed HCL reference.
 	credentialRef string
@@ -119,6 +122,7 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	if req.Scope == "" {
 		req.Scope = ruleScopeExact
 	}
+	req.Condition = strings.TrimSpace(req.Condition)
 	if author != nil {
 		if ev.Profile == "" {
 			return nil, fmt.Errorf("this request has no recorded profile, so no member rule can be scoped to it")
@@ -132,15 +136,22 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	if ep == nil {
 		return nil, fmt.Errorf("endpoint %q no longer in policy", ev.Endpoint)
 	}
-	condition, warnings, err := scopedRuleCondition(ep.Family, ev, req)
-	if err != nil {
-		return nil, err
+	condition, warnings, genErr := scopedRuleCondition(ep.Family, ev, req)
+	if req.Condition != "" && genErr == nil && req.Condition == condition {
+		// Edited back to, or never changed from, the generated condition:
+		// it is the generated rule, under the generated rule's name.
+		req.Condition = ""
 	}
-	if req.Condition = strings.TrimSpace(req.Condition); req.Condition != "" {
+	if req.Condition != "" {
 		if _, err := facet.NewMatcher(ep.Family, req.Condition); err != nil {
 			return nil, fmt.Errorf("condition: %w", err)
 		}
+		// The condition replaces what the scope and header pin generate,
+		// so neither is checked nor part of the name.
 		condition, warnings = req.Condition, nil
+		req.Scope, req.PinHeader = "", ""
+	} else if genErr != nil {
+		return nil, genErr
 	}
 	rule := &ScopedRule{
 		RuleName:     scopedRuleName(author, req, ev, ep.Name),
@@ -149,6 +160,7 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		Family:       ep.Family,
 		Condition:    condition,
 		Warnings:     warnings,
+		HandWritten:  req.Condition != "",
 	}
 	if author != nil {
 		rule.Profile = ev.Profile
@@ -174,7 +186,7 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	if req.Verdict == ruleVerdictAllow {
 		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny or approve apply")
 	}
-	if req.Scope != ruleScopeExact || strings.TrimSpace(req.Condition) != "" {
+	if req.Scope != ruleScopeExact || req.Condition != "" {
 		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact, no condition)")
 	}
 	host := canonicalObservedHost(ev.Host)
@@ -246,12 +258,7 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 	if rule.Profile != "" {
 		b.SetAttributeRaw("profile", config.TraversalTokens("profile."+rule.Profile))
 	}
-	switch {
-	case req.Condition != "":
-		// Quoted, not a heredoc: the user's text may hold `${` or a
-		// line reading CEL, which a heredoc would not keep literal.
-		b.SetAttributeValue("condition", cty.StringVal(rule.Condition))
-	case rule.Condition != "":
+	if rule.Condition != "" {
 		setCELCondition(b, rule.Condition)
 	}
 	by := "an admin"
@@ -291,7 +298,12 @@ func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName
 		ruleVerdictAllow:   "allow",
 		ruleVerdictApprove: "approve",
 	}[req.Verdict]
-	sumInput := strings.Join([]string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader, req.Condition}, "\x00")
+	fields := []string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader}
+	if req.Condition != "" {
+		// Only then: a generated rule keeps the name it always had.
+		fields = append(fields, req.Condition)
+	}
+	sumInput := strings.Join(fields, "\x00")
 	sum := sha256.Sum256([]byte(sumInput))
 	name := fmt.Sprintf("%s_%s_%x", prefix, safeRuleNamePart(endpointName), sum[:3])
 	if author != nil {

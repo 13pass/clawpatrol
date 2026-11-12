@@ -130,7 +130,7 @@ func ruleOutcomeLabel(r *rules.Rule) string {
 
 // ruleCreateSummary describes a new rule in a line: what it does to
 // which requests.
-func ruleCreateSummary(req RuleRequest, ev *Event) string {
+func ruleCreateSummary(req RuleRequest, rule *ScopedRule, ev *Event) string {
 	what := map[string]string{
 		ruleVerdictDeny:    "block",
 		ruleVerdictAllow:   "pre-approve",
@@ -153,7 +153,7 @@ func ruleCreateSummary(req RuleRequest, ev *Event) string {
 		ruleScopePattern:   ", IDs generalized",
 		ruleScopeAnyName:   ", any object name",
 	}[req.Scope]
-	if strings.TrimSpace(req.Condition) != "" {
+	if rule.HandWritten {
 		return fmt.Sprintf("%s requests on %s matching a condition written by hand", what, where)
 	}
 	return fmt.Sprintf("%s %s on %s%s", what, target, where, scopeLabel)
