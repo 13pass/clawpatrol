@@ -181,6 +181,9 @@ export type CredentialConfigOptions = {
     string,
     CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
   >;
+  // new_endpoint_rules: the defaults.new_endpoint_rule names a new host
+  // gets, each written as "<endpoint>-<name>".
+  new_endpoint_rules: string[];
 };
 
 export type CredentialConfigChange = {

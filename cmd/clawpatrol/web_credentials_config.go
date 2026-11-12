@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -485,8 +486,9 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 		if err != nil {
 			return nil, err
 		}
-		blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
-		blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
+		if err := t.declareEndpoint(gw, f, name, host); err != nil {
+			return nil, err
+		}
 		return entityRef(newEndpointType, name), nil
 	}
 	if req.Endpoint == nil {
@@ -500,6 +502,100 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 		return nil, fmt.Errorf("%w: a %s credential cannot bind the %s endpoint %q", errBadCredentialRequest, typ.Type, ent.Symbol.Type, *req.Endpoint)
 	}
 	return entityRef(ent.Symbol.Type, *req.Endpoint), nil
+}
+
+// declareEndpoint appends an https endpoint for host to f, then a rule
+// for each defaults.new_endpoint_rule, so the endpoint never loads
+// without them.
+func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name, host string) error {
+	blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
+	blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
+	for _, def := range t.newEndpointRules() {
+		ruleName := newEndpointRuleName(name, def.Labels()[0])
+		if _, exists := gw.Policy.Rules[ruleName]; exists {
+			return fmt.Errorf("%w: endpoint %q would add the rule %q, which already exists", errBadCredentialRequest, name, ruleName)
+		}
+		rule := appendBlock(f, "rule", []string{ruleName})
+		rule.Body().SetAttributeTraversal("endpoint", entityRef(newEndpointType, name))
+		body := def.Body().BuildTokens(nil)
+		for len(body) > 0 && body[0].Type == hclsyntax.TokenNewline {
+			body = body[1:]
+		}
+		rule.Body().AppendUnstructuredTokens(body)
+	}
+	return nil
+}
+
+// newEndpointRules returns the defaults.new_endpoint_rule blocks in
+// declaration order.
+func (t *configTree) newEndpointRules() []*hclwrite.Block {
+	var rules []*hclwrite.Block
+	_, defaults := t.blocks("defaults")
+	for _, d := range defaults {
+		for _, blk := range d.Body().Blocks() {
+			if blk.Type() == "new_endpoint_rule" && len(blk.Labels()) == 1 {
+				rules = append(rules, blk)
+			}
+		}
+	}
+	return rules
+}
+
+func newEndpointRuleName(endpoint, rule string) string {
+	return endpoint + "-" + rule
+}
+
+// newEndpointRuleProbe names the endpoint checkNewEndpointRules
+// declares; a number is appended while the config already has one.
+const newEndpointRuleProbe = "new-endpoint-rule-probe"
+
+// checkNewEndpointRules declares a probe endpoint in the config at path
+// the way the dashboard declares a new host, and loads the result. A
+// defaults.new_endpoint_rule that cannot become a rule then fails this
+// load, not the first host added on the dashboard.
+func checkNewEndpointRules(path string, gw *config.Gateway) error {
+	if gw.Defaults == nil || len(gw.Defaults.NewEndpointRules) == 0 {
+		return nil
+	}
+	tree, err := loadConfigTree(path)
+	if err != nil {
+		return err
+	}
+	target, _, err := resolveConfigFile(path, "")
+	if err != nil {
+		return err
+	}
+	f, err := tree.file(target)
+	if err != nil {
+		return err
+	}
+	name := newEndpointRuleProbe
+	for i := 2; gw.Policy.Endpoints[name] != nil; i++ {
+		name = fmt.Sprintf("%s%d", newEndpointRuleProbe, i)
+	}
+	if err := tree.declareEndpoint(gw, f, name, "probe.invalid"); err != nil {
+		return fmt.Errorf("defaults.new_endpoint_rule: %w", err)
+	}
+	if configIsDir(path) {
+		overrides := map[string][]byte{}
+		for _, c := range tree.changes(target, "") {
+			overrides[c.Name] = c.Content
+		}
+		_, _, err = loadConfigOverlay(path, overrides)
+	} else {
+		var tmpPath string
+		tmpPath, err = writeTempConfig(filepath.Dir(path), f.Bytes())
+		if err != nil {
+			return err
+		}
+		defer func() { _ = os.Remove(tmpPath) }()
+		probed, diags := config.Load(tmpPath)
+		_, _, err = compileLoadedConfig(probed, diags)
+	}
+	if err != nil {
+		return fmt.Errorf("defaults.new_endpoint_rule: a new endpoint with these rules would not load: %w", err)
+	}
+	return nil
 }
 
 // setCredentialFields applies the request's type-specific settings to
@@ -554,9 +650,9 @@ type credentialConfigEntry struct {
 }
 
 // apiCredentialOptions lists what the credential form needs: the types
-// it declares, the endpoints and profiles to pick from, and where each
+// it declares, the endpoints and profiles to pick from, where each
 // credential and profile is declared, so the form can tell which ones
-// it may change. The loaded config and the files are read under the
+// it may change, and the rules a new host gets. The loaded config and the files are read under the
 // config lock, so both describe the same revision.
 func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	w.g.configMu.Lock()
@@ -636,13 +732,19 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		creds[name] = entry
 	}
 
+	newEndpointRules := []string{}
+	for _, def := range tree.newEndpointRules() {
+		newEndpointRules = append(newEndpointRules, def.Labels()[0])
+	}
+
 	writeJSON(rw, map[string]any{
-		"writes":      gw.DashboardConfigWrites(),
-		"file":        target,
-		"types":       editableCredentialTypes,
-		"endpoints":   endpoints,
-		"profiles":    profiles,
-		"credentials": creds,
+		"writes":             gw.DashboardConfigWrites(),
+		"file":               target,
+		"types":              editableCredentialTypes,
+		"endpoints":          endpoints,
+		"profiles":           profiles,
+		"credentials":        creds,
+		"new_endpoint_rules": newEndpointRules,
 	})
 }
 

@@ -112,8 +112,10 @@ type Gateway struct {
 	Settings *GatewaySettings `hcl:"gateway,block"`
 
 	// Defaults holds the optional `defaults { ... }` block with the
-	// policy defaults (unknown_host, unknown_peer, relay_*, llm_*, human_*). nil when the
-	// block is absent — every field has a built-in default.
+	// policy defaults (unknown_host, unknown_peer, relay_*, llm_*,
+	// human_*, and the new_endpoint_rule blocks the dashboard writes for
+	// each host it declares). nil when the block is absent — every field
+	// has a built-in default.
 	Defaults *Defaults `hcl:"defaults,block"`
 
 	// Plugins lists every `plugin "<name>" { source = "..." }` block
@@ -625,6 +627,22 @@ type Defaults struct {
 	// HumanOnTimeout is the default outcome when a human approver
 	// does not answer before timeout. "deny" or "allow".
 	HumanOnTimeout string `hcl:"human_on_timeout,optional"`
+
+	// NewEndpointRules are the rules the dashboard writes for every
+	// https endpoint it declares, in the same change as the endpoint,
+	// so a host added from a device's Credentials panel is never
+	// served without them. Each one becomes `rule "<endpoint>-<name>"`
+	// with `endpoint` set to the new endpoint and this block's body
+	// copied as written. The gateway checks them against a probe
+	// endpoint whenever it loads the config.
+	NewEndpointRules []NewEndpointRule `hcl:"new_endpoint_rule,block"`
+}
+
+// NewEndpointRule is a `new_endpoint_rule "<name>" { ... }` block: the
+// body of a rule, without its endpoint.
+type NewEndpointRule struct {
+	Name string   `hcl:"name,label"`
+	Body hcl.Body `hcl:",remain"`
 }
 
 // IsWireGuardEnabled reports whether the operator declared a

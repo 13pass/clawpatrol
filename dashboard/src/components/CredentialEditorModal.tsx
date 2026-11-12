@@ -346,7 +346,25 @@ export function CredentialEditorModal({
             </div>
             <span className="text-2xs text-text-subtle">
               Declares an https endpoint for this host in{" "}
-              <span className="font-mono">{opts.file}</span>. It has no rules yet.
+              <span className="font-mono">{opts.file}</span>
+              {opts.new_endpoint_rules.length > 0 ? (
+                <>
+                  , with the rules{" "}
+                  {opts.new_endpoint_rules.map((r, i) => (
+                    <span key={r}>
+                      {i > 0 && ", "}
+                      <span className="font-mono">
+                        {(newEndpointName.trim() || "<endpoint>") + "-" + r}
+                      </span>
+                    </span>
+                  ))}{" "}
+                  from <span className="font-mono">defaults.new_endpoint_rule</span>.
+                </>
+              ) : (
+                <>
+                  . It has no rules, so every request to it is allowed until you add some.
+                </>
+              )}
             </span>
           </div>
         )}

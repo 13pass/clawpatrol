@@ -475,6 +475,37 @@ If no rule matches, the request is **allowed** — there is no global
 default-deny. Add a `priority = -100, verdict = "deny"` catch-all
 per endpoint to invert this.
 
+### Rules for hosts added on the dashboard
+
+With `dashboard_config_writes` on, a device's Credentials panel can
+declare a new https endpoint, which by the rule above allows every
+request until someone writes rules for it. `new_endpoint_rule` blocks
+in `defaults` close that gap: the dashboard writes one rule per block
+in the same change as the endpoint, named `<endpoint>-<name>`, with
+`endpoint` set to the new endpoint and the block's body copied as
+written. They are ordinary rules afterwards, shown and edited like
+any other.
+
+```hcl
+defaults {
+  new_endpoint_rule "delete-deny" {
+    condition = "http.method == 'DELETE'"
+    verdict   = "deny"
+  }
+  new_endpoint_rule "writes" {
+    condition = "!(http.method in ['GET', 'HEAD', 'OPTIONS'])"
+    approve   = [human_approver.ops]
+  }
+}
+```
+
+A block's body is everything a `rule` takes except `endpoint`. The
+gateway checks the blocks each time it loads the config, by declaring
+a probe endpoint with them the way the dashboard would, so a condition
+that does not compile or an approver that does not exist fails the
+load, not the first host added. Endpoints that already exist, and ones
+declared in HCL, get no rules from these blocks.
+
 ### Synchronous human approval and timeouts
 
 Human approval is synchronous in the transparent proxy path. When a

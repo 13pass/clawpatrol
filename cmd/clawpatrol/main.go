@@ -205,7 +205,14 @@ func newReqID() string {
 // process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
 	gw, diags := config.Load(path)
-	return compileLoadedConfig(gw, diags)
+	gw, cp, err := compileLoadedConfig(gw, diags)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkNewEndpointRules(path, gw); err != nil {
+		return nil, nil, err
+	}
+	return gw, cp, nil
 }
 
 // loadConfigOverlay is loadConfig for a config directory with some
