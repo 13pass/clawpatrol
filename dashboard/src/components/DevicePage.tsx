@@ -262,8 +262,8 @@ export function DevicePage({
           name={credentialEditor ?? undefined}
           defaultProfile={a.profile}
           onClose={() => setCredentialEditor(undefined)}
-          onSaved={(name, declared) => {
-            if (declared) setSecretFor(name);
+          onSaved={(name, needsSecret) => {
+            if (needsSecret) setSecretFor(name);
             onRefresh();
           }}
         />

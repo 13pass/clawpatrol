@@ -653,6 +653,8 @@ type credentialPlan struct {
 	changes []configChange
 	before  func() error
 	after   func() error
+	// secretCleared tells the form the credential needs its secret again.
+	secretCleared bool
 }
 
 // apiCredentialDeclare declares a credential in the dashboard's file,
@@ -702,7 +704,7 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 		}
 		// A secret left under this name by an earlier credential must
 		// never become the new one's, not even for the first requests.
-		return credentialPlan{changes: tree.changes(target, ""), before: w.clearCredentialState(req.Name)}, nil
+		return credentialPlan{changes: tree.changes(target, ""), before: w.clearCredentialState(req.Name), secretCleared: true}, nil
 	})
 }
 
@@ -721,6 +723,7 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			return credentialPlan{}, err
 		}
 		settings := req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil
+		rebound := false
 		if settings {
 			typ, ok := editableCredentialType(credType)
 			if !ok {
@@ -736,6 +739,9 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			if ref != nil {
 				blk.Body().RemoveAttribute("endpoints")
 				blk.Body().SetAttributeTraversal("endpoint", ref)
+				current := config.CredentialEndpointTargets(gw.Policy.Credentials[req.Name])
+				newEndpoint := ref[len(ref)-1].(hcl.TraverseAttr).Name
+				rebound = len(current) != 1 || current[0] != newEndpoint
 			}
 		}
 		if req.Profiles != nil {
@@ -750,9 +756,17 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			first = target
 		}
 		p := credentialPlan{changes: tree.changes(first, "")}
-		if settings {
-			// The last verification checked the old header or endpoint.
-			p.after = func() error { return clearCredentialVerification(w.g.db, req.Name) }
+		switch {
+		case rebound:
+			// The secret was issued for the old endpoint's host: it must
+			// never reach the new one, so it goes before the change is live.
+			p.before, p.secretCleared = w.clearCredentialState(req.Name), true
+		case settings:
+			// The last verification checked the old header.
+			p.after = func() error {
+				defer w.lockCredentialSave(req.Name)()
+				return clearCredentialVerification(w.g.db, req.Name)
+			}
 		}
 		return p, nil
 	})
@@ -760,10 +774,15 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 
 // apiCredentialRemove removes a credential's block and its entries in
 // profile lists, then clears its stored secret. Only the types the
-// form declares can be removed: their secret is a plain slot.
+// form declares can be removed: their secret is a plain slot. Removing a
+// name the config no longer declares clears what is still stored under
+// it, so a remove whose clear failed can be retried.
 func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
-	w.editCredentialConfig(rw, r, func(tree *configTree, _ *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
+	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
 		file, blk := tree.find("credential", req.Name)
+		if blk == nil && gw.Policy.Credentials[req.Name] == nil && configNameRE.MatchString(req.Name) {
+			return credentialPlan{after: w.clearCredentialState(req.Name), secretCleared: true}, nil
+		}
 		if blk == nil || len(blk.Labels()) != 2 {
 			return credentialPlan{}, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
 		}
@@ -775,7 +794,7 @@ func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
 			return credentialPlan{}, err
 		}
 		tree.files[file].Body().RemoveBlock(blk)
-		return credentialPlan{changes: tree.changes("", file), after: w.clearCredentialState(req.Name)}, nil
+		return credentialPlan{changes: tree.changes("", file), after: w.clearCredentialState(req.Name), secretCleared: true}, nil
 	})
 }
 
@@ -863,5 +882,5 @@ func (w *webMux) editCredentialConfig(rw http.ResponseWriter, r *http.Request,
 			return
 		}
 	}
-	writeJSON(rw, map[string]any{"ok": true, "name": req.Name, "files": files})
+	writeJSON(rw, map[string]any{"ok": true, "name": req.Name, "files": files, "secret_cleared": p.secretCleared})
 }

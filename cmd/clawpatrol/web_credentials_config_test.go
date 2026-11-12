@@ -232,8 +232,15 @@ func TestCredentialRemoveDropsBlockProfilesAndSecret(t *testing.T) {
 	if _, found, err := readCredentialSecrets(w.g.db, "tok"); err != nil || found {
 		t.Errorf("secret still stored (found=%v err=%v)", found, err)
 	}
-	if rw := credentialConfigCall(t, w.apiCredentialRemove, map[string]any{"name": "tok"}); rw.Code != http.StatusNotFound {
-		t.Errorf("second remove: status=%d, want 404", rw.Code)
+	// A retry, as after a failed clear, clears what is left and succeeds.
+	if err := setCredentialSlot(w.g.db, "tok", "", "left-over"); err != nil {
+		t.Fatal(err)
+	}
+	if rw := credentialConfigCall(t, w.apiCredentialRemove, map[string]any{"name": "tok"}); rw.Code != http.StatusOK {
+		t.Errorf("second remove: status=%d body=%s, want 200", rw.Code, rw.Body.String())
+	}
+	if _, found, err := readCredentialSecrets(w.g.db, "tok"); err != nil || found {
+		t.Errorf("the retried remove left the secret (found=%v err=%v)", found, err)
 	}
 }
 
@@ -282,6 +289,8 @@ func TestConfigFileReadOnlyMarker(t *testing.T) {
 		"# " + readOnlyConfigMarker + "\n":              true,
 		"x = 1\n  #" + readOnlyConfigMarker + "  \n":    true,
 		"// " + readOnlyConfigMarker:                    true,
+		"/* " + readOnlyConfigMarker + " */\n":          true,
+		"/*/\n":                                         false,
 		"# see " + readOnlyConfigMarker + "\n":          false,
 		`x = "` + readOnlyConfigMarker + `"` + "\n":     false,
 		"# rendered by a script, never hand-edit it.\n": false,
@@ -460,5 +469,34 @@ profile "ok" { credentials = [bearer_token.tok] }
 	}
 	if err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
 		t.Errorf("adding to the unreadable list: err = %v, want it refused", err)
+	}
+}
+
+func TestCredentialEditEndpointClearsSecretHeaderKeepsIt(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	if rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "header_token", "name": "gh-pat", "header": "Authorization", "endpoint": "gitlab",
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if err := setCredentialSlot(w.g.db, "gh-pat", "", "gitlab-token"); err != nil {
+		t.Fatal(err)
+	}
+	rw := credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "gh-pat", "header": "PRIVATE-TOKEN", "endpoint": "gitlab"})
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"secret_cleared":false`) {
+		t.Fatalf("header edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if _, found, _ := readCredentialSecrets(w.g.db, "gh-pat"); !found {
+		t.Error("a header edit on the same endpoint dropped the secret")
+	}
+	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{
+		"name": "gh-pat", "new_endpoint": map[string]string{"name": "forge", "host": "forge.example"},
+	})
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"secret_cleared":true`) {
+		t.Fatalf("endpoint edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if _, found, _ := readCredentialSecrets(w.g.db, "gh-pat"); found {
+		t.Error("the GitLab token survived the move to forge.example")
 	}
 }

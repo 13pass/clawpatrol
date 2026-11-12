@@ -184,7 +184,7 @@ func checkConfigFilesWritable(cfgPath string, changes []configChange) error {
 }
 
 // configFileReadOnly reports whether a comment line of the file is
-// readOnlyConfigMarker.
+// readOnlyConfigMarker: `# marker`, `// marker` or `/* marker */`.
 func configFileReadOnly(content []byte) bool {
 	for _, line := range strings.Split(string(content), "\n") {
 		text := strings.TrimSpace(line)
@@ -193,6 +193,8 @@ func configFileReadOnly(content []byte) bool {
 			text = text[1:]
 		case strings.HasPrefix(text, "//"):
 			text = text[2:]
+		case len(text) >= len("/**/") && strings.HasPrefix(text, "/*") && strings.HasSuffix(text, "*/"):
+			text = text[2 : len(text)-2]
 		default:
 			continue
 		}

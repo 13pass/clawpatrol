@@ -339,12 +339,23 @@ function Card({
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
           {onEdit && (
+            // Always shown (muted) and focusable: the only way to edit or
+            // remove a credential, it must work by touch and keyboard too.
             <span
+              role="button"
+              tabIndex={0}
+              aria-label={`edit credential ${i.name}`}
               onClick={(e) => {
                 e.stopPropagation();
                 onEdit();
               }}
-              className="opacity-0 group-hover:opacity-100 text-xs leading-none text-text hover:text-rust-500 transition-opacity cursor-pointer"
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                e.stopPropagation();
+                onEdit();
+              }}
+              className="opacity-50 group-hover:opacity-100 focus:opacity-100 text-xs leading-none text-text hover:text-rust-500 transition-opacity cursor-pointer"
               title="edit declaration"
             >
               ✎

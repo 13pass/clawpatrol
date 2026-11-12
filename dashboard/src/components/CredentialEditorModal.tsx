@@ -49,7 +49,9 @@ export function CredentialEditorModal({
   onClose: () => void;
   // declared is true when a new credential was added, so the caller
   // can ask for its secret.
-  onSaved: (name: string, declared: boolean) => void;
+  // needsSecret is true when the credential has no secret any more (a new
+  // one, or one moved to another endpoint), so the caller can ask for it.
+  onSaved: (name: string, needsSecret: boolean) => void;
 }) {
   const editing = name !== undefined;
   const [opts, setOpts] = useState<CredentialConfigOptions | null>(null);
@@ -63,6 +65,10 @@ export function CredentialEditorModal({
   const [newEndpointName, setNewEndpointName] = useState("");
   const [endpointNameTouched, setEndpointNameTouched] = useState(false);
   const [profiles, setProfiles] = useState<string[]>([]);
+  // The profiles listing the credential when the form opened: an edit
+  // sends profiles only when they differ, so it never undoes another
+  // admin's change to a profile this form did not touch.
+  const [initialProfiles, setInitialProfiles] = useState<string[]>([]);
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -78,7 +84,9 @@ export function CredentialEditorModal({
             setPrefix(c.prefix ?? "");
             setEndpoint(c.endpoint ?? "");
           }
-          setProfiles(o.profiles.filter((p) => p.credentials.includes(name)).map((p) => p.name));
+          const listing = o.profiles.filter((p) => p.credentials.includes(name)).map((p) => p.name);
+          setProfiles(listing);
+          setInitialProfiles(listing);
         } else if (o.profiles.some((p) => p.name === defaultProfile && !p.read_only)) {
           // Pre-tick the device's profile, unless the form cannot change
           // it: a read-only box ticked could not be unticked.
@@ -99,13 +107,22 @@ export function CredentialEditorModal({
     [opts, typeOpt],
   );
   const canAddHost = typeOpt?.families.includes("http") ?? false;
+  // Remove also edits every profile listing the credential, so a
+  // read-only one among them blocks it.
+  const lockedProfiles = (opts?.profiles ?? []).filter(
+    (p) => p.read_only && editing && p.credentials.includes(name),
+  );
 
   function toggleProfile(p: string, on: boolean) {
     setProfiles((cur) => (on ? [...cur, p] : cur.filter((x) => x !== p)));
   }
 
   function buildChange(): CredentialConfigChange {
-    const change: CredentialConfigChange = { name: credName.trim(), profiles };
+    const change: CredentialConfigChange = { name: credName.trim() };
+    const sameProfiles =
+      profiles.length === initialProfiles.length &&
+      profiles.every((p) => initialProfiles.includes(p));
+    if (!editing || !sameProfiles) change.profiles = profiles;
     if (!editing) change.type = type;
     if (settingsEditable) {
       if (hasHeader && (!editing || header !== (current?.header ?? "")))
@@ -125,9 +142,8 @@ export function CredentialEditorModal({
     setErr(null);
     try {
       const change = buildChange();
-      if (editing) await editCredential(change);
-      else await declareCredential(change);
-      onSaved(change.name, !editing);
+      const result = editing ? await editCredential(change) : await declareCredential(change);
+      onSaved(change.name, result.secret_cleared);
       onClose();
     } catch (e: any) {
       setErr(String(e.message ?? e));
@@ -291,6 +307,12 @@ export function CredentialEditorModal({
               ))}
               {canAddHost && <option value={NEW_ENDPOINT}>New host…</option>}
             </select>
+            {editing && endpoint && endpoint !== (current?.endpoint ?? "") && (
+              <span className="text-2xs text-text-subtle">
+                Moving it to another endpoint clears its stored secret, so the old token never
+                reaches the new host: paste the new one after saving.
+              </span>
+            )}
           </label>
         )}
 
@@ -365,7 +387,16 @@ export function CredentialEditorModal({
       </div>
       <div className="flex items-center gap-2 px-4 py-3">
         {editing && settingsEditable && (
-          <Button variant="outline" onClick={remove} disabled={saving}>
+          <Button
+            variant="outline"
+            onClick={remove}
+            disabled={saving || lockedProfiles.length > 0}
+            title={
+              lockedProfiles.length > 0
+                ? `Listed by ${lockedProfiles.map((p) => `${p.name} (${p.file})`).join(", ")}, which the dashboard cannot change`
+                : undefined
+            }
+          >
             Remove
           </Button>
         )}

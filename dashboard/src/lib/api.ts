@@ -201,24 +201,30 @@ export async function getCredentialConfigOptions(): Promise<CredentialConfigOpti
   return r.json();
 }
 
-async function postCredentialConfig(path: string, body: object): Promise<void> {
+// CredentialConfigResult: secret_cleared means the credential's stored
+// secret was dropped (a new credential, or one moved to another endpoint)
+// and has to be pasted again.
+export type CredentialConfigResult = { name: string; files: string[]; secret_cleared: boolean };
+
+async function postCredentialConfig(path: string, body: object): Promise<CredentialConfigResult> {
   const r = await api(path, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
   if (!r.ok) throw new Error(await r.text());
+  return r.json();
 }
 
-export function declareCredential(change: CredentialConfigChange): Promise<void> {
+export function declareCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
   return postCredentialConfig("/api/credentials/declare", change);
 }
 
-export function editCredential(change: CredentialConfigChange): Promise<void> {
+export function editCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
   return postCredentialConfig("/api/credentials/edit", change);
 }
 
-export function removeCredential(name: string): Promise<void> {
+export function removeCredential(name: string): Promise<CredentialConfigResult> {
   return postCredentialConfig("/api/credentials/remove", { name });
 }
 
