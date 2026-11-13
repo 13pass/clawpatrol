@@ -17,9 +17,11 @@ import { Tag, type Tone } from "./Tag";
 export function RulesPanel({
   profile,
   version,
+  isMember,
   onChanged,
 }: {
   profile?: string;
+  isMember: boolean;
   // version reloads the list when it changes.
   version?: number;
   // onChanged runs after a change, applied or sent for review.
@@ -66,6 +68,8 @@ export function RulesPanel({
     } else if (kind === "delete" && !window.confirm(`Delete rule ${r.name}?`)) {
       return;
     }
+    setInfo("");
+    setErr(null);
     try {
       const res =
         kind === "delete"
@@ -86,7 +90,7 @@ export function RulesPanel({
   // Without a profile, a rule shows once per endpoint, not once per
   // profile that reaches it.
   const visible = useMemo(() => {
-    if (profile) return rows.filter((r) => !r.profile || r.profile === profile);
+    if (profile) return rows.filter((r) => r.profile === profile);
     const seen = new Set<string>();
     return rows.filter((r) => {
       const key = `${r.name} ${r.endpoint}`;
@@ -105,6 +109,7 @@ export function RulesPanel({
         title="Rules"
         rows={visible}
         myFile={myFile}
+        isMember={isMember}
         onChange={change}
         allRulesLink={!!profile}
       />
@@ -116,17 +121,19 @@ function Section({
   title,
   rows,
   myFile,
+  isMember,
   onChange,
   allRulesLink,
 }: {
   title: string;
   rows: RuleSummary[];
   myFile: string;
+  isMember: boolean;
   onChange: (r: RuleSummary, kind: RuleChange) => void;
   allRulesLink: boolean;
 }) {
-  // Group by endpoint. Server already sorts rules within an endpoint
-  // by priority desc. Endpoint groups themselves sort alphabetically.
+  // Group by endpoint, rules by priority, highest (tried first) on top.
+  // Endpoint groups sort alphabetically.
   const groups = useMemo(() => {
     const m = new Map<string, { endpoint: string; family: string; rules: RuleSummary[] }>();
     for (const r of rows) {
@@ -138,6 +145,7 @@ function Section({
       g.rules.push(r);
       m.set(r.endpoint, g);
     }
+    for (const g of m.values()) g.rules.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
     return Array.from(m.values()).sort((a, b) => a.endpoint.localeCompare(b.endpoint));
   }, [rows]);
 
@@ -156,12 +164,12 @@ function Section({
           </a>
         )}
       </div>
-      {myFile && (
+      {myFile && rows.some((r) => r.mine) && (
         <div className="px-4 py-2 text-2xs text-text-muted border-b border-canvas-muted">
           Rules in <code>{myFile}</code> can be disabled or deleted here.
-          {rows.some((r) => !r.mine && r.file)
-            ? " The others change in the file named next to them."
-            : " An admin changes the others."}
+          {isMember
+            ? " An admin changes the others."
+            : " The others change in the file named next to them."}
         </div>
       )}
       {groups.length === 0 ? (

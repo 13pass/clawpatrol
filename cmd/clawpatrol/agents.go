@@ -24,7 +24,6 @@ import (
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
-	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 	"github.com/denoland/clawpatrol/internal/config/plugins/tailscaleproto"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
@@ -1300,22 +1299,11 @@ func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 		}
 		gw := w.g.cfg.Load()
 		_, ownPath, ownErr := w.rulesFile(v)
-		declared := func(name string) (*rules.Rule, string) {
-			if gw == nil || gw.Policy == nil {
-				return nil, ""
-			}
-			ent := gw.Policy.Rules[name]
-			if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil {
-				return nil, ""
-			}
-			body, _ := ent.Body.(*rules.Rule)
-			return body, ent.Symbol.Block.DefRange.Filename
-		}
 		isMine := func(path string) bool {
 			return ownErr == nil && filepath.Clean(path) == filepath.Clean(ownPath)
 		}
 		mark := func(s *RuleSummary) {
-			body, path := declared(s.Name)
+			body, path := declaredRule(gw, s.Name)
 			if body == nil {
 				return
 			}
@@ -1341,7 +1329,7 @@ func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 		}
 		if gw != nil && gw.Policy != nil {
 			for _, name := range slices.Sorted(maps.Keys(gw.Policy.Rules)) {
-				body, path := declared(name)
+				body, path := declaredRule(gw, name)
 				if body == nil || listed[name] || !isMine(path) {
 					continue
 				}

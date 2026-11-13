@@ -28,6 +28,7 @@ export function DevicePage({
   integrations,
   configFile,
   canEditCredentials,
+  isMember,
   onBack,
   onConnect,
   onRefresh,
@@ -39,6 +40,7 @@ export function DevicePage({
   // canEditCredentials: an admin, on a gateway that lets the dashboard
   // write its config.
   canEditCredentials: boolean;
+  isMember: boolean;
   onBack: () => void;
   onConnect: (id: string) => void;
   onRefresh: () => void;
@@ -276,7 +278,7 @@ export function DevicePage({
         />
       )}
 
-      <RulesPanel profile={a.profile} />
+      <RulesPanel profile={a.profile} isMember={isMember} />
 
       {pendingProfile && (
         <ConfirmProfileChange
