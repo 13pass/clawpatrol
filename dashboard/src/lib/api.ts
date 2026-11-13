@@ -740,6 +740,27 @@ export function previewRule(actionID: string, req: RuleRequest) {
   return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
 }
 
+// profile, when set, limits an endpoint rule to that profile.
+export function previewEndpointRule(endpoint: string, profile: string, req: RuleRequest) {
+  return postJSON<RulePreviewResp>("/api/rules/preview", {
+    endpoint,
+    profile: profile || undefined,
+    ...req,
+  });
+}
+
+export function createEndpointRule(endpoint: string, profile: string, req: RuleRequest) {
+  return postJSON<RuleChangeResult>("/api/rules/create", {
+    endpoint,
+    profile: profile || undefined,
+    ...req,
+  });
+}
+
+export function addEndpointDefaultRules(endpoint: string) {
+  return postJSON<RuleChangeResult>("/api/rules/endpoint-defaults", { endpoint });
+}
+
 export function createRule(actionID: string, req: RuleRequest, reason?: string) {
   return postJSON<RuleChangeResult>("/api/rules/create", {
     action_id: actionID,
@@ -792,10 +813,20 @@ export type MyRule = {
 
 export type RuleChange = "disable" | "enable" | "delete";
 
+export type RuleEndpoint = {
+  name: string;
+  family: string;
+  profiles: string[];
+  // missing_defaults: the default rules an https endpoint lacks, by name.
+  missing_defaults: string[];
+};
+
 export async function getMyRules(): Promise<{
   file: string;
   rules: MyRule[];
   unavailable?: string;
+  // endpoints an admin may add a rule to.
+  endpoints?: RuleEndpoint[];
 }> {
   const r = await api("/api/my/rules");
   if (!r.ok) throw new Error(await r.text());

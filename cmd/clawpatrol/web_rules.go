@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -14,6 +15,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/hashicorp/hcl/v2/hclwrite"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
@@ -198,6 +201,10 @@ func (w *webMux) apiMyActions(rw http.ResponseWriter, r *http.Request) {
 
 type ruleRequestBody struct {
 	ActionID string `json:"action_id"`
+	// Endpoint, in place of ActionID, is an admin's rule for an endpoint
+	// with no request to start from, limited to Profile when set.
+	Endpoint string `json:"endpoint,omitempty"`
+	Profile  string `json:"profile,omitempty"`
 	RuleRequest
 	// Reason tells the admins why a member asks for a rule that waits
 	// for review.
@@ -217,6 +224,9 @@ func (w *webMux) scopedRuleFor(rw http.ResponseWriter, r *http.Request) (viewer,
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return viewer{}, nil, nil, false
+	}
+	if body.ActionID == "" && body.Endpoint != "" {
+		return w.endpointRuleFor(rw, v, body)
 	}
 	ev, err := w.loadAction(body.ActionID)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && !v.canSee(ev)) {
@@ -264,6 +274,136 @@ func (w *webMux) newHostConfig() (newHostConfig, error) {
 		}
 	}
 	return c, nil
+}
+
+type ruleEndpoint struct {
+	Name     string   `json:"name"`
+	Family   string   `json:"family"`
+	Profiles []string `json:"profiles"`
+	// MissingDefaults are the defaults.new_endpoint_rule rules an https
+	// endpoint lacks, by the name it would get.
+	MissingDefaults []string `json:"missing_defaults"`
+}
+
+// ruleEndpoints lists every endpoint an admin may add a rule to, with
+// the profiles reaching it.
+func (w *webMux) ruleEndpoints() []ruleEndpoint {
+	gw, policy := w.g.cfg.Load(), w.g.Policy()
+	out := []ruleEndpoint{}
+	if gw == nil || gw.Policy == nil || policy == nil {
+		return out
+	}
+	for _, name := range slices.Sorted(maps.Keys(policy.Endpoints)) {
+		ep := policy.Endpoints[name]
+		e := ruleEndpoint{Name: name, Family: ep.Family, Profiles: []string{}, MissingDefaults: []string{}}
+		for _, p := range slices.Sorted(maps.Keys(policy.Profiles)) {
+			if policy.Profiles[p].Endpoints[name] != nil {
+				e.Profiles = append(e.Profiles, p)
+			}
+		}
+		if ent := gw.Policy.Endpoints[name]; ent != nil && ent.Symbol != nil && ent.Symbol.Type == newEndpointType && gw.Defaults != nil {
+			for _, def := range gw.Defaults.NewEndpointRules {
+				if rule := newEndpointRuleName(name, def.Name); gw.Policy.Rules[rule] == nil {
+					e.MissingDefaults = append(e.MissingDefaults, rule)
+				}
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
+func (w *webMux) endpointRuleFor(rw http.ResponseWriter, v viewer, body ruleRequestBody) (viewer, *Event, *ScopedRule, bool) {
+	if !v.admin {
+		http.Error(rw, "only an admin writes a rule for an endpoint; create yours from one of your requests", http.StatusForbidden)
+		return viewer{}, nil, nil, false
+	}
+	if err := validateUserAssignment(w.g.Policy(), nil, &body.Approver); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return viewer{}, nil, nil, false
+	}
+	rule, err := GenerateEndpointRule(w.g.Policy(), body.Endpoint, body.Profile, body.RuleRequest)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return viewer{}, nil, nil, false
+	}
+	return v, &Event{Endpoint: body.Endpoint}, rule, true
+}
+
+// apiEndpointDefaultRules writes the defaults.new_endpoint_rule rules
+// an existing https endpoint lacks, as a host added from a request gets
+// them.
+func (w *webMux) apiEndpointDefaultRules(rw http.ResponseWriter, r *http.Request) {
+	var body struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if err := json.NewDecoder(http.MaxBytesReader(rw, r.Body, ruleRequestMaxBytes)).Decode(&body); err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	setAuditTarget(r, body.Endpoint)
+	v, err := w.viewerFor(r)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !v.admin {
+		http.Error(rw, "only an admin adds the default rules", http.StatusForbidden)
+		return
+	}
+	w.g.configMu.Lock()
+	defer w.g.configMu.Unlock()
+	gw := w.g.cfg.Load()
+	if !gw.DashboardConfigWrites() {
+		http.Error(rw, errConfigWritesDisabled.Error(), http.StatusForbidden)
+		return
+	}
+	ent := gw.Policy.Endpoints[body.Endpoint]
+	if ent == nil || ent.Symbol == nil {
+		http.Error(rw, "no endpoint "+strconv.Quote(body.Endpoint), http.StatusNotFound)
+		return
+	}
+	if ent.Symbol.Type != newEndpointType {
+		http.Error(rw, "the default rules are for https endpoints", http.StatusBadRequest)
+		return
+	}
+	tree, err := loadConfigTree(w.g.cfgPath)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var missing []*hclwrite.Block
+	for _, def := range tree.newEndpointRules() {
+		if gw.Policy.Rules[newEndpointRuleName(body.Endpoint, def.Labels()[0])] == nil {
+			missing = append(missing, def)
+		}
+	}
+	if len(missing) == 0 {
+		http.Error(rw, "endpoint "+strconv.Quote(body.Endpoint)+" has every default rule, or defaults declares none", http.StatusConflict)
+		return
+	}
+	f := hclwrite.NewEmptyFile()
+	names, err := appendNewEndpointRules(f, body.Endpoint, missing)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusBadRequest)
+		return
+	}
+	file, path, err := w.rulesFile(v)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusConflict)
+		return
+	}
+	current, err := readConfigFileOrEmpty(path)
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	changes, err := planConfigAppend(w.g.cfgPath, file, current, string(f.Bytes()))
+	if err != nil {
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.writeRuleChanges(rw, changes, map[string]any{"ok": true, "file": file, "default_rules": names})
 }
 
 // apiRulePreview generates a rule from an action without writing it,
@@ -484,7 +624,8 @@ type myRule struct {
 	NeedsReview []string `json:"needs_review,omitempty"`
 }
 
-// apiMyRules lists the rules declared in the caller's rules file.
+// apiMyRules lists the rules declared in the caller's rules file, and
+// for an admin the endpoints a rule can be added to.
 func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(rw, "GET", http.StatusMethodNotAllowed)
@@ -522,7 +663,11 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
-	writeJSON(rw, map[string]any{"file": file, "rules": out})
+	resp := map[string]any{"file": file, "rules": out}
+	if v.admin {
+		resp["endpoints"] = w.ruleEndpoints()
+	}
+	writeJSON(rw, resp)
 }
 
 // apiMyRulesUpdate disables or re-enables a rule in the caller's file.

@@ -389,6 +389,7 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/users/channel/clear", Auth: authDashboard, Handler: w.apiUsersChannelClear},
 		{Method: http.MethodPost, Path: "/api/rules/preview", Auth: authDashboard, Handler: w.apiRulePreview},
 		{Method: http.MethodPost, Path: "/api/rules/create", Auth: authDashboard, Handler: w.apiRuleCreate},
+		{Method: http.MethodPost, Path: "/api/rules/endpoint-defaults", Auth: authDashboard, Handler: w.apiEndpointDefaultRules},
 		{Method: http.MethodGet, Path: "/api/rule-requests", Auth: authDashboard, Handler: w.apiRuleRequests},
 		{Method: http.MethodPost, Path: "/api/rule-requests/withdraw", Auth: authDashboard, Handler: w.apiRuleRequestWithdraw},
 		{Method: http.MethodPost, Path: "/api/rule-requests/decide", Auth: authDashboard, Handler: w.apiRuleRequestDecide},
