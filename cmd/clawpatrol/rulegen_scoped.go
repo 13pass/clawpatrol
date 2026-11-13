@@ -142,7 +142,7 @@ func generateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 			return nil, fmt.Errorf("only an admin adds a host without a rule, from a request no endpoint claimed")
 		}
 	default:
-		return nil, fmt.Errorf("verdict must be deny, allow or approve")
+		return nil, fmt.Errorf("verdict must be deny, allow, approve or none")
 	}
 	if req.Scope == "" {
 		req.Scope = ruleScopeExact

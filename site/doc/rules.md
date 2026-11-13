@@ -490,7 +490,10 @@ shown and edited like any other.
 
 The host's credential is added afterwards on a device's Credentials
 panel, which binds only existing endpoints. In each profile it is added
-to, it replaces the passthrough credential. A profile declared in a file
+to, it replaces the passthrough credential; removing it, or moving it to
+another endpoint, puts the passthrough credential back, so the host keeps
+its rules. A hand-written passthrough credential is never replaced. A
+profile declared in a file
 marked `# clawpatrol:dashboard-readonly` is never changed: the dashboard
 says so, and the endpoint or credential goes into that file by hand.
 A member's rule for a host with no endpoint claims it for their own

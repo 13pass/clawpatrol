@@ -272,7 +272,11 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// Under the config lock, so a new host's defaults and read-only
+	// profiles come from the files the loaded policy was read from.
+	w.g.configMu.Lock()
 	v, ev, rule, ok := w.scopedRuleFor(rw, r)
+	w.g.configMu.Unlock()
 	if !ok {
 		return
 	}

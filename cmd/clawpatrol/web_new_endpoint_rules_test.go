@@ -11,6 +11,8 @@ import (
 	"slices"
 	"strings"
 	"testing"
+
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 const newEndpointRulesFile = "05-defaults.hcl"
@@ -466,5 +468,94 @@ func TestCredentialSwapRefusedWhenARulePinsThePassthrough(t *testing.T) {
 	}
 	if got := readCfgFile(t, env.w, "20-profiles.hcl"); got != before {
 		t.Errorf("20-profiles.hcl changed:\n%s", got)
+	}
+}
+
+// hostWithCredential adds example.org from the log, then ex-tok for it
+// in team-a, and returns the endpoint and its placeholder.
+func hostWithCredential(t *testing.T, env *rulesTestEnv) (string, string) {
+	t.Helper()
+	_, added := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
+	if added.EndpointName == "" {
+		t.Fatal("the host was not added")
+	}
+	if rw := credentialConfigCall(t, env.w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "ex-tok", "endpoint": added.EndpointName, "profiles": []string{"team-a"},
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("declare: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	return added.EndpointName, added.EndpointName + "_passthrough"
+}
+
+func teamProfiles(t *testing.T, env *rulesTestEnv) (string, string) {
+	t.Helper()
+	profiles := readCfgFile(t, env.w, "20-profiles.hcl")
+	at := strings.Index(profiles, `profile "team-b"`)
+	return profiles[:at], profiles[at:]
+}
+
+func TestRemovingTheCredentialRestoresThePlaceholder(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	_, placeholder := hostWithCredential(t, env)
+	if rw := credentialConfigCall(t, env.w.apiCredentialRemove, map[string]any{"name": "ex-tok"}); rw.Code != http.StatusOK {
+		t.Fatalf("remove: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if teamA, _ := teamProfiles(t, env); !strings.Contains(teamA, "passthrough."+placeholder) {
+		t.Errorf("team-a lost the host's endpoint with its credential:\n%s", teamA)
+	}
+	if runtime.HostEndpoint(env.w.g.Policy(), "team-a", "example.org") == nil {
+		t.Error("example.org has no endpoint for team-a any more")
+	}
+}
+
+func TestMovingTheCredentialRestoresThePlaceholder(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	_, placeholder := hostWithCredential(t, env)
+	if rw := credentialConfigCall(t, env.w.apiCredentialEdit, map[string]any{"name": "ex-tok", "endpoint": "sentry"}); rw.Code != http.StatusBadRequest {
+		// team-a already binds sentry-a to sentry, so the move itself is refused.
+		t.Fatalf("move onto a bound endpoint: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if rw := credentialConfigCall(t, env.w.apiCredentialEdit, map[string]any{
+		"name": "ex-tok", "endpoint": "sentry", "profiles": []string{"team-b"},
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("move: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	teamA, teamB := teamProfiles(t, env)
+	if !strings.Contains(teamA, "passthrough."+placeholder) || strings.Contains(teamA, "ex-tok") {
+		t.Errorf("team-a should be back on the placeholder:\n%s", teamA)
+	}
+	if !strings.Contains(teamB, "bearer_token.ex-tok") {
+		t.Errorf("team-b should list ex-tok:\n%s", teamB)
+	}
+}
+
+func TestEditingThePlaceholderKeepsItWhereItIs(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	_, added := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
+	placeholder := added.EndpointName + "_passthrough"
+	if rw := credentialConfigCall(t, env.w.apiCredentialEdit, map[string]any{
+		"name": placeholder, "profiles": []string{"team-a"},
+	}); rw.Code != http.StatusOK {
+		t.Fatalf("edit: status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	teamA, teamB := teamProfiles(t, env)
+	if !strings.Contains(teamA, "passthrough."+placeholder) || strings.Contains(teamB, "passthrough."+placeholder) {
+		t.Errorf("want the placeholder in team-a only:\n%s%s", teamA, teamB)
+	}
+}
+
+func TestHandWrittenPassthroughIsNotAPlaceholder(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	src := `endpoint "https" "forge" { hosts = ["forge.example"] }
+credential "passthrough" "forge-open" { endpoint = https.forge }
+`
+	if err := os.WriteFile(filepath.Join(env.w.g.cfgPath, "15-forge.hcl"), []byte(src), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	if got := placeholders(env.w.g.cfg.Load(), "forge", ""); len(got) != 0 {
+		t.Errorf("placeholders(forge) = %q, want none", got)
 	}
 }

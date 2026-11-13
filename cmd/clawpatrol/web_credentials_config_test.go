@@ -180,7 +180,7 @@ func TestCredentialDeclareRefusesReadOnlyProfileFile(t *testing.T) {
 		"type": "bearer_token", "name": "x", "endpoint": "github", "profiles": []string{"default"},
 	})
 	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), configDirProfilesFile) ||
-		!strings.Contains(rw.Body.String(), "add bearer_token.x to its credentials list in that file") {
+		!strings.Contains(rw.Body.String(), "change its credentials list in that file (add bearer_token.x)") {
 		t.Fatalf("status=%d body=%s, want a 400 naming %s and the edit to make there", rw.Code, rw.Body.String(), configDirProfilesFile)
 	}
 	if got := readCfgFile(t, w, configDirProfilesFile); got != before {
@@ -429,13 +429,13 @@ profile "ok" { credentials = [bearer_token.tok] }
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := tree.setCredentialProfiles("bearer_token", "tok", nil, nil); err != nil {
+	if _, err := tree.setCredentialProfiles("bearer_token", "tok", nil, placeholderSwap{}); err != nil {
 		t.Fatalf("removing from every profile: %v", err)
 	}
 	if got := string(tree.changes("", "")[0].Content); !strings.Contains(got, "credentials = some_list") || strings.Contains(got, "bearer_token.tok") {
 		t.Errorf("profiles = %q, want odd untouched and tok gone from ok", got)
 	}
-	if _, err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}, nil); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
+	if _, err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}, placeholderSwap{}); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
 		t.Errorf("adding to the unreadable list: err = %v, want it refused", err)
 	}
 }

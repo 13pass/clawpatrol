@@ -403,17 +403,28 @@ func entityRef(typ, name string) hcl.Traversal {
 	return hcl.Traversal{hcl.TraverseRoot{Name: typ}, hcl.TraverseAttr{Name: name}}
 }
 
+// placeholderSwap is how the passthrough placeholders the dashboard
+// adds with a host follow a credential change.
+type placeholderSwap struct {
+	// replace are the placeholders of the endpoint the credential binds:
+	// a profile that gains it, or keeps it while it moves, drops them.
+	replace []string
+	// restore is the placeholder of the endpoint it bound before the
+	// change: a profile that loses it, or keeps it while it moves, gets
+	// it back, so that endpoint stays claimed with its rules.
+	restore string
+	rebound bool
+}
+
 // setCredentialProfiles makes exactly the profiles in want list the
-// credential: it is appended to the lists that lack it and dropped
-// from the others. A profile that lists it afterwards loses the
-// credentials in replace: the passthrough credential that claimed the
-// endpoint until a real one was added. It returns the profiles that
-// lost one, with what they lost.
-func (t *configTree) setCredentialProfiles(credType, credName string, want []string, replace []string) (map[string][]string, error) {
+// credential, moving placeholders as swap says. It returns the
+// placeholders each profile dropped.
+func (t *configTree) setCredentialProfiles(credType, credName string, want []string, swap placeholderSwap) (map[string][]string, error) {
 	wanted := map[string]bool{}
 	for _, p := range want {
 		wanted[p] = true
 	}
+	ref := credType + "." + credName
 	replaced := map[string][]string{}
 	files, profiles := t.blocks("profile")
 	for i, profile := range profiles {
@@ -421,55 +432,66 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 		if len(labels) != 1 {
 			continue
 		}
+		name := labels[0]
 		list, err := parseProfileCredentials(profile)
 		if err != nil {
 			// The form cannot read this list, so it leaves it alone; a
 			// request to add the credential to it is refused. If the
 			// list still names a removed credential, the reload says so.
-			if wanted[labels[0]] {
-				return nil, fmt.Errorf("%w: profile %q: %v; change it in the config", errBadCredentialRequest, labels[0], err)
+			if wanted[name] {
+				return nil, fmt.Errorf("%w: profile %q: %v; change it in the config", errBadCredentialRequest, name, err)
 			}
 			continue
 		}
 		has := list.has(credName)
 		var drop []string
-		if wanted[labels[0]] {
-			drop = slices.DeleteFunc(slices.Clone(replace), func(name string) bool { return !list.has(name) })
+		restore := !wanted[name] && has || wanted[name] && has && swap.rebound
+		if wanted[name] && (!has || swap.rebound) {
+			drop = slices.DeleteFunc(slices.Clone(swap.replace), func(p string) bool { return !list.has(p) })
 		}
-		if (wanted[labels[0]] != has || len(drop) > 0) && t.readOnly(files[i]) {
-			var edit string
-			switch {
-			case !has:
-				edit = "add " + credType + "." + credName + " to its credentials list"
-			case !wanted[labels[0]]:
-				edit = "remove " + credType + "." + credName + " from its credentials list"
-			}
-			if len(drop) > 0 {
-				edit = strings.TrimPrefix(edit+" and remove "+strings.Join(drop, ", ")+" from it", " and ")
-			}
-			return nil, fmt.Errorf("%w: profile %q is declared in %s, which the dashboard does not change: %s in that file",
-				errBadCredentialRequest, labels[0], files[i], edit)
+		restore = restore && swap.restore != "" && !list.has(swap.restore)
+		var edits []string
+		if wanted[name] && !has {
+			edits = append(edits, "add "+ref)
 		}
-		for _, name := range drop {
-			if list, err = parseCredentialList(list.without(name), labels[0]); err != nil {
+		if !wanted[name] && has {
+			edits = append(edits, "remove "+ref)
+		}
+		for _, p := range drop {
+			edits = append(edits, "remove passthrough."+p)
+		}
+		if restore {
+			edits = append(edits, "add passthrough."+swap.restore)
+		}
+		if len(edits) > 0 && t.readOnly(files[i]) {
+			return nil, fmt.Errorf("%w: profile %q is declared in %s, which the dashboard does not change: change its credentials list in that file (%s)",
+				errBadCredentialRequest, name, files[i], strings.Join(edits, " and "))
+		}
+		for _, p := range drop {
+			if list, err = parseCredentialList(list.without(p), name); err != nil {
+				return nil, err
+			}
+		}
+		if restore {
+			if list, err = parseCredentialList(list.with("passthrough."+swap.restore), name); err != nil {
 				return nil, err
 			}
 		}
 		switch {
-		case wanted[labels[0]] && !has:
-			err = setProfileCredentialsSource(profile, list.with(credType+"."+credName))
-		case !wanted[labels[0]] && has:
+		case wanted[name] && !has:
+			err = setProfileCredentialsSource(profile, list.with(ref))
+		case !wanted[name] && has:
 			err = setProfileCredentialsSource(profile, list.without(credName))
-		case len(drop) > 0:
+		case len(edits) > 0:
 			err = setProfileCredentialsSource(profile, list.src)
 		}
 		if err != nil {
 			return nil, err
 		}
 		if len(drop) > 0 {
-			replaced[labels[0]] = drop
+			replaced[name] = drop
 		}
-		delete(wanted, labels[0])
+		delete(wanted, name)
 	}
 	if len(wanted) > 0 {
 		missing := make([]string, 0, len(wanted))
@@ -482,13 +504,16 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 	return replaced, nil
 }
 
-// placeholderCredentials are the passthrough credentials that claim
-// endpoint: the dashboard adds one with each host, until a real
-// credential replaces it.
-func placeholderCredentials(gw *config.Gateway, endpoint string) []string {
+// placeholders are the passthrough credentials the dashboard added with
+// endpoint (generatedPassthroughCredName), other than except.
+func placeholders(gw *config.Gateway, endpoint, except string) []string {
 	var names []string
 	for name, ent := range gw.Policy.Credentials {
-		if ent == nil || ent.Symbol == nil || ent.Symbol.Type != "passthrough" {
+		if name == except || ent == nil || ent.Symbol == nil || ent.Symbol.Type != "passthrough" {
+			continue
+		}
+		base := endpoint + "_passthrough"
+		if suffix, ok := strings.CutPrefix(name, base+"_"); name != base && (!ok || strings.Trim(suffix, "0123456789") != "") {
 			continue
 		}
 		if targets := config.CredentialEndpointTargets(ent); len(targets) == 1 && targets[0] == endpoint {
@@ -497,6 +522,15 @@ func placeholderCredentials(gw *config.Gateway, endpoint string) []string {
 	}
 	sort.Strings(names)
 	return names
+}
+
+// placeholderFor is the placeholder a profile gets back when it stops
+// reaching endpoint through except, or "".
+func placeholderFor(gw *config.Gateway, endpoint, except string) string {
+	if p := placeholders(gw, endpoint, except); len(p) > 0 {
+		return p[0]
+	}
+	return ""
 }
 
 // checkReplacedCredentials refuses a swap that would stop a rule: a
@@ -896,7 +930,7 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 		if req.Profiles != nil {
 			profiles = *req.Profiles
 		}
-		replaced, err := tree.setCredentialProfiles(typ.Type, req.Name, profiles, placeholderCredentials(gw, *req.Endpoint))
+		replaced, err := tree.setCredentialProfiles(typ.Type, req.Name, profiles, placeholderSwap{replace: placeholders(gw, *req.Endpoint, req.Name)})
 		if err != nil {
 			return credentialPlan{}, err
 		}
@@ -943,8 +977,7 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 		}
 		profiles := req.Profiles
 		if profiles == nil && rebound {
-			// The profiles listing it keep it, and lose the endpoint's
-			// passthrough credential.
+			// The profiles listing it keep it, and swap placeholders.
 			listing := []string{}
 			_, blocks := tree.blocks("profile")
 			for _, profile := range blocks {
@@ -955,14 +988,16 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			profiles = &listing
 		}
 		if profiles != nil {
-			endpoint := ""
+			current := ""
 			if targets := config.CredentialEndpointTargets(gw.Policy.Credentials[req.Name]); len(targets) == 1 {
-				endpoint = targets[0]
+				current = targets[0]
 			}
+			endpoint := current
 			if req.Endpoint != nil {
 				endpoint = *req.Endpoint
 			}
-			replaced, err := tree.setCredentialProfiles(credType, req.Name, *profiles, placeholderCredentials(gw, endpoint))
+			swap := placeholderSwap{replace: placeholders(gw, endpoint, req.Name), restore: placeholderFor(gw, current, req.Name), rebound: rebound}
+			replaced, err := tree.setCredentialProfiles(credType, req.Name, *profiles, swap)
 			if err != nil {
 				return credentialPlan{}, err
 			}
@@ -1005,7 +1040,11 @@ func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
 		if _, ok := editableCredentialType(credType); !ok {
 			return credentialPlan{}, fmt.Errorf("%w: the form cannot remove a %s credential; remove it from %s", errBadCredentialRequest, credType, file)
 		}
-		if _, err := tree.setCredentialProfiles(credType, req.Name, nil, nil); err != nil {
+		swap := placeholderSwap{}
+		if targets := config.CredentialEndpointTargets(gw.Policy.Credentials[req.Name]); len(targets) == 1 {
+			swap.restore = placeholderFor(gw, targets[0], req.Name)
+		}
+		if _, err := tree.setCredentialProfiles(credType, req.Name, nil, swap); err != nil {
 			return credentialPlan{}, err
 		}
 		tree.files[file].Body().RemoveBlock(blk)
