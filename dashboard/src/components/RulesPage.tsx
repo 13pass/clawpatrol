@@ -4,8 +4,6 @@ import { PageTitle } from "./PageTitle";
 import { RuleRequests } from "./RuleRequests";
 import { RulesPanel } from "./RulesPanel";
 
-// RulesPage shows the rule requests (those to review for an admin, a
-// member's own otherwise) above every rule the viewer can see.
 export function RulesPage({ isMember }: { isMember: boolean }) {
   const [requestsVersion, setRequestsVersion] = useState(0);
   const [rulesVersion, setRulesVersion] = useState(0);

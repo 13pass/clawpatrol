@@ -10,10 +10,6 @@ import {
 import { Button } from "./Button";
 import { Tag, type Tone } from "./Tag";
 
-// RulesPanel lists the rules that apply, grouped by endpoint: all of
-// them, or those of one profile on a device page. The rules of the
-// viewer's own file (the dashboard's, for an admin) are disabled,
-// enabled or deleted here.
 export function RulesPanel({
   profile,
   version,
@@ -22,9 +18,7 @@ export function RulesPanel({
 }: {
   profile?: string;
   isMember: boolean;
-  // version reloads the list when it changes.
   version?: number;
-  // onChanged runs after a change, applied or sent for review.
   onChanged?: () => void;
 }) {
   const [rows, setRows] = useState<RuleSummary[]>([]);
@@ -132,8 +126,7 @@ function Section({
   onChange: (r: RuleSummary, kind: RuleChange) => void;
   allRulesLink: boolean;
 }) {
-  // Group by endpoint, rules by priority, highest (tried first) on top.
-  // Endpoint groups sort alphabetically.
+  // Highest priority first: the order rules are tried in.
   const groups = useMemo(() => {
     const m = new Map<string, { endpoint: string; family: string; rules: RuleSummary[] }>();
     for (const r of rows) {

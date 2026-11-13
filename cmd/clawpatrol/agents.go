@@ -1268,13 +1268,10 @@ type RuleSummary struct {
 	Verdict    string                `json:"verdict,omitempty"`
 	Reason     string                `json:"reason,omitempty"`
 	Approve    []config.ApproveStage `json:"approve,omitempty"`
-	// File is the config file declaring the rule; a member only sees
-	// their own.
+	// File is only set for a member's own rules.
 	File          string `json:"file,omitempty"`
 	PinnedProfile string `json:"pinned_profile,omitempty"`
-	// Mine marks a rule of the viewer's own file, which /api/my/rules
-	// changes; Owned is false when it is pinned to a profile the member
-	// no longer owns.
+	// Owned is false for a member's rule pinned to a profile they lost.
 	Mine        bool     `json:"mine,omitempty"`
 	Owned       bool     `json:"owned,omitempty"`
 	NeedsReview []string `json:"needs_review,omitempty"`
@@ -1285,10 +1282,8 @@ type RuleSummary struct {
 // emit one row per endpoint so the operator sees each attachment
 // site individually.
 //
-// Read-only: the rules of the viewer's own file change through
-// /api/my/rules, the others in their file. Those rules are listed even
-// when no profile of the viewer reaches them, so they can still be
-// changed.
+// Read-only. The viewer's own rules are listed even when no profile of
+// theirs reaches them, so they can still be changed.
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":

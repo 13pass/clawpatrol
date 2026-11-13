@@ -652,8 +652,6 @@ func (w *webMux) decidesPending(v viewer, p runtime.HITLPending) bool {
 	return body != nil && filepath.Clean(file) == filepath.Clean(path) && v.ownsRule(body)
 }
 
-// declaredRule is a rule of the loaded config and the file declaring
-// it, or nil.
 func declaredRule(gw *config.Gateway, name string) (*rules.Rule, string) {
 	if gw == nil || gw.Policy == nil {
 		return nil, ""

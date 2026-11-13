@@ -300,11 +300,10 @@ export type RuleSummary = {
   // dispatched against. Empty when the rule doesn't filter on
   // credential.
   credential?: string;
-  // file declares the rule; a member only sees their own.
+  // file is only set for a member's own rules.
   file?: string;
   pinned_profile?: string;
-  // mine marks a rule of the viewer's own file, changed through
-  // /api/my/rules; owned is false when its profile is no longer theirs.
+  // owned is false for a member's rule pinned to a profile they lost.
   mine?: boolean;
   owned?: boolean;
   needs_review?: RuleChange[];
