@@ -413,7 +413,6 @@ func TestMemberHandWrittenConditionGoesToReview(t *testing.T) {
 		t.Error("a member's hand-written deny was written before review")
 	}
 
-	// An admin's hand-written condition applies at once.
 	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create", req); rw.Code != http.StatusOK {
 		t.Fatalf("admin create = %d %s", rw.Code, rw.Body.String())
 	}

@@ -48,7 +48,6 @@ const (
 // the author has no approver of their own.
 const dashboardApproverRef = "builtin.dashboard"
 
-// memberConditionMaxBytes bounds a member's hand-written condition.
 const memberConditionMaxBytes = 4096
 
 // patternMinHexSegment is the shortest all-hex path segment the
@@ -72,9 +71,7 @@ type RuleRequest struct {
 	// PinHeader, when set, limits an HTTP rule to requests carrying the
 	// recorded value of this header — e.g. the API service's caller ID.
 	PinHeader string `json:"pin_header,omitempty"`
-	// Condition, when set, is the rule's CEL condition as the user wrote
-	// it, in place of the one Scope and PinHeader generate. The rule's
-	// endpoint, pins and priority stay as generated.
+	// Condition replaces the one Scope and PinHeader generate.
 	Condition string `json:"condition,omitempty"`
 }
 
@@ -102,17 +99,12 @@ type ScopedRule struct {
 	// ProfileAdditions.
 	NewEndpoint      bool     `json:"new_endpoint,omitempty"`
 	ProfileAdditions []string `json:"profile_additions,omitempty"`
-	// HandWritten is set when Condition is the user's own, not the one
-	// the scope and header pin generate.
-	HandWritten bool `json:"hand_written,omitempty"`
+	HandWritten      bool     `json:"hand_written,omitempty"`
 
 	// credentialRef is Credential as a typed HCL reference.
 	credentialRef string
-	// scope is the scope the rule was generated for; empty for a
-	// hand-written condition.
-	scope string
-	// matcher is the compiled condition, when it was compiled already.
-	matcher match.Matcher
+	scope         string
+	matcher       match.Matcher
 }
 
 // GenerateScopedRule turns a recorded request into a rule. For a member
@@ -321,13 +313,11 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 
 var parseOnlyCELEnv = sync.OnceValues(func() (*cel.Env, error) { return cel.NewEnv() })
 
-// checkMemberCondition holds a member's condition to what the generated
-// ones do. A loop inside another loop is refused: it runs on every
-// request, and its cost grows with the product of the lists. A header
-// is read only by a quoted name (`'X' in http.headers`,
-// `http.headers['X']`) that is not one IsSensitiveHeader masks, as the
-// header pin does. Text the plain parser cannot read is refused, so
-// syntax a facet adds cannot slip past either check.
+// checkMemberCondition holds a member's condition to what generated ones
+// do: no loop inside a loop, whose cost on every request is the product
+// of the lists, and headers only by a quoted name that is not masked.
+// Text the plain parser cannot read is refused, so facet syntax cannot
+// slip past.
 func checkMemberCondition(condition string) error {
 	env, err := parseOnlyCELEnv()
 	if err != nil {
@@ -363,8 +353,6 @@ func isHTTPHeaders(e celast.NavigableExpr) bool {
 	return operand.Kind() == celast.IdentKind && operand.AsIdent() == "http"
 }
 
-// quotedHeaderName returns the string literal headers is indexed by or
-// tested for with `in`.
 func quotedHeaderName(headers celast.NavigableExpr) (string, bool) {
 	parent, ok := headers.Parent()
 	if !ok || parent.Kind() != celast.CallKind {

@@ -248,7 +248,6 @@ func setCELCondition(b *hclwrite.Body, condition string) {
 
 const celHeredocMarker = "CEL"
 
-// heredocTemplateEscaper keeps `${` and `%{` literal in a heredoc.
 var heredocTemplateEscaper = strings.NewReplacer("${", "$${", "%{", "%%{")
 
 // splitCELAnd splits a condition at each ` && ` outside a string

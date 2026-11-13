@@ -676,8 +676,6 @@ export type RuleRequest = {
   // approver applies to admins only; a member's own approver is used.
   approver?: string;
   pin_header?: string;
-  // condition: a CEL condition written by hand, in place of the one
-  // scope and pin_header generate.
   condition?: string;
 };
 
@@ -687,7 +685,6 @@ export type ScopedRule = {
   endpoint_name: string;
   family: string;
   condition?: string;
-  // hand_written: the condition was written by hand, not generated.
   hand_written?: boolean;
   credential?: string;
   profile?: string;

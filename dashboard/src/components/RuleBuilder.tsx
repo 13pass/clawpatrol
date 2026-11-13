@@ -76,8 +76,7 @@ export function RuleBuilderModal({
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
-  // conditionText is null while the editor is closed. Blank, the rule
-  // uses the generated condition and Matching applies again.
+  // null while the editor is closed.
   const [conditionText, setConditionText] = useState<string | null>(null);
   const condition = conditionText?.trim() ? conditionText : undefined;
   const prefillOnPreview = useRef(false);
@@ -139,9 +138,7 @@ export function RuleBuilderModal({
     };
   }, [ev.id, request, requestKey, created]);
 
-  // editCondition opens the editor on the generated condition. While a
-  // preview is on its way, it opens empty and that preview fills it,
-  // unless the user types first. After a failed preview it stays empty.
+  // While a preview is on its way, the editor opens empty and that preview fills it.
   function editCondition() {
     prefillOnPreview.current = !fresh && !err;
     setConditionText(fresh ? (preview?.rule.condition ?? "") : "");
