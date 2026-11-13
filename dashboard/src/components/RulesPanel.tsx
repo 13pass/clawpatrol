@@ -1,10 +1,9 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   deleteMyRule,
   getMyRules,
   getRules,
   setMyRuleDisabled,
-  type MyRule,
   type RuleChange,
   type RuleSummary,
 } from "../lib/api";
@@ -14,39 +13,49 @@ import { Tag, type Tone } from "./Tag";
 // RulesPanel lists the rules that apply, grouped by endpoint: all of
 // them, or those of one profile on a device page. The rules of the
 // viewer's own file (the dashboard's, for an admin) are disabled,
-// enabled or deleted here; the others name the file to change them in.
+// enabled or deleted here.
 export function RulesPanel({
   profile,
+  version,
   onChanged,
 }: {
   profile?: string;
+  // version reloads the list when it changes.
+  version?: number;
   // onChanged runs after a change, applied or sent for review.
   onChanged?: () => void;
 }) {
   const [rows, setRows] = useState<RuleSummary[]>([]);
-  const [mine, setMine] = useState<Map<string, MyRule>>(new Map());
   const [myFile, setMyFile] = useState("");
   const [unavailable, setUnavailable] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [info, setInfo] = useState("");
+  const loads = useRef(0);
 
   function refresh() {
-    return Promise.all([getRules(), getMyRules().catch(() => null)])
+    const load = ++loads.current;
+    const my = getMyRules().catch((e) => ({
+      file: "",
+      unavailable: `The rules you can change could not be loaded: ${e instanceof Error ? e.message : e}`,
+    }));
+    return Promise.all([getRules(), my])
       .then(([all, my]) => {
+        if (load !== loads.current) return;
         setRows(all ?? []);
-        setMine(new Map((my?.rules ?? []).map((r) => [r.name, r])));
-        setMyFile(my?.file ?? "");
-        setUnavailable(my?.unavailable ?? "");
+        setMyFile(my.file);
+        setUnavailable(my.unavailable ?? "");
         setErr(null);
       })
-      .catch((e) => setErr(String(e instanceof Error ? e.message : e)));
+      .catch((e) => {
+        if (load === loads.current) setErr(String(e instanceof Error ? e.message : e));
+      });
   }
 
   useEffect(() => {
     refresh();
-  }, []);
+  }, [version]);
 
-  async function change(r: MyRule, kind: RuleChange) {
+  async function change(r: RuleSummary, kind: RuleChange) {
     let reason: string | undefined;
     if (r.needs_review?.includes(kind)) {
       const answer = window.prompt(
@@ -95,7 +104,6 @@ export function RulesPanel({
       <Section
         title="Rules"
         rows={visible}
-        mine={mine}
         myFile={myFile}
         onChange={change}
         allRulesLink={!!profile}
@@ -107,16 +115,14 @@ export function RulesPanel({
 function Section({
   title,
   rows,
-  mine,
   myFile,
   onChange,
   allRulesLink,
 }: {
   title: string;
   rows: RuleSummary[];
-  mine: Map<string, MyRule>;
   myFile: string;
-  onChange: (r: MyRule, kind: RuleChange) => void;
+  onChange: (r: RuleSummary, kind: RuleChange) => void;
   allRulesLink: boolean;
 }) {
   // Group by endpoint. Server already sorts rules within an endpoint
@@ -152,8 +158,10 @@ function Section({
       </div>
       {myFile && (
         <div className="px-4 py-2 text-2xs text-text-muted border-b border-canvas-muted">
-          Rules in <code>{myFile}</code> can be disabled or deleted here; the others change in the
-          file named next to them.
+          Rules in <code>{myFile}</code> can be disabled or deleted here.
+          {rows.some((r) => !r.mine && r.file)
+            ? " The others change in the file named next to them."
+            : " An admin changes the others."}
         </div>
       )}
       {groups.length === 0 ? (
@@ -161,7 +169,7 @@ function Section({
       ) : (
         <div className="flex flex-col">
           {groups.map((g) => (
-            <EndpointGroup key={g.endpoint} group={g} mine={mine} onChange={onChange} />
+            <EndpointGroup key={g.endpoint} group={g} onChange={onChange} />
           ))}
         </div>
       )}
@@ -171,12 +179,10 @@ function Section({
 
 function EndpointGroup({
   group,
-  mine,
   onChange,
 }: {
   group: { endpoint: string; family: string; rules: RuleSummary[] };
-  mine: Map<string, MyRule>;
-  onChange: (r: MyRule, kind: RuleChange) => void;
+  onChange: (r: RuleSummary, kind: RuleChange) => void;
 }) {
   return (
     <div className="border-b border-canvas-muted last:border-b-0">
@@ -189,7 +195,7 @@ function EndpointGroup({
         </span>
       </div>
       {group.rules.map((r, i) => (
-        <RuleRow key={`${r.name}/${i}`} rule={r} mine={mine.get(r.name)} onChange={onChange} />
+        <RuleRow key={`${r.name}/${i}`} rule={r} onChange={onChange} />
       ))}
     </div>
   );
@@ -197,12 +203,10 @@ function EndpointGroup({
 
 function RuleRow({
   rule: r,
-  mine,
   onChange,
 }: {
   rule: RuleSummary;
-  mine?: MyRule;
-  onChange: (r: MyRule, kind: RuleChange) => void;
+  onChange: (r: RuleSummary, kind: RuleChange) => void;
 }) {
   return (
     <div
@@ -224,7 +228,10 @@ function RuleRow({
         <div className="text-xs text-text-muted mt-1 font-mono truncate" title={renderCondition(r)}>
           {renderCondition(r)}
         </div>
-        {mine && !mine.owned && (
+        {r.pinned_profile && (
+          <div className="text-2xs text-text-muted mt-0.5">profile {r.pinned_profile} only</div>
+        )}
+        {r.mine && !r.owned && (
           <div className="text-2xs text-text-muted mt-0.5">
             Its profile is no longer yours; an admin can change it.
           </div>
@@ -240,21 +247,21 @@ function RuleRow({
             {r.priority}
           </span>
         )}
-        {mine ? (
+        {r.mine ? (
           <div className="flex gap-1 mt-1">
             <Button
               size="xs"
               variant="outline"
-              disabled={!mine.owned}
-              onClick={() => onChange(mine, mine.disabled ? "enable" : "disable")}
+              disabled={!r.owned}
+              onClick={() => onChange(r, r.disabled ? "enable" : "disable")}
             >
-              {mine.disabled ? "Enable" : "Disable"}
+              {r.disabled ? "Enable" : "Disable"}
             </Button>
             <Button
               size="xs"
               variant="outline"
-              disabled={!mine.owned}
-              onClick={() => onChange(mine, "delete")}
+              disabled={!r.owned}
+              onClick={() => onChange(r, "delete")}
             >
               Delete
             </Button>

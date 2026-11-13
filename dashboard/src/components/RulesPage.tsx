@@ -25,7 +25,7 @@ export function RulesPage({ isMember }: { isMember: boolean }) {
         version={requestsVersion}
         onDecided={() => setRulesVersion((v) => v + 1)}
       />
-      <RulesPanel key={rulesVersion} onChanged={() => setRequestsVersion((v) => v + 1)} />
+      <RulesPanel version={rulesVersion} onChanged={() => setRequestsVersion((v) => v + 1)} />
     </Main>
   );
 }

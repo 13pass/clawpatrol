@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/extplugin"
+	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 	"github.com/denoland/clawpatrol/internal/config/plugins/tailscaleproto"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
@@ -1267,8 +1269,16 @@ type RuleSummary struct {
 	Verdict    string                `json:"verdict,omitempty"`
 	Reason     string                `json:"reason,omitempty"`
 	Approve    []config.ApproveStage `json:"approve,omitempty"`
-	// File is the config file declaring the rule.
-	File string `json:"file,omitempty"`
+	// File is the config file declaring the rule; a member only sees
+	// their own.
+	File          string `json:"file,omitempty"`
+	PinnedProfile string `json:"pinned_profile,omitempty"`
+	// Mine marks a rule of the viewer's own file, which /api/my/rules
+	// changes; Owned is false when it is pinned to a profile the member
+	// no longer owns.
+	Mine        bool     `json:"mine,omitempty"`
+	Owned       bool     `json:"owned,omitempty"`
+	NeedsReview []string `json:"needs_review,omitempty"`
 }
 
 // apiRules returns every compiled rule across every profile, flattened
@@ -1277,7 +1287,9 @@ type RuleSummary struct {
 // site individually.
 //
 // Read-only: the rules of the viewer's own file change through
-// /api/my/rules, the others in their file.
+// /api/my/rules, the others in their file. Those rules are listed even
+// when no profile of the viewer reaches them, so they can still be
+// changed.
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -1286,15 +1298,67 @@ func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		gw := w.g.cfg.Load()
+		_, ownPath, ownErr := w.rulesFile(v)
+		declared := func(name string) (*rules.Rule, string) {
+			if gw == nil || gw.Policy == nil {
+				return nil, ""
+			}
+			ent := gw.Policy.Rules[name]
+			if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil {
+				return nil, ""
+			}
+			body, _ := ent.Body.(*rules.Rule)
+			return body, ent.Symbol.Block.DefRange.Filename
+		}
+		isMine := func(path string) bool {
+			return ownErr == nil && filepath.Clean(path) == filepath.Clean(ownPath)
+		}
+		mark := func(s *RuleSummary) {
+			body, path := declared(s.Name)
+			if body == nil {
+				return
+			}
+			s.PinnedProfile = body.Profile
+			if isMine(path) {
+				s.Mine, s.Owned = true, v.ownsRule(body)
+				if !v.admin {
+					s.NeedsReview = ruleChangesNeedingReview(body)
+				}
+			}
+			if v.admin || s.Mine {
+				s.File = filepath.Base(path)
+			}
+		}
 		out := []RuleSummary{}
+		listed := map[string]bool{}
 		for _, s := range w.collectRuleSummaries("") {
 			if v.ownsProfile(s.Profile) {
+				mark(&s)
 				out = append(out, s)
+				listed[s.Name] = true
+			}
+		}
+		if gw != nil && gw.Policy != nil {
+			for _, name := range slices.Sorted(maps.Keys(gw.Policy.Rules)) {
+				body, path := declared(name)
+				if body == nil || listed[name] || !isMine(path) {
+					continue
+				}
+				for _, ep := range body.Endpoints {
+					s := RuleSummary{
+						Name: name, Family: body.Family, Endpoint: ep, Priority: body.Priority, Disabled: body.Disabled,
+						Condition: body.Condition, Credential: body.Credential, Verdict: body.Verdict, Reason: body.Reason,
+						Approve: body.Approve,
+					}
+					mark(&s)
+					out = append(out, s)
+				}
 			}
 		}
 		writeJSON(rw, out)
 	default:
-		http.Error(rw, "edit rules through the gateway.hcl preview/save flow", http.StatusNotImplemented)
+		http.Error(rw, "rules change through /api/my/rules or in their config file", http.StatusNotImplemented)
 	}
 }
 
@@ -1308,14 +1372,6 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 	policy := w.g.Policy()
 	if policy == nil {
 		return []RuleSummary{}
-	}
-	files := map[string]string{}
-	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil {
-		for name, ent := range gw.Policy.Rules {
-			if ent != nil && ent.Symbol != nil && ent.Symbol.Block != nil {
-				files[name] = filepath.Base(ent.Symbol.Block.DefRange.Filename)
-			}
-		}
 	}
 	var out []RuleSummary
 	for profileName, prof := range policy.Profiles {
@@ -1341,7 +1397,6 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 					Verdict:    r.Outcome.Verdict,
 					Reason:     r.Outcome.Reason,
 					Approve:    r.Outcome.Approve,
-					File:       files[r.Name],
 				})
 			}
 		}

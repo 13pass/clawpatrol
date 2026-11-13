@@ -300,7 +300,14 @@ export type RuleSummary = {
   // dispatched against. Empty when the rule doesn't filter on
   // credential.
   credential?: string;
+  // file declares the rule; a member only sees their own.
   file?: string;
+  pinned_profile?: string;
+  // mine marks a rule of the viewer's own file, changed through
+  // /api/my/rules; owned is false when its profile is no longer theirs.
+  mine?: boolean;
+  owned?: boolean;
+  needs_review?: RuleChange[];
 };
 
 export async function getRules(): Promise<RuleSummary[]> {
