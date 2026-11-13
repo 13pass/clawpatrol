@@ -629,8 +629,8 @@ type Defaults struct {
 	HumanOnTimeout string `hcl:"human_on_timeout,optional"`
 
 	// NewEndpointRules are the rules the dashboard writes for every
-	// https endpoint it declares, in the same change as the endpoint,
-	// so a host added from a device's Credentials panel is never
+	// https endpoint an admin declares from a request no endpoint
+	// claimed, in the same change as the endpoint, so the host is never
 	// served without them. Each one becomes `rule "<endpoint>-<name>"`
 	// with `endpoint` set to the new endpoint and this block's body
 	// copied as written. The gateway checks them against a probe

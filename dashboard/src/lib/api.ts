@@ -181,8 +181,6 @@ export type CredentialConfigOptions = {
     string,
     CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
   >;
-  // new_endpoint_rules: suffixes of the new endpoint's name.
-  new_endpoint_rules: string[];
 };
 
 export type CredentialConfigChange = {
@@ -191,7 +189,6 @@ export type CredentialConfigChange = {
   header?: string;
   prefix?: string;
   endpoint?: string;
-  new_endpoint?: { name: string; host: string };
   // profiles: every profile that should list it; omitted on an edit, the
   // profiles stay as they are.
   profiles?: string[];
@@ -670,7 +667,8 @@ export function updateUser(
 }
 
 // A request turned into a rule: what it does and how much it matches.
-export type RuleVerdict = "deny" | "allow" | "approve";
+// none adds a host no endpoint claimed with only its default rules.
+export type RuleVerdict = "deny" | "allow" | "approve" | "none";
 export type RuleScope = "exact" | "any_method" | "any_path" | "pattern" | "any_name";
 export type RuleRequest = {
   verdict: RuleVerdict;
@@ -694,6 +692,7 @@ export type ScopedRule = {
   warnings?: string[];
   new_endpoint?: boolean;
   profile_additions?: string[];
+  default_rules?: string[];
 };
 
 export type RulePreviewResp = {
@@ -714,6 +713,8 @@ export type RuleChangeResult = {
   ok: boolean;
   rule_name?: string;
   file?: string;
+  endpoint_name?: string;
+  default_rules?: string[];
   pending?: boolean;
   request_id?: number;
 };

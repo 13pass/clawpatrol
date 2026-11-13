@@ -19,6 +19,11 @@ const MASKED_HEADER_VALUE = "***";
 const PREVIEW_DEBOUNCE_MS = 250;
 
 const VERDICTS: { value: RuleVerdict; label: string; help: string }[] = [
+  {
+    value: "none",
+    label: "Only the default rules",
+    help: "Add the host with the rules every host added here gets.",
+  },
   { value: "deny", label: "Deny", help: "Block matching requests." },
   { value: "allow", label: "Pre-approve", help: "Let matching requests through without review." },
   {
@@ -63,8 +68,14 @@ export function RuleBuilderModal({
   onClose: () => void;
 }) {
   const isAdmin = whoami?.role !== "member";
+  const newHost = !ev.endpoint;
   const scopes = scopesFor(ev);
-  const [verdict, setVerdict] = useState<RuleVerdict>("deny");
+  // A host no endpoint claimed already passes through, so allowing it
+  // means nothing; only an admin adds one without a rule.
+  const verdicts = VERDICTS.filter((v) =>
+    newHost ? v.value !== "allow" && (isAdmin || v.value !== "none") : v.value !== "none",
+  );
+  const [verdict, setVerdict] = useState<RuleVerdict>(verdicts[0].value);
   const [scope, setScope] = useState<RuleScope>(scopes[0].value);
   const [pinHeader, setPinHeader] = useState("");
   const [approver, setApprover] = useState("");
@@ -167,7 +178,11 @@ export function RuleBuilderModal({
     "border border-canvas-dark rounded px-2 py-1.5 text-xs bg-canvas focus:outline-none focus:border-text";
 
   return (
-    <Modal title="Create a rule from this request" size="lg" onClose={onClose}>
+    <Modal
+      title={newHost && isAdmin ? "Add this host" : "Create a rule from this request"}
+      size="lg"
+      onClose={onClose}
+    >
       <div className="p-4 space-y-4 overflow-auto">
         {created?.pending ? (
           <div className="space-y-2">
@@ -182,6 +197,22 @@ export function RuleBuilderModal({
                 Rules
               </a>{" "}
               page.
+            </p>
+          </div>
+        ) : created?.endpoint_name && isAdmin ? (
+          <div className="space-y-2">
+            <p className="text-sm text-text">
+              Endpoint <code className="font-bold">{created.endpoint_name}</code> for{" "}
+              <code>{ev.host}</code> was written to <code>{created.file}</code> and loaded by the
+              gateway
+              {created.default_rules?.length || created.rule_name
+                ? `, with the rules ${[...(created.default_rules ?? []), created.rule_name].filter(Boolean).join(", ")}`
+                : ", with no rules"}
+              .
+            </p>
+            <p className="text-xs text-text-muted">
+              Next, add its credential on a device's Credentials panel: pick endpoint{" "}
+              <code>{created.endpoint_name}</code>.
             </p>
           </div>
         ) : created ? (
@@ -203,7 +234,7 @@ export function RuleBuilderModal({
             <fieldset className="space-y-2">
               <legend className={labelClass}>What should happen</legend>
               <div className="flex flex-wrap gap-2">
-                {VERDICTS.map((v) => (
+                {verdicts.map((v) => (
                   <label
                     key={v.value}
                     className={
@@ -338,14 +369,30 @@ export function RuleBuilderModal({
             {preview && (
               <div className={"space-y-2" + (fresh ? "" : " opacity-60")}>
                 <p className="text-xs text-text">
-                  Would have matched{" "}
-                  <span className="font-bold">
-                    {preview.recent_matches} of the last {preview.recent_sampled}
-                  </span>{" "}
-                  {isAdmin ? "requests" : "requests of your profile"} to this{" "}
-                  {preview.rule.new_endpoint ? "host" : "endpoint"}. Written to{" "}
-                  <code>{preview.file}</code>.
+                  {preview.rule.rule_name && (
+                    <>
+                      Would have matched{" "}
+                      <span className="font-bold">
+                        {preview.recent_matches} of the last {preview.recent_sampled}
+                      </span>{" "}
+                      {isAdmin ? "requests" : "requests of your profile"} to this{" "}
+                      {preview.rule.new_endpoint ? "host" : "endpoint"}.{" "}
+                    </>
+                  )}
+                  Written to <code>{preview.file}</code>.
                 </p>
+                {!!preview.rule.default_rules?.length && (
+                  <p className="text-xs text-text">
+                    With the default rules{" "}
+                    {preview.rule.default_rules.map((r, i) => (
+                      <span key={r}>
+                        {i > 0 && ", "}
+                        <code>{r}</code>
+                      </span>
+                    ))}{" "}
+                    from <code>defaults.new_endpoint_rule</code>.
+                  </p>
+                )}
                 {preview.rule.warnings?.map((w) => (
                   <div key={w} className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
                     {w}
@@ -395,7 +442,13 @@ export function RuleBuilderModal({
               Cancel
             </Button>
             <Button disabled={!fresh || !preview?.writes_enabled || busy} onClick={create}>
-              {busy ? "Sending…" : preview?.needs_review ? "Send for review" : "Create rule"}
+              {busy
+                ? "Sending…"
+                : preview?.needs_review
+                  ? "Send for review"
+                  : verdict === "none"
+                    ? "Add host"
+                    : "Create rule"}
             </Button>
           </>
         )}

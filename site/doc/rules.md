@@ -477,14 +477,27 @@ per endpoint to invert this.
 
 ### Rules for hosts added on the dashboard
 
-With `dashboard_config_writes` on, a device's Credentials panel can
-declare a new https endpoint, which by the rule above allows every
-request until someone writes rules for it. `new_endpoint_rule` blocks
-in `defaults` close that gap: the dashboard writes one rule per block
-in the same change as the endpoint, named `<endpoint>-<name>`, with
-`endpoint` set to the new endpoint and the block's body copied as
-written. They are ordinary rules afterwards, shown and edited like
-any other.
+With `dashboard_config_writes` on, an admin adds a host from a request
+to it that no endpoint claimed: "Add this host" in the rule dialog
+declares an https endpoint for it, with a passthrough credential that
+claims it in every profile the dashboard can change. By the rule above,
+that endpoint allows every request until someone writes rules for it.
+`new_endpoint_rule` blocks in `defaults` close that gap: the dashboard
+writes one rule per block in the same change as the endpoint, named
+`<endpoint>-<name>`, with `endpoint` set to the new endpoint and the
+block's body copied as written. They are ordinary rules afterwards,
+shown and edited like any other.
+
+The host's credential is added afterwards on a device's Credentials
+panel, which binds only existing endpoints. In each profile it is added
+to, it replaces the passthrough credential; removing it, or moving it to
+another endpoint, puts the passthrough credential back, so the host keeps
+its rules. A hand-written passthrough credential is never replaced. A
+profile declared in a file
+marked `# clawpatrol:dashboard-readonly` is never changed: the dashboard
+says so, and the endpoint or credential goes into that file by hand.
+A member's rule for a host with no endpoint claims it for their own
+profile only, and gets no default rules.
 
 ```hcl
 defaults {

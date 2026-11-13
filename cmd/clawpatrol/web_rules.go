@@ -232,12 +232,37 @@ func (w *webMux) scopedRuleFor(rw http.ResponseWriter, r *http.Request) (viewer,
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return viewer{}, nil, nil, false
 	}
-	rule, err := GenerateScopedRule(w.g.Policy(), ev, body.RuleRequest, v.author())
+	var newHost newHostConfig
+	if ev.Endpoint == "" {
+		if newHost, err = w.newHostConfig(); err != nil {
+			http.Error(rw, err.Error(), http.StatusInternalServerError)
+			return viewer{}, nil, nil, false
+		}
+	}
+	rule, err := generateScopedRule(w.g.Policy(), ev, body.RuleRequest, v.author(), newHost)
+	if err == nil && rule.NewEndpoint {
+		err = checkNewEndpointRuleNames(w.g.cfg.Load(), rule.EndpointName, rule.DefaultRules)
+	}
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return viewer{}, nil, nil, false
 	}
 	return v, ev, rule, true
+}
+
+func (w *webMux) newHostConfig() (newHostConfig, error) {
+	tree, err := loadConfigTree(w.g.cfgPath)
+	if err != nil {
+		return newHostConfig{}, err
+	}
+	c := newHostConfig{readOnlyProfiles: map[string]string{}, defaultRules: tree.newEndpointRules()}
+	files, blocks := tree.blocks("profile")
+	for i, blk := range blocks {
+		if len(blk.Labels()) == 1 && tree.readOnly(files[i]) {
+			c.readOnlyProfiles[blk.Labels()[0]] = files[i]
+		}
+	}
+	return c, nil
 }
 
 // apiRulePreview generates a rule from an action without writing it,
@@ -247,7 +272,11 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, "POST", http.StatusMethodNotAllowed)
 		return
 	}
+	// Under the config lock, so a new host's defaults and read-only
+	// profiles come from the files the loaded policy was read from.
+	w.g.configMu.Lock()
 	v, ev, rule, ok := w.scopedRuleFor(rw, r)
+	w.g.configMu.Unlock()
 	if !ok {
 		return
 	}
@@ -278,6 +307,9 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 // host with no endpoint), and for a member the same profile. One query
 // reads only what the replay needs.
 func (w *webMux) countRecentMatches(v viewer, ev *Event, rule *ScopedRule) (int, int, error) {
+	if rule.RuleName == "" {
+		return 0, 0, nil
+	}
 	replayRule := *rule
 	if rule.NewEndpoint {
 		// Recorded requests predate the generated credential.
@@ -362,8 +394,12 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	setAuditTarget(r, rule.RuleName)
-	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil && gw.Policy.Rules[rule.RuleName] != nil {
+	if rule.RuleName == "" {
+		setAuditTarget(r, rule.EndpointName)
+	} else {
+		setAuditTarget(r, rule.RuleName)
+	}
+	if gw := w.g.cfg.Load(); rule.RuleName != "" && gw != nil && gw.Policy != nil && gw.Policy.Rules[rule.RuleName] != nil {
 		http.Error(rw, "rule "+strconv.Quote(rule.RuleName)+" already exists", http.StatusConflict)
 		return
 	}
@@ -398,7 +434,11 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		}, map[string]any{"file": file})
 		return
 	}
-	w.writeRuleChanges(rw, changes, map[string]any{"ok": true, "rule_name": rule.RuleName, "file": file})
+	result := map[string]any{"ok": true, "rule_name": rule.RuleName, "file": file}
+	if rule.NewEndpoint {
+		result["endpoint_name"], result["default_rules"] = rule.EndpointName, rule.DefaultRules
+	}
+	w.writeRuleChanges(rw, changes, result)
 }
 
 func (w *webMux) writeRuleChanges(rw http.ResponseWriter, changes []configChange, ok map[string]any) {
