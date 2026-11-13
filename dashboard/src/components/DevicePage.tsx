@@ -276,8 +276,7 @@ export function DevicePage({
         />
       )}
 
-      {/* rules — per-device scope (with global rules layered in) */}
-      <RulesPanel deviceIP={a.ip} profile={a.profile} />
+      <RulesPanel profile={a.profile} />
 
       {pendingProfile && (
         <ConfirmProfileChange

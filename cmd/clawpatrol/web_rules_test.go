@@ -395,6 +395,9 @@ func TestRuleSummariesRespectTheProfilePin(t *testing.T) {
 		if strings.HasPrefix(s.Name, "alice-") && s.Profile != "team-a" {
 			t.Errorf("alice's team-a rule listed under profile %q", s.Profile)
 		}
+		if strings.HasPrefix(s.Name, "alice-") && s.File != "50-user-alice.hcl" {
+			t.Errorf("alice's rule listed in file %q", s.File)
+		}
 	}
 }
 

@@ -1,30 +1,105 @@
 import { useEffect, useMemo, useState } from "react";
-import { getRules, type RuleSummary } from "../lib/api";
+import {
+  deleteMyRule,
+  getMyRules,
+  getRules,
+  setMyRuleDisabled,
+  type MyRule,
+  type RuleChange,
+  type RuleSummary,
+} from "../lib/api";
+import { Button } from "./Button";
 import { Tag, type Tone } from "./Tag";
 
-// Rules panel. Profile-level rules only — device-specific overrides
-// are gone. Display-only — operators edit gateway.hcl out-of-band and
-// push via SSH. Device pages pass `profile` so the listing filters to
-// the device's profile.
-export function RulesPanel({ profile }: { deviceIP?: string; profile?: string }) {
+// RulesPanel lists the rules that apply, grouped by endpoint: all of
+// them, or those of one profile on a device page. The rules of the
+// viewer's own file (the dashboard's, for an admin) are disabled,
+// enabled or deleted here; the others name the file to change them in.
+export function RulesPanel({
+  profile,
+  onChanged,
+}: {
+  profile?: string;
+  // onChanged runs after a change, applied or sent for review.
+  onChanged?: () => void;
+}) {
   const [rows, setRows] = useState<RuleSummary[]>([]);
+  const [mine, setMine] = useState<Map<string, MyRule>>(new Map());
+  const [myFile, setMyFile] = useState("");
+  const [unavailable, setUnavailable] = useState("");
   const [err, setErr] = useState<string | null>(null);
+  const [info, setInfo] = useState("");
+
+  function refresh() {
+    return Promise.all([getRules(), getMyRules().catch(() => null)])
+      .then(([all, my]) => {
+        setRows(all ?? []);
+        setMine(new Map((my?.rules ?? []).map((r) => [r.name, r])));
+        setMyFile(my?.file ?? "");
+        setUnavailable(my?.unavailable ?? "");
+        setErr(null);
+      })
+      .catch((e) => setErr(String(e instanceof Error ? e.message : e)));
+  }
 
   useEffect(() => {
-    getRules()
-      .then((r) => setRows(r ?? []))
-      .catch((e) => setErr(String(e)));
+    refresh();
   }, []);
 
-  const visible = useMemo(
-    () => (profile ? rows.filter((r) => !r.profile || r.profile === profile) : rows),
-    [rows, profile],
-  );
+  async function change(r: MyRule, kind: RuleChange) {
+    let reason: string | undefined;
+    if (r.needs_review?.includes(kind)) {
+      const answer = window.prompt(
+        `An admin reviews this before it applies: ${kind} rule ${r.name}. Why do you need it? (optional)`,
+      );
+      if (answer === null) return;
+      reason = answer;
+    } else if (kind === "delete" && !window.confirm(`Delete rule ${r.name}?`)) {
+      return;
+    }
+    try {
+      const res =
+        kind === "delete"
+          ? await deleteMyRule(r.name, reason)
+          : await setMyRuleDisabled(r.name, kind === "disable", reason);
+      setInfo(
+        res.pending
+          ? `Sent to the admins: ${kind} ${r.name}. It applies once one approves it.`
+          : "",
+      );
+      onChanged?.();
+      await refresh();
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e));
+    }
+  }
+
+  // Without a profile, a rule shows once per endpoint, not once per
+  // profile that reaches it.
+  const visible = useMemo(() => {
+    if (profile) return rows.filter((r) => !r.profile || r.profile === profile);
+    const seen = new Set<string>();
+    return rows.filter((r) => {
+      const key = `${r.name} ${r.endpoint}`;
+      if (seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    });
+  }, [rows, profile]);
 
   return (
     <div className="bg-canvas border-1.5 border-navy">
       {err && <div className="px-4 py-3 text-xs text-rust-700">{err}</div>}
-      <Section title="Rules" rows={visible} />
+      {info && <div className="px-4 py-3 text-xs text-text">{info}</div>}
+      {unavailable && <div className="px-4 py-3 text-xs text-text-muted">{unavailable}</div>}
+      <Section
+        title="Rules"
+        rows={visible}
+        mine={mine}
+        myFile={myFile}
+        onChange={change}
+        allRulesLink={!!profile}
+      />
     </div>
   );
 }
@@ -32,11 +107,17 @@ export function RulesPanel({ profile }: { deviceIP?: string; profile?: string })
 function Section({
   title,
   rows,
-  emptyHint,
+  mine,
+  myFile,
+  onChange,
+  allRulesLink,
 }: {
   title: string;
   rows: RuleSummary[];
-  emptyHint?: string;
+  mine: Map<string, MyRule>;
+  myFile: string;
+  onChange: (r: MyRule, kind: RuleChange) => void;
+  allRulesLink: boolean;
 }) {
   // Group by endpoint. Server already sorts rules within an endpoint
   // by priority desc. Endpoint groups themselves sort alphabetically.
@@ -63,15 +144,24 @@ function Section({
         <span className="ml-2 text-2xs text-navy/70 tabular-nums">
           {rows.length} rule{rows.length === 1 ? "" : "s"}
         </span>
+        {allRulesLink && (
+          <a href="#/rules" className="ml-auto text-2xs text-navy underline">
+            All rules
+          </a>
+        )}
       </div>
-      {groups.length === 0 ? (
-        <div className="px-5 py-5 text-center text-xs text-text-subtle">
-          {emptyHint ?? "no rules configured"}
+      {myFile && (
+        <div className="px-4 py-2 text-2xs text-text-muted border-b border-canvas-muted">
+          Rules in <code>{myFile}</code> can be disabled or deleted here; the others change in the
+          file named next to them.
         </div>
+      )}
+      {groups.length === 0 ? (
+        <div className="px-5 py-5 text-center text-xs text-text-subtle">no rules configured</div>
       ) : (
         <div className="flex flex-col">
           {groups.map((g) => (
-            <EndpointGroup key={g.endpoint} group={g} />
+            <EndpointGroup key={g.endpoint} group={g} mine={mine} onChange={onChange} />
           ))}
         </div>
       )}
@@ -81,8 +171,12 @@ function Section({
 
 function EndpointGroup({
   group,
+  mine,
+  onChange,
 }: {
   group: { endpoint: string; family: string; rules: RuleSummary[] };
+  mine: Map<string, MyRule>;
+  onChange: (r: MyRule, kind: RuleChange) => void;
 }) {
   return (
     <div className="border-b border-canvas-muted last:border-b-0">
@@ -95,13 +189,21 @@ function EndpointGroup({
         </span>
       </div>
       {group.rules.map((r, i) => (
-        <RuleRow key={`${r.name}/${i}`} rule={r} />
+        <RuleRow key={`${r.name}/${i}`} rule={r} mine={mine.get(r.name)} onChange={onChange} />
       ))}
     </div>
   );
 }
 
-function RuleRow({ rule: r }: { rule: RuleSummary }) {
+function RuleRow({
+  rule: r,
+  mine,
+  onChange,
+}: {
+  rule: RuleSummary;
+  mine?: MyRule;
+  onChange: (r: MyRule, kind: RuleChange) => void;
+}) {
   return (
     <div
       className={
@@ -112,6 +214,7 @@ function RuleRow({ rule: r }: { rule: RuleSummary }) {
       <div className="flex-1 min-w-0">
         <div className="flex items-center gap-2 flex-wrap">
           <Verdict r={r} />
+          {r.disabled && <span className="text-2xs text-text-muted">(disabled)</span>}
           {r.reason && (
             <span className="text-xs text-text-muted truncate" title={r.reason}>
               {r.reason}
@@ -121,6 +224,11 @@ function RuleRow({ rule: r }: { rule: RuleSummary }) {
         <div className="text-xs text-text-muted mt-1 font-mono truncate" title={renderCondition(r)}>
           {renderCondition(r)}
         </div>
+        {mine && !mine.owned && (
+          <div className="text-2xs text-text-muted mt-0.5">
+            Its profile is no longer yours; an admin can change it.
+          </div>
+        )}
       </div>
       <div className="flex flex-col items-end gap-0.5 shrink-0">
         <span className="text-xs text-text-subtle truncate max-w-[10rem]" title={r.name}>
@@ -131,6 +239,28 @@ function RuleRow({ rule: r }: { rule: RuleSummary }) {
             p{(r.priority ?? 0) > 0 ? "+" : ""}
             {r.priority}
           </span>
+        )}
+        {mine ? (
+          <div className="flex gap-1 mt-1">
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!mine.owned}
+              onClick={() => onChange(mine, mine.disabled ? "enable" : "disable")}
+            >
+              {mine.disabled ? "Enable" : "Disable"}
+            </Button>
+            <Button
+              size="xs"
+              variant="outline"
+              disabled={!mine.owned}
+              onClick={() => onChange(mine, "delete")}
+            >
+              Delete
+            </Button>
+          </div>
+        ) : (
+          r.file && <span className="text-2xs text-text-subtle font-mono">in {r.file}</span>
         )}
       </div>
     </div>

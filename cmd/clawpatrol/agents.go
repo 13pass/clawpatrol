@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -1266,6 +1267,8 @@ type RuleSummary struct {
 	Verdict    string                `json:"verdict,omitempty"`
 	Reason     string                `json:"reason,omitempty"`
 	Approve    []config.ApproveStage `json:"approve,omitempty"`
+	// File is the config file declaring the rule.
+	File string `json:"file,omitempty"`
 }
 
 // apiRules returns every compiled rule across every profile, flattened
@@ -1273,9 +1276,8 @@ type RuleSummary struct {
 // emit one row per endpoint so the operator sees each attachment
 // site individually.
 //
-// Read-only. Dashboard edits go through the whole-file gateway.hcl
-// preview/save flow so operators review the formatted diff before the
-// typed-block validator persists changes.
+// Read-only: the rules of the viewer's own file change through
+// /api/my/rules, the others in their file.
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -1307,6 +1309,14 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 	if policy == nil {
 		return []RuleSummary{}
 	}
+	files := map[string]string{}
+	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil {
+		for name, ent := range gw.Policy.Rules {
+			if ent != nil && ent.Symbol != nil && ent.Symbol.Block != nil {
+				files[name] = filepath.Base(ent.Symbol.Block.DefRange.Filename)
+			}
+		}
+	}
 	var out []RuleSummary
 	for profileName, prof := range policy.Profiles {
 		if profileFilter != "" && profileName != profileFilter {
@@ -1331,6 +1341,7 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 					Verdict:    r.Outcome.Verdict,
 					Reason:     r.Outcome.Reason,
 					Approve:    r.Outcome.Approve,
+					File:       files[r.Name],
 				})
 			}
 		}

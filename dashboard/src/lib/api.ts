@@ -300,6 +300,7 @@ export type RuleSummary = {
   // dispatched against. Empty when the rule doesn't filter on
   // credential.
   credential?: string;
+  file?: string;
 };
 
 export async function getRules(): Promise<RuleSummary[]> {
