@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
@@ -501,13 +502,9 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 	}
 	out := []myRule{}
 	if gw := w.g.cfg.Load(); gw != nil && gw.Policy != nil {
-		for name, ent := range gw.Policy.Rules {
-			if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil ||
-				filepath.Clean(ent.Symbol.Block.DefRange.Filename) != filepath.Clean(path) {
-				continue
-			}
-			body, ok := ent.Body.(*rules.Rule)
-			if !ok {
+		for name := range gw.Policy.Rules {
+			body, file := declaredRule(gw, name)
+			if body == nil || filepath.Clean(file) != filepath.Clean(path) {
 				continue
 			}
 			rule := myRule{
@@ -651,13 +648,23 @@ func (w *webMux) decidesPending(v viewer, p runtime.HITLPending) bool {
 	if path == "" || gw == nil || gw.Policy == nil {
 		return false
 	}
-	ent := gw.Policy.Rules[p.Rule]
-	if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil ||
-		filepath.Clean(ent.Symbol.Block.DefRange.Filename) != filepath.Clean(path) {
-		return false
+	body, file := declaredRule(gw, p.Rule)
+	return body != nil && filepath.Clean(file) == filepath.Clean(path) && v.ownsRule(body)
+}
+
+func declaredRule(gw *config.Gateway, name string) (*rules.Rule, string) {
+	if gw == nil || gw.Policy == nil {
+		return nil, ""
+	}
+	ent := gw.Policy.Rules[name]
+	if ent == nil || ent.Symbol == nil || ent.Symbol.Block == nil {
+		return nil, ""
 	}
 	body, ok := ent.Body.(*rules.Rule)
-	return ok && v.ownsRule(body)
+	if !ok {
+		return nil, ""
+	}
+	return body, ent.Symbol.Block.DefRange.Filename
 }
 
 // memberRulesPath is the rules file of username in a directory config,

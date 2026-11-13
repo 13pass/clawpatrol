@@ -168,6 +168,7 @@ export default function App() {
           integrations={integrations}
           configFile={configFile}
           canEditCredentials={!isMember && configWrites}
+          isMember={isMember}
           onBack={() => navigate("")}
           onConnect={(id) => setConnectId(id)}
           onRefresh={refresh}

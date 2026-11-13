@@ -398,6 +398,77 @@ func TestRuleSummariesRespectTheProfilePin(t *testing.T) {
 	}
 }
 
+func rulesAs(t *testing.T, env *rulesTestEnv, c *http.Cookie) []RuleSummary {
+	t.Helper()
+	rw := serveAs(t, env.h, c, http.MethodGet, "/api/rules", "")
+	var out []RuleSummary
+	if rw.Code != http.StatusOK || json.Unmarshal(rw.Body.Bytes(), &out) != nil {
+		t.Fatalf("/api/rules = %d %s", rw.Code, rw.Body.String())
+	}
+	return out
+}
+
+func TestRulesListMarksTheViewersOwnRules(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.bobNotes+`","verdict":"deny","scope":"any_method"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	var alices, admins int
+	for _, s := range rulesAs(t, env, env.alice) {
+		switch {
+		case strings.HasPrefix(s.Name, "alice-"):
+			alices++
+			if !s.Mine || !s.Owned || s.File != "50-user-alice.hcl" || s.PinnedProfile != "team-a" || s.NeedsReview == nil {
+				t.Errorf("alice's own rule = %+v", s)
+			}
+		case s.File != "" || s.Mine:
+			t.Errorf("alice sees the file of a rule that is not hers: %+v", s)
+		}
+	}
+	for _, s := range rulesAs(t, env, env.root) {
+		if s.File == dashboardConfigFile {
+			admins++
+			if !s.Mine || !s.Owned {
+				t.Errorf("the admin's own rule = %+v", s)
+			}
+		}
+		if strings.HasPrefix(s.Name, "alice-") && (s.Mine || s.File != "50-user-alice.hcl") {
+			t.Errorf("the admin's view of alice's rule = %+v", s)
+		}
+	}
+	if alices == 0 || admins == 0 {
+		t.Fatalf("listed %d of alice's rules and %d of the admin's, want both", alices, admins)
+	}
+}
+
+func TestRulesListKeepsOwnRulesNoProfileReaches(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceNotes+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatal(rw.Body.String())
+	}
+	if err := setDashboardUserProfiles(env.w.g.db, "alice", []string{"team-b"}); err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, s := range rulesAs(t, env, env.alice) {
+		if strings.HasPrefix(s.Name, "alice-") {
+			found = true
+			if !s.Mine || s.Owned {
+				t.Errorf("a rule pinned to a profile alice lost = %+v, want mine and not owned", s)
+			}
+		}
+	}
+	if !found {
+		t.Error("alice's rule for a profile she no longer owns is not listed")
+	}
+}
+
 func TestMemberHandWrittenConditionGoesToReview(t *testing.T) {
 	env := newRulesTestEnv(t, true)
 	req := `{"action_id":"` + env.aliceNotes + `","verdict":"deny","condition":"http.path.startsWith('/api/v4/')"}`

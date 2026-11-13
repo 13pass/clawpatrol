@@ -300,6 +300,13 @@ export type RuleSummary = {
   // dispatched against. Empty when the rule doesn't filter on
   // credential.
   credential?: string;
+  // file is only set for a member's own rules.
+  file?: string;
+  pinned_profile?: string;
+  // owned is false for a member's rule pinned to a profile they lost.
+  mine?: boolean;
+  owned?: boolean;
+  needs_review?: RuleChange[];
 };
 
 export async function getRules(): Promise<RuleSummary[]> {
