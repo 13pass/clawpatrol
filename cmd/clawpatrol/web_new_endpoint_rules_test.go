@@ -39,55 +39,6 @@ func setNewEndpointRules(t *testing.T, w *webMux, src string) error {
 	return w.g.reloadConfigFromFileLocked(w.g.cfgPath)
 }
 
-func TestCredentialDeclareNewHostGetsDefaultRules(t *testing.T) {
-	w := configDirTestMux(t)
-	if err := setNewEndpointRules(t, w, testNewEndpointRules); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
-	}
-	if raw := readCfgFile(t, w, dashboardConfigFile); !regexp.MustCompile(`endpoint +=  *https\.forge\n  condition`).MatchString(raw) {
-		t.Errorf("the copied rule body does not follow the endpoint line:\n%s", raw)
-	}
-	dash := strings.Join(strings.Fields(readCfgFile(t, w, dashboardConfigFile)), " ")
-	for _, want := range []string{
-		`rule "forge-no-delete" { endpoint = https.forge condition = "http.method == 'DELETE'" verdict = "deny"`,
-		`rule "forge-writes" { endpoint = https.forge # reads stay unmatched, so they are allowed`,
-		"approve = [human_approver.ops]",
-	} {
-		if !strings.Contains(dash, want) {
-			t.Errorf("%s = %q, want %q", dashboardConfigFile, dash, want)
-		}
-	}
-	rules := w.g.cfg.Load().Policy.Rules
-	for _, name := range []string{"forge-no-delete", "forge-writes"} {
-		if rules[name] == nil {
-			t.Errorf("the gateway did not reload with rule %s", name)
-		}
-	}
-}
-
-func TestCredentialEditNewHostGetsDefaultRules(t *testing.T) {
-	w := configDirTestMux(t)
-	if err := setNewEndpointRules(t, w, testNewEndpointRules); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialEdit, map[string]any{
-		"name": "tok", "new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
-	}
-	if w.g.cfg.Load().Policy.Rules["forge-no-delete"] == nil {
-		t.Error("an endpoint added by an edit has no default rules")
-	}
-}
-
 func TestCredentialDeclareExistingEndpointAddsNoRules(t *testing.T) {
 	w := configDirTestMux(t)
 	addGitlabEndpoint(t, w)
@@ -102,30 +53,6 @@ func TestCredentialDeclareExistingEndpointAddsNoRules(t *testing.T) {
 	}
 	if dash := readCfgFile(t, w, dashboardConfigFile); strings.Contains(dash, "rule ") {
 		t.Errorf("%s = %q, want no rule for an endpoint that already exists", dashboardConfigFile, dash)
-	}
-}
-
-func TestCredentialDeclareRefusesTakenDefaultRuleName(t *testing.T) {
-	w := configDirTestMux(t)
-	taken := testNewEndpointRules + `
-rule "forge-no-delete" {
-  endpoint  = https.github
-  condition = "http.method == 'DELETE'"
-  verdict   = "deny"
-}
-`
-	if err := setNewEndpointRules(t, w, taken); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
-	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), `"forge-no-delete"`) {
-		t.Fatalf("status=%d body=%s, want 400 naming the rule", rw.Code, rw.Body.String())
-	}
-	if _, err := os.Stat(filepath.Join(w.g.cfgPath, dashboardConfigFile)); !os.IsNotExist(err) {
-		t.Errorf("%s written for a refused request", dashboardConfigFile)
 	}
 }
 
@@ -189,41 +116,6 @@ profile "default" { credentials = [] }
 	}
 }
 
-func TestCredentialOptionsListsNewEndpointRules(t *testing.T) {
-	w := configDirTestMux(t)
-	if err := setNewEndpointRules(t, w, testNewEndpointRules); err != nil {
-		t.Fatal(err)
-	}
-	rw := httptest.NewRecorder()
-	w.apiCredentialOptions(rw, httptest.NewRequest(http.MethodGet, "/api/credentials/options", nil))
-	var got struct {
-		NewEndpointRules []string `json:"new_endpoint_rules"`
-	}
-	if err := json.Unmarshal(rw.Body.Bytes(), &got); err != nil {
-		t.Fatal(err)
-	}
-	if !slices.Equal(got.NewEndpointRules, []string{"-no-delete", "-writes"}) {
-		t.Errorf("new_endpoint_rules = %q", got.NewEndpointRules)
-	}
-}
-
-func TestOneLineNewEndpointRule(t *testing.T) {
-	w := configDirTestMux(t)
-	if err := setNewEndpointRules(t, w, "defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n"); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
-	}
-	if w.g.cfg.Load().Policy.Rules["forge-deny"] == nil {
-		t.Error("the rule from a one-line block did not load")
-	}
-}
-
 func TestNewEndpointRulesCheckedBeforeAWrite(t *testing.T) {
 	w := configDirTestMux(t)
 	bad := "defaults {\n  new_endpoint_rule \"bad\" {\n    condition = \"http.nope == 'x'\"\n    verdict = \"deny\"\n  }\n}\n"
@@ -279,23 +171,6 @@ func TestInvalidNewEndpointRuleLabelFailsTheLoad(t *testing.T) {
 	}
 }
 
-func TestRuleCopiedFromABlockEndingInACommentHasNoBlankLine(t *testing.T) {
-	w := configDirTestMux(t)
-	if err := setNewEndpointRules(t, w, "defaults {\n  new_endpoint_rule \"deny\" {\n    verdict = \"deny\" # why\n  }\n}\n"); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
-	}
-	if got := readCfgFile(t, w, dashboardConfigFile); strings.Contains(got, "# why\n\n") {
-		t.Errorf("a blank line follows the copied comment:\n%s", got)
-	}
-}
-
 func TestNewEndpointRulesCheckedOnceForASingleFileWrite(t *testing.T) {
 	dir := t.TempDir()
 	src := []byte("defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n")
@@ -338,39 +213,258 @@ profile "default" { credentials = [] }
 	}
 }
 
-func TestDeclareNewHostLeavesTheDefaultsBlockAsWritten(t *testing.T) {
-	w := configDirTestMux(t)
-	// In the file the form writes to, so formatting that file would
-	// reach the defaults block.
-	if err := os.WriteFile(filepath.Join(w.g.cfgPath, dashboardConfigFile), []byte(testNewEndpointRules), 0o640); err != nil {
+type addedHost struct {
+	RuleName     string   `json:"rule_name"`
+	EndpointName string   `json:"endpoint_name"`
+	DefaultRules []string `json:"default_rules"`
+}
+
+// addHostAsAdmin creates a rule from env.aliceHost, a request to
+// example.org that no endpoint claimed.
+func addHostAsAdmin(t *testing.T, env *rulesTestEnv, fields string) (*httptest.ResponseRecorder, addedHost) {
+	t.Helper()
+	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create", `{"action_id":"`+env.aliceHost+`",`+fields+`}`)
+	var out addedHost
+	if rw.Code == http.StatusOK {
+		if err := json.Unmarshal(rw.Body.Bytes(), &out); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return rw, out
+}
+
+func TestAdminAddsAHostWithTheDefaultRules(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if err := setNewEndpointRules(t, env.w, testNewEndpointRules); err != nil {
 		t.Fatal(err)
 	}
-	if err := w.g.reloadConfigFromFileLocked(w.g.cfgPath); err != nil {
-		t.Fatal(err)
-	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
+	rw, added := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
 	if rw.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
 	}
-	if got := readCfgFile(t, w, dashboardConfigFile); !strings.HasPrefix(got, testNewEndpointRules) {
+	ep := added.EndpointName
+	if added.RuleName != "" || !slices.Equal(added.DefaultRules, []string{ep + "-no-delete", ep + "-writes"}) {
+		t.Fatalf("added = %+v", added)
+	}
+	raw := readCfgFile(t, env.w, dashboardConfigFile)
+	if !regexp.MustCompile(`endpoint +=  *https\.` + ep + `\n  condition`).MatchString(raw) {
+		t.Errorf("the copied rule body does not follow the endpoint line:\n%s", raw)
+	}
+	dash := strings.Join(strings.Fields(raw), " ")
+	for _, want := range []string{
+		`hosts = ["example.org"]`,
+		`credential "passthrough" "` + ep + `_passthrough"`,
+		`rule "` + ep + `-no-delete" { endpoint = https.` + ep + ` condition = "http.method == 'DELETE'" verdict = "deny"`,
+		`rule "` + ep + `-writes" { endpoint = https.` + ep + ` # reads stay unmatched, so they are allowed`,
+	} {
+		if !strings.Contains(dash, want) {
+			t.Errorf("%s = %q, want %q", dashboardConfigFile, dash, want)
+		}
+	}
+	if profiles := readCfgFile(t, env.w, "20-profiles.hcl"); strings.Count(profiles, "passthrough."+ep+"_passthrough") != 2 {
+		t.Errorf("both profiles should claim the endpoint:\n%s", profiles)
+	}
+	for _, name := range added.DefaultRules {
+		if env.w.g.cfg.Load().Policy.Rules[name] == nil {
+			t.Errorf("the gateway did not reload with rule %s", name)
+		}
+	}
+}
+
+func TestAdminHostRuleComesWithTheDefaultRules(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if err := setNewEndpointRules(t, env.w, testNewEndpointRules); err != nil {
+		t.Fatal(err)
+	}
+	rw, added := addHostAsAdmin(t, env, `"verdict":"deny","scope":"exact"`)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	rules := env.w.g.cfg.Load().Policy.Rules
+	for _, name := range append([]string{added.RuleName}, added.DefaultRules...) {
+		if name == "" || rules[name] == nil {
+			t.Errorf("rule %q did not load (added %+v)", name, added)
+		}
+	}
+}
+
+func TestMemberHostGetsNoDefaultRules(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if err := setNewEndpointRules(t, env.w, testNewEndpointRules); err != nil {
+		t.Fatal(err)
+	}
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceHost+`","verdict":"none"}`); rw.Code != http.StatusBadRequest {
+		t.Errorf("a member adding a host without a rule = %d, want 400", rw.Code)
+	}
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceHost+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatalf("member deny = %d %s", rw.Code, rw.Body.String())
+	}
+	for name := range env.w.g.cfg.Load().Policy.Rules {
+		if strings.HasSuffix(name, "-no-delete") || strings.HasSuffix(name, "-writes") {
+			t.Errorf("a member's host got the default rule %s", name)
+		}
+	}
+}
+
+func TestAddHostRefusesTakenDefaultRuleName(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	taken := testNewEndpointRules + `
+rule "example_org-no-delete" {
+  endpoint  = https.gitlab
+  condition = "http.method == 'DELETE'"
+  verdict   = "deny"
+}
+`
+	if err := setNewEndpointRules(t, env.w, taken); err != nil {
+		t.Fatal(err)
+	}
+	rw, _ := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
+	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), `"example_org-no-delete"`) {
+		t.Fatalf("status=%d body=%s, want 400 naming the rule", rw.Code, rw.Body.String())
+	}
+	if _, err := os.Stat(filepath.Join(env.w.g.cfgPath, dashboardConfigFile)); !os.IsNotExist(err) {
+		t.Errorf("%s written for a refused request", dashboardConfigFile)
+	}
+}
+
+func TestOneLineNewEndpointRule(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if err := setNewEndpointRules(t, env.w, "defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	rw, added := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if env.w.g.cfg.Load().Policy.Rules[added.EndpointName+"-deny"] == nil {
+		t.Error("the rule from a one-line block did not load")
+	}
+}
+
+func TestRuleCopiedFromABlockEndingInACommentHasNoBlankLine(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if err := setNewEndpointRules(t, env.w, "defaults {\n  new_endpoint_rule \"deny\" {\n    verdict = \"deny\" # why\n  }\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	if rw, _ := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`); rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, env.w, dashboardConfigFile); strings.Contains(got, "# why\n\n") {
+		t.Errorf("a blank line follows the copied comment:\n%s", got)
+	}
+}
+
+func TestAddHostLeavesTheDefaultsBlockAsWritten(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	// In the file the host is added to, so formatting that file would
+	// reach the defaults block.
+	if err := os.WriteFile(filepath.Join(env.w.g.cfgPath, dashboardConfigFile), []byte(testNewEndpointRules), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	if rw, _ := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`); rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, env.w, dashboardConfigFile); !strings.HasPrefix(got, testNewEndpointRules) {
 		t.Errorf("the defaults block was rewritten:\n%s", got)
 	}
 }
 
-func TestDeclareWithDuplicateLabelIsABadRequest(t *testing.T) {
-	w := configDirTestMux(t)
+func TestAddHostWithDuplicateLabelIsABadRequest(t *testing.T) {
+	env := newRulesTestEnv(t, true)
 	dup := "defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n"
-	if err := setNewEndpointRules(t, w, dup); err == nil {
+	if err := setNewEndpointRules(t, env.w, dup); err == nil {
 		t.Fatal("a duplicated label loaded")
 	}
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
-	})
+	rw, _ := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
 	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "more than once") {
 		t.Fatalf("status=%d body=%s, want 400 naming the duplicated label", rw.Code, rw.Body.String())
+	}
+}
+
+func TestAddHostSkipsReadOnlyProfiles(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	ops := "# " + readOnlyConfigMarker + "\nprofile \"ops\" { credentials = [bearer_token.gl] }\n"
+	if err := os.WriteFile(filepath.Join(env.w.g.cfgPath, "25-ops.hcl"), []byte(ops), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/preview", `{"action_id":"`+env.aliceHost+`","verdict":"none"}`)
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), "Profile ops is declared in 25-ops.hcl") {
+		t.Fatalf("preview = %d %s, want a warning about profile ops", rw.Code, rw.Body.String())
+	}
+	if rw, _ := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`); rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, env.w, "25-ops.hcl"); got != ops {
+		t.Errorf("25-ops.hcl changed:\n%s", got)
+	}
+	if !strings.Contains(readCfgFile(t, env.w, "20-profiles.hcl"), "passthrough.") {
+		t.Error("the writable profiles did not get the endpoint")
+	}
+}
+
+func TestMemberHostRefusedForAReadOnlyProfile(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	markConfigFileReadOnly(t, env.w, "20-profiles.hcl")
+	if err := env.w.g.reloadConfigFromFileLocked(env.w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create", `{"action_id":"`+env.aliceHost+`","verdict":"deny"}`)
+	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "declared in 20-profiles.hcl") {
+		t.Fatalf("status=%d body=%s, want 400 naming the read-only file", rw.Code, rw.Body.String())
+	}
+}
+
+func TestCredentialReplacesTheHostsPassthrough(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	_, added := addHostAsAdmin(t, env, `"verdict":"none","scope":"exact"`)
+	if added.EndpointName == "" {
+		t.Fatal("the host was not added")
+	}
+	rw := credentialConfigCall(t, env.w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "ex-tok", "endpoint": added.EndpointName, "profiles": []string{"team-a"},
+	})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	profiles := readCfgFile(t, env.w, "20-profiles.hcl")
+	teamA := profiles[:strings.Index(profiles, `profile "team-b"`)]
+	teamB := profiles[strings.Index(profiles, `profile "team-b"`):]
+	if !strings.Contains(teamA, "bearer_token.ex-tok") || strings.Contains(teamA, "passthrough.") {
+		t.Errorf("team-a should list ex-tok in place of the passthrough:\n%s", profiles)
+	}
+	if !strings.Contains(teamB, "passthrough.") {
+		t.Errorf("team-b lost the passthrough it still needs:\n%s", profiles)
+	}
+}
+
+func TestCredentialSwapRefusedWhenARulePinsThePassthrough(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create",
+		`{"action_id":"`+env.aliceHost+`","verdict":"deny"}`); rw.Code != http.StatusOK {
+		t.Fatalf("member deny = %d %s", rw.Code, rw.Body.String())
+	}
+	var endpoint string
+	for name := range env.w.g.cfg.Load().Policy.Endpoints {
+		if strings.HasPrefix(name, "alice-") {
+			endpoint = name
+		}
+	}
+	before := readCfgFile(t, env.w, "20-profiles.hcl")
+	rw := credentialConfigCall(t, env.w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "ex-tok", "endpoint": endpoint, "profiles": []string{"team-a"},
+	})
+	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "would stop matching") {
+		t.Fatalf("status=%d body=%s, want 400 naming the pinned rule", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, env.w, "20-profiles.hcl"); got != before {
+		t.Errorf("20-profiles.hcl changed:\n%s", got)
 	}
 }

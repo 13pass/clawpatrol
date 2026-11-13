@@ -75,26 +75,6 @@ func TestCredentialDeclareWritesDashboardFileAndProfile(t *testing.T) {
 	}
 }
 
-func TestCredentialDeclareWithNewHost(t *testing.T) {
-	w := configDirTestMux(t)
-	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "https://Git.Example.org/api/v1"},
-		"profiles":     []string{},
-	})
-	if rw.Code != http.StatusOK {
-		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
-	}
-	dash := strings.Join(strings.Fields(readCfgFile(t, w, dashboardConfigFile)), " ")
-	if !strings.Contains(dash, `endpoint "https" "forge"`) || !strings.Contains(dash, `hosts = ["git.example.org"]`) ||
-		!strings.Contains(dash, "endpoint = https.forge") {
-		t.Fatalf("%s = %q", dashboardConfigFile, dash)
-	}
-	if got := readCfgFile(t, w, configDirProfilesFile); strings.Contains(got, "forge-tok") {
-		t.Errorf("profile lists forge-tok although none was picked: %q", got)
-	}
-}
-
 func TestCredentialDeclareRejectsBadRequests(t *testing.T) {
 	cases := map[string]map[string]any{
 		"unknown type":     {"type": "aws", "name": "x", "endpoint": "github"},
@@ -103,10 +83,8 @@ func TestCredentialDeclareRejectsBadRequests(t *testing.T) {
 		"missing header":   {"type": "header_token", "name": "x", "endpoint": "github"},
 		"bad header":       {"type": "header_token", "name": "x", "header": "Bad Header", "endpoint": "github"},
 		"no endpoint":      {"type": "bearer_token", "name": "x"},
+		"new host":         {"type": "bearer_token", "name": "x", "new_endpoint": map[string]string{"name": "e", "host": "a.example"}},
 		"unknown endpoint": {"type": "bearer_token", "name": "x", "endpoint": "nope"},
-		"taken endpoint":   {"type": "bearer_token", "name": "x", "new_endpoint": map[string]string{"name": "github", "host": "a.example"}},
-		"port":             {"type": "bearer_token", "name": "x", "new_endpoint": map[string]string{"name": "e", "host": "https://a.example:8443"}},
-		"http url":         {"type": "bearer_token", "name": "x", "new_endpoint": map[string]string{"name": "e", "host": "http://a.example"}},
 		"unknown profile":  {"type": "bearer_token", "name": "x", "endpoint": "github", "profiles": []string{"ghost"}},
 	}
 	for name, body := range cases {
@@ -157,9 +135,8 @@ func TestCredentialEditProfilesOfReadOnlyCredential(t *testing.T) {
 	if got := readCfgFile(t, w, configDirProfilesFile); strings.Contains(got, "bearer_token.tok") {
 		t.Errorf("%s = %q, want tok dropped", configDirProfilesFile, got)
 	}
-	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{
-		"name": "tok", "new_endpoint": map[string]string{"name": "gh2", "host": "gh2.example"}, "profiles": []string{},
-	})
+	addGitlabEndpoint(t, w)
+	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "tok", "endpoint": "gitlab", "profiles": []string{}})
 	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), "read-only") {
 		t.Fatalf("endpoint change: status=%d body=%s, want a read-only 400", rw.Code, rw.Body.String())
 	}
@@ -183,10 +160,9 @@ credential "bearer_token" "tok" {
 	if err := os.WriteFile(path, []byte(src), 0o640); err != nil {
 		t.Fatal(err)
 	}
+	addGitlabEndpoint(t, w)
 	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
-		"type": "bearer_token", "name": "forge-tok",
-		"new_endpoint": map[string]string{"name": "forge", "host": "forge.example"},
-		"profiles":     []string{"default"},
+		"type": "bearer_token", "name": "forge-tok", "endpoint": "gitlab", "profiles": []string{"default"},
 	})
 	if rw.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
@@ -203,8 +179,9 @@ func TestCredentialDeclareRefusesReadOnlyProfileFile(t *testing.T) {
 	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
 		"type": "bearer_token", "name": "x", "endpoint": "github", "profiles": []string{"default"},
 	})
-	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), configDirProfilesFile) {
-		t.Fatalf("status=%d body=%s, want a 400 naming %s", rw.Code, rw.Body.String(), configDirProfilesFile)
+	if rw.Code != http.StatusBadRequest || !strings.Contains(rw.Body.String(), configDirProfilesFile) ||
+		!strings.Contains(rw.Body.String(), "add bearer_token.x to its credentials list in that file") {
+		t.Fatalf("status=%d body=%s, want a 400 naming %s and the edit to make there", rw.Code, rw.Body.String(), configDirProfilesFile)
 	}
 	if got := readCfgFile(t, w, configDirProfilesFile); got != before {
 		t.Errorf("%s changed: %q", configDirProfilesFile, got)
@@ -440,15 +417,6 @@ func TestCredentialEditSettingsClearsVerification(t *testing.T) {
 	}
 }
 
-func TestCredentialDeclareAcceptsDefaultPort(t *testing.T) {
-	if host, err := endpointHost("https://Git.Example.org:443/group"); err != nil || host != "git.example.org" {
-		t.Errorf("endpointHost(:443) = %q, %v", host, err)
-	}
-	if _, err := endpointHost("https://git.example.org:8443"); err == nil {
-		t.Error("endpointHost accepted port 8443")
-	}
-}
-
 func TestCredentialProfilesSkipUnreadableList(t *testing.T) {
 	dir := t.TempDir()
 	src := `profile "odd" { credentials = some_list }
@@ -461,13 +429,13 @@ profile "ok" { credentials = [bearer_token.tok] }
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := tree.setCredentialProfiles("bearer_token", "tok", nil); err != nil {
+	if _, err := tree.setCredentialProfiles("bearer_token", "tok", nil, nil); err != nil {
 		t.Fatalf("removing from every profile: %v", err)
 	}
 	if got := string(tree.changes("", "")[0].Content); !strings.Contains(got, "credentials = some_list") || strings.Contains(got, "bearer_token.tok") {
 		t.Errorf("profiles = %q, want odd untouched and tok gone from ok", got)
 	}
-	if err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
+	if _, err := tree.setCredentialProfiles("bearer_token", "tok", []string{"odd"}, nil); err == nil || !strings.Contains(err.Error(), `profile "odd"`) {
 		t.Errorf("adding to the unreadable list: err = %v, want it refused", err)
 	}
 }
@@ -490,9 +458,14 @@ func TestCredentialEditEndpointClearsSecretHeaderKeepsIt(t *testing.T) {
 	if _, found, _ := readCredentialSecrets(w.g.db, "gh-pat"); !found {
 		t.Error("a header edit on the same endpoint dropped the secret")
 	}
-	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{
-		"name": "gh-pat", "new_endpoint": map[string]string{"name": "forge", "host": "forge.example"},
-	})
+	forge := `endpoint "https" "forge" { hosts = ["forge.example"] }` + "\n"
+	if err := os.WriteFile(filepath.Join(w.g.cfgPath, "16-forge.hcl"), []byte(forge), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	if err := w.g.reloadConfigFromFileLocked(w.g.cfgPath); err != nil {
+		t.Fatal(err)
+	}
+	rw = credentialConfigCall(t, w.apiCredentialEdit, map[string]any{"name": "gh-pat", "endpoint": "forge"})
 	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"secret_cleared":true`) {
 		t.Fatalf("endpoint edit: status=%d body=%s", rw.Code, rw.Body.String())
 	}

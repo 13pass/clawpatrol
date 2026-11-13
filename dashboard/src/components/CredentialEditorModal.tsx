@@ -20,22 +20,6 @@ const INPUT_CLASS =
   "border border-canvas-dark rounded px-2 py-1.5 text-xs focus:outline-none focus:border-text";
 const LABEL_CLASS = "font-mono text-xs uppercase tracking-wider text-text-muted";
 
-// NEW_ENDPOINT is the endpoint picker's "declare a new host" choice.
-const NEW_ENDPOINT = "__new__";
-
-// endpointNameFromHost suggests an endpoint name: the host's first
-// label that is not "www", "api" or "*".
-function endpointNameFromHost(raw: string): string {
-  const host = raw
-    .trim()
-    .replace(/^[a-z]+:\/\//i, "")
-    .split(/[/:]/)[0]
-    .toLowerCase();
-  const label = host.split(".").find((l) => l && !["www", "api", "*"].includes(l)) ?? "";
-  const name = label.replace(/[^a-z0-9_-]/g, "-");
-  return /^[a-z]/.test(name) ? name : "";
-}
-
 export function CredentialEditorModal({
   name,
   defaultProfile,
@@ -61,9 +45,6 @@ export function CredentialEditorModal({
   const [header, setHeader] = useState("");
   const [prefix, setPrefix] = useState("");
   const [endpoint, setEndpoint] = useState("");
-  const [newHost, setNewHost] = useState("");
-  const [newEndpointName, setNewEndpointName] = useState("");
-  const [endpointNameTouched, setEndpointNameTouched] = useState(false);
   const [profiles, setProfiles] = useState<string[]>([]);
   // The profiles listing the credential when the form opened: an edit
   // sends profiles only when they differ, so it never undoes another
@@ -106,7 +87,6 @@ export function CredentialEditorModal({
     () => (opts?.endpoints ?? []).filter((e) => typeOpt?.families.includes(e.family)),
     [opts, typeOpt],
   );
-  const canAddHost = typeOpt?.families.includes("http") ?? false;
   // Remove also edits every profile listing the credential, so a
   // read-only one among them blocks it.
   const lockedProfiles = (opts?.profiles ?? []).filter(
@@ -128,9 +108,7 @@ export function CredentialEditorModal({
       if (hasHeader && (!editing || header !== (current?.header ?? "")))
         change.header = header.trim();
       if (hasHeader && (!editing || prefix !== (current?.prefix ?? ""))) change.prefix = prefix;
-      if (endpoint === NEW_ENDPOINT) {
-        change.new_endpoint = { name: newEndpointName.trim(), host: newHost.trim() };
-      } else if (endpoint && (!editing || endpoint !== (current?.endpoint ?? ""))) {
+      if (endpoint && (!editing || endpoint !== (current?.endpoint ?? ""))) {
         change.endpoint = endpoint;
       }
     }
@@ -305,8 +283,11 @@ export function CredentialEditorModal({
                   {e.hosts ? ` — ${e.hosts.replace(/[[\]"]/g, "")}` : ""}
                 </option>
               ))}
-              {canAddHost && <option value={NEW_ENDPOINT}>New host…</option>}
             </select>
+            <span className="text-2xs text-text-subtle">
+              A host with no endpoint is added from the log: open a request to it and create a rule
+              from it.
+            </span>
             {editing && endpoint && endpoint !== (current?.endpoint ?? "") && (
               <span className="text-2xs text-text-subtle">
                 Moving it to another endpoint clears its stored secret, so the old token never
@@ -314,57 +295,6 @@ export function CredentialEditorModal({
               </span>
             )}
           </label>
-        )}
-
-        {endpoint === NEW_ENDPOINT && (
-          <div className="flex flex-col gap-1">
-            <div className="grid grid-cols-[minmax(0,2fr),minmax(0,1fr)] gap-3">
-              <label className="flex flex-col gap-1">
-                <span className={LABEL_CLASS}>Host or URL</span>
-                <input
-                  value={newHost}
-                  onChange={(e) => {
-                    setNewHost(e.target.value);
-                    if (!endpointNameTouched)
-                      setNewEndpointName(endpointNameFromHost(e.target.value));
-                  }}
-                  placeholder="https://git.example.org"
-                  className={INPUT_CLASS + " font-mono"}
-                />
-              </label>
-              <label className="flex flex-col gap-1">
-                <span className={LABEL_CLASS}>Endpoint name</span>
-                <input
-                  value={newEndpointName}
-                  onChange={(e) => {
-                    setEndpointNameTouched(true);
-                    setNewEndpointName(e.target.value);
-                  }}
-                  className={INPUT_CLASS + " font-mono"}
-                />
-              </label>
-            </div>
-            <span className="text-2xs text-text-subtle">
-              Declares an https endpoint for this host in{" "}
-              <span className="font-mono">{opts.file}</span>
-              {opts.new_endpoint_rules.length > 0 ? (
-                <>
-                  , with the rules{" "}
-                  {opts.new_endpoint_rules.map((r, i) => (
-                    <span key={r}>
-                      {i > 0 && ", "}
-                      <span className="font-mono">
-                        {(newEndpointName.trim() || "<endpoint>") + r}
-                      </span>
-                    </span>
-                  ))}{" "}
-                  from <span className="font-mono">defaults.new_endpoint_rule</span>.
-                </>
-              ) : (
-                <>. It has no rules, so every request to it is allowed until you add some.</>
-              )}
-            </span>
-          </div>
         )}
 
         <fieldset className="flex flex-col gap-1">
@@ -393,8 +323,15 @@ export function CredentialEditorModal({
             </label>
           ))}
           <span className="text-2xs text-text-subtle">
-            A profile takes one credential per endpoint: the gateway refuses a second one.
+            A profile takes one credential per endpoint. In the profiles you pick, this credential
+            replaces the passthrough credential the host was added with.
           </span>
+          {opts.profiles.some((p) => p.read_only) && (
+            <span className="text-2xs text-text-subtle">
+              Read-only profiles are declared in a file the dashboard does not change. To give one
+              this credential, add it to the profile's credentials list in that file.
+            </span>
+          )}
         </fieldset>
 
         {err && (

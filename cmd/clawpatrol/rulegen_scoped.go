@@ -27,6 +27,9 @@ const (
 	ruleVerdictDeny    = "deny"
 	ruleVerdictAllow   = "allow"
 	ruleVerdictApprove = "approve"
+	// ruleVerdictNone adds a host with only the default rules: an admin's
+	// choice for a request no endpoint claimed.
+	ruleVerdictNone = "none"
 
 	ruleScopeExact     = "exact"      // the request's method and path (or SQL / k8s facets)
 	ruleScopeAnyMethod = "any_method" // HTTP: the path, any method
@@ -99,6 +102,7 @@ type ScopedRule struct {
 	// ProfileAdditions.
 	NewEndpoint      bool     `json:"new_endpoint,omitempty"`
 	ProfileAdditions []string `json:"profile_additions,omitempty"`
+	DefaultRules     []string `json:"default_rules,omitempty"`
 	HandWritten      bool     `json:"hand_written,omitempty"`
 
 	// credentialRef is Credential as a typed HCL reference.
@@ -107,11 +111,24 @@ type ScopedRule struct {
 	matcher       match.Matcher
 }
 
+// newHostConfig is what a rule for a host with no endpoint needs from
+// the config files.
+type newHostConfig struct {
+	// readOnlyProfiles maps a profile to the file declaring it, when the
+	// dashboard may not change that file.
+	readOnlyProfiles map[string]string
+	defaultRules     []*hclwrite.Block
+}
+
 // GenerateScopedRule turns a recorded request into a rule. For a member
 // (author != nil) the rule is pinned to the request's profile and
 // credential, named under the member's prefix, and held to
 // memberRulePriority.
 func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor) (*ScopedRule, error) {
+	return generateScopedRule(policy, ev, req, author, newHostConfig{})
+}
+
+func generateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor, newHost newHostConfig) (*ScopedRule, error) {
 	if policy == nil {
 		return nil, fmt.Errorf("policy not loaded")
 	}
@@ -120,6 +137,10 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	}
 	switch req.Verdict {
 	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
+	case ruleVerdictNone:
+		if ev.Endpoint != "" || author != nil {
+			return nil, fmt.Errorf("only an admin adds a host without a rule, from a request no endpoint claimed")
+		}
 	default:
 		return nil, fmt.Errorf("verdict must be deny, allow or approve")
 	}
@@ -134,7 +155,7 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		req.Approver = author.Approver
 	}
 	if ev.Endpoint == "" {
-		return generateScopedHostRule(policy, ev, req, author)
+		return generateScopedHostRule(policy, ev, req, author, newHost)
 	}
 	ep := policy.Endpoints[ev.Endpoint]
 	if ep == nil {
@@ -199,10 +220,12 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 
 // generateScopedHostRule handles a request no endpoint claimed: it
 // declares an endpoint for the host, a passthrough credential that
-// claims it for the author's profile (every profile, for an admin),
-// and the rule. Such a host already passes through, so only deny and
-// approve make sense.
-func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor) (*ScopedRule, error) {
+// claims it for the author's profile (every profile the dashboard may
+// change, for an admin), and the rule. An admin's endpoint also gets
+// the defaults.new_endpoint_rule rules, and may skip the rule
+// (ruleVerdictNone). Such a host already passes through, so allow
+// means nothing.
+func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor, newHost newHostConfig) (*ScopedRule, error) {
 	if req.Verdict == ruleVerdictAllow {
 		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny or approve apply")
 	}
@@ -223,19 +246,41 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 		endpointName = uniqueEndpointName(policy, author.Username+"-"+endpointName)
 	}
 	credName := generatedPassthroughCredName(policy, endpointName)
-	rule := &ScopedRule{
-		RuleName:     scopedRuleName(author, req, ev, endpointName),
-		Verdict:      req.Verdict,
-		EndpointName: endpointName,
-		Family:       "http",
-		NewEndpoint:  true,
-		scope:        req.Scope,
+	credRef := "passthrough." + credName
+
+	var profiles, warnings []string
+	for _, profile := range hostRuleProfiles(policy, ev, author) {
+		file, readOnly := newHost.readOnlyProfiles[profile]
+		switch {
+		case !readOnly:
+			profiles = append(profiles, profile)
+		case author != nil:
+			return nil, fmt.Errorf("your profile %q is declared in %s, which the dashboard does not change: "+
+				"ask an admin to declare an endpoint for %s in the HCL files and add its credential to the profile there", profile, file, host)
+		default:
+			warnings = append(warnings, fmt.Sprintf("Profile %s is declared in %s, which the dashboard does not change, so it does not get this endpoint "+
+				"and its requests to %s keep passing through. To include it, add %s to its credentials in that file.", profile, file, host, credRef))
+		}
 	}
-	rule.ProfileAdditions = hostRuleProfiles(policy, ev, author)
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("every profile is declared in a file the dashboard does not change: declare the endpoint for %s in the HCL files", host)
+	}
+
+	rule := &ScopedRule{
+		Verdict:          req.Verdict,
+		EndpointName:     endpointName,
+		Family:           "http",
+		NewEndpoint:      true,
+		ProfileAdditions: profiles,
+		scope:            req.Scope,
+	}
+	if req.Verdict != ruleVerdictNone {
+		rule.RuleName = scopedRuleName(author, req, ev, endpointName)
+	}
 	if author != nil {
 		rule.Profile = ev.Profile
 		rule.Credential = credName
-		rule.credentialRef = "passthrough." + credName
+		rule.credentialRef = credRef
 	}
 
 	f := hclwrite.NewEmptyFile()
@@ -244,15 +289,33 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	f.Body().AppendNewline()
 	cb := f.Body().AppendNewBlock("credential", []string{"passthrough", credName}).Body()
 	cb.SetAttributeRaw("endpoint", config.TraversalTokens("https."+endpointName))
-	f.Body().AppendNewline()
-	writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
-	for _, profile := range rule.ProfileAdditions {
+	if author == nil {
+		names, err := appendNewEndpointRules(f, endpointName, newHost.defaultRules)
+		if err != nil {
+			return nil, err
+		}
+		rule.DefaultRules = names
+	}
+	if rule.RuleName != "" {
+		f.Body().AppendNewline()
+		writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
+	}
+	for _, profile := range profiles {
 		f.Body().AppendNewline()
 		pb := f.Body().AppendNewBlock("profile", []string{profile}).Body()
-		config.SetIdentList(pb, "credentials", []string{"passthrough." + credName})
+		config.SetIdentList(pb, "credentials", []string{credRef})
 	}
 	rule.HCL = string(f.Bytes())
-	rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
+	if author != nil {
+		rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
+	} else {
+		rule.Warnings = append(rule.Warnings, "This request matched no endpoint: saving declares "+endpointName+" for "+host+
+			", claimed by a passthrough credential until you add its credential on a device's Credentials panel.")
+		if len(rule.DefaultRules) == 0 && rule.RuleName == "" {
+			rule.Warnings = append(rule.Warnings, "defaults declares no new_endpoint_rule, so every request to "+host+" is allowed until you add a rule.")
+		}
+	}
+	rule.Warnings = append(rule.Warnings, warnings...)
 	return rule, nil
 }
 

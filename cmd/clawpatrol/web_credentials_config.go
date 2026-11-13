@@ -9,7 +9,6 @@ import (
 	"log"
 	"maps"
 	"net/http"
-	"net/url"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -25,21 +24,20 @@ import (
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/plugins/credentials"
+	"github.com/denoland/clawpatrol/internal/config/plugins/rules"
 )
 
 // credentialConfigMaxBytes bounds a credential declaration request.
 const credentialConfigMaxBytes = 16 << 10
 
-// newEndpointType is the endpoint type the form declares for a new
+// newEndpointType is the endpoint type the dashboard declares for a
 // host.
 const newEndpointType = "https"
 
 var (
-	// configNameRE is what the form accepts as a credential or endpoint
-	// name: an HCL identifier, so `<type>.<name>` stays a reference.
+	// configNameRE is what the form accepts as a credential name: an HCL
+	// identifier, so `<type>.<name>` stays a reference.
 	configNameRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
-	// endpointHostRE is a lowercase DNS name, optionally `*.`-prefixed.
-	endpointHostRE = regexp.MustCompile(`^(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*$`)
 
 	errNoSuchCredential     = errors.New("no such credential")
 	errBadCredentialRequest = errors.New("bad request")
@@ -71,20 +69,12 @@ func editableCredentialType(typ string) (credentialTypeOption, bool) {
 // the full set of profiles that list it afterwards. On an edit, a nil
 // Header, Prefix, Endpoint or Profiles keeps the current value.
 type credentialConfigRequest struct {
-	Type        string              `json:"type,omitempty"`
-	Name        string              `json:"name"`
-	Header      *string             `json:"header,omitempty"`
-	Prefix      *string             `json:"prefix,omitempty"`
-	Endpoint    *string             `json:"endpoint,omitempty"`
-	NewEndpoint *newEndpointRequest `json:"new_endpoint,omitempty"`
-	Profiles    *[]string           `json:"profiles,omitempty"`
-}
-
-// newEndpointRequest declares an https endpoint for one host,
-// alongside the credential that binds it.
-type newEndpointRequest struct {
-	Name string `json:"name"`
-	Host string `json:"host"`
+	Type     string    `json:"type,omitempty"`
+	Name     string    `json:"name"`
+	Header   *string   `json:"header,omitempty"`
+	Prefix   *string   `json:"prefix,omitempty"`
+	Endpoint *string   `json:"endpoint,omitempty"`
+	Profiles *[]string `json:"profiles,omitempty"`
 }
 
 // configTree is the config's files parsed for editing, in load order.
@@ -237,13 +227,17 @@ func parseProfileCredentials(profile *hclwrite.Block) (*profileCredentials, erro
 	if attr := profile.Body().GetAttribute("credentials"); attr != nil {
 		src = attr.Expr().BuildTokens(nil).Bytes()
 	}
+	return parseCredentialList(src, profile.Labels()[0])
+}
+
+func parseCredentialList(src []byte, profile string) (*profileCredentials, error) {
 	expr, diags := hclsyntax.ParseExpression(src, "", hcl.InitialPos)
 	if diags.HasErrors() {
 		return nil, errors.New(diags.Error())
 	}
 	tuple, ok := expr.(*hclsyntax.TupleConsExpr)
 	if !ok {
-		return nil, fmt.Errorf("profile %q: credentials is not a list", profile.Labels()[0])
+		return nil, fmt.Errorf("profile %q: credentials is not a list", profile)
 	}
 	l := &profileCredentials{src: src, closeAt: tuple.SrcRange.End.Byte - 1}
 	for _, item := range tuple.Exprs {
@@ -411,14 +405,18 @@ func entityRef(typ, name string) hcl.Traversal {
 
 // setCredentialProfiles makes exactly the profiles in want list the
 // credential: it is appended to the lists that lack it and dropped
-// from the others.
-func (t *configTree) setCredentialProfiles(credType, credName string, want []string) error {
+// from the others. A profile that lists it afterwards loses the
+// credentials in replace: the passthrough credential that claimed the
+// endpoint until a real one was added. It returns the profiles that
+// lost one, with what they lost.
+func (t *configTree) setCredentialProfiles(credType, credName string, want []string, replace []string) (map[string][]string, error) {
 	wanted := map[string]bool{}
 	for _, p := range want {
 		wanted[p] = true
 	}
-	_, profiles := t.blocks("profile")
-	for _, profile := range profiles {
+	replaced := map[string][]string{}
+	files, profiles := t.blocks("profile")
+	for i, profile := range profiles {
 		labels := profile.Labels()
 		if len(labels) != 1 {
 			continue
@@ -429,19 +427,47 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 			// request to add the credential to it is refused. If the
 			// list still names a removed credential, the reload says so.
 			if wanted[labels[0]] {
-				return fmt.Errorf("%w: profile %q: %v; change it in the config", errBadCredentialRequest, labels[0], err)
+				return nil, fmt.Errorf("%w: profile %q: %v; change it in the config", errBadCredentialRequest, labels[0], err)
 			}
 			continue
 		}
 		has := list.has(credName)
+		var drop []string
+		if wanted[labels[0]] {
+			drop = slices.DeleteFunc(slices.Clone(replace), func(name string) bool { return !list.has(name) })
+		}
+		if (wanted[labels[0]] != has || len(drop) > 0) && t.readOnly(files[i]) {
+			var edit string
+			switch {
+			case !has:
+				edit = "add " + credType + "." + credName + " to its credentials list"
+			case !wanted[labels[0]]:
+				edit = "remove " + credType + "." + credName + " from its credentials list"
+			}
+			if len(drop) > 0 {
+				edit = strings.TrimPrefix(edit+" and remove "+strings.Join(drop, ", ")+" from it", " and ")
+			}
+			return nil, fmt.Errorf("%w: profile %q is declared in %s, which the dashboard does not change: %s in that file",
+				errBadCredentialRequest, labels[0], files[i], edit)
+		}
+		for _, name := range drop {
+			if list, err = parseCredentialList(list.without(name), labels[0]); err != nil {
+				return nil, err
+			}
+		}
 		switch {
 		case wanted[labels[0]] && !has:
 			err = setProfileCredentialsSource(profile, list.with(credType+"."+credName))
 		case !wanted[labels[0]] && has:
 			err = setProfileCredentialsSource(profile, list.without(credName))
+		case len(drop) > 0:
+			err = setProfileCredentialsSource(profile, list.src)
 		}
 		if err != nil {
-			return err
+			return nil, err
+		}
+		if len(drop) > 0 {
+			replaced[labels[0]] = drop
 		}
 		delete(wanted, labels[0])
 	}
@@ -451,63 +477,50 @@ func (t *configTree) setCredentialProfiles(credType, credName string, want []str
 			missing = append(missing, p)
 		}
 		sort.Strings(missing)
-		return fmt.Errorf("%w: no such profile: %s", errBadCredentialRequest, strings.Join(missing, ", "))
+		return nil, fmt.Errorf("%w: no such profile: %s", errBadCredentialRequest, strings.Join(missing, ", "))
+	}
+	return replaced, nil
+}
+
+// placeholderCredentials are the passthrough credentials that claim
+// endpoint: the dashboard adds one with each host, until a real
+// credential replaces it.
+func placeholderCredentials(gw *config.Gateway, endpoint string) []string {
+	var names []string
+	for name, ent := range gw.Policy.Credentials {
+		if ent == nil || ent.Symbol == nil || ent.Symbol.Type != "passthrough" {
+			continue
+		}
+		if targets := config.CredentialEndpointTargets(ent); len(targets) == 1 && targets[0] == endpoint {
+			names = append(names, name)
+		}
+	}
+	sort.Strings(names)
+	return names
+}
+
+// checkReplacedCredentials refuses a swap that would stop a rule: a
+// rule pinned to a profile and a credential the profile no longer
+// lists never matches again.
+func checkReplacedCredentials(gw *config.Gateway, replaced map[string][]string) error {
+	for name, ent := range gw.Policy.Rules {
+		r, ok := ent.Body.(*rules.Rule)
+		if !ok || r.Credential == "" {
+			continue
+		}
+		for profile, creds := range replaced {
+			if (r.Profile == "" || r.Profile == profile) && slices.Contains(creds, r.Credential) {
+				return fmt.Errorf("%w: rule %q is pinned to %s, which this change removes from profile %q, so the rule would stop matching; change or remove the rule first",
+					errBadCredentialRequest, name, r.Credential, profile)
+			}
+		}
 	}
 	return nil
 }
 
-// endpointHost reduces a URL or a host to the lowercase host an https
-// endpoint matches.
-func endpointHost(raw string) (string, error) {
-	raw = strings.TrimSpace(raw)
-	if strings.Contains(raw, "://") {
-		u, err := url.Parse(raw)
-		if err != nil {
-			return "", fmt.Errorf("%w: host: %v", errBadCredentialRequest, err)
-		}
-		if u.Scheme != "https" {
-			return "", fmt.Errorf("%w: host: only https URLs can be declared here", errBadCredentialRequest)
-		}
-		if port := u.Port(); port != "" && port != "443" {
-			return "", fmt.Errorf("%w: host: a port other than 443 needs an endpoint written in the config", errBadCredentialRequest)
-		}
-		raw = u.Hostname()
-	}
-	host := strings.ToLower(strings.TrimSuffix(raw, "."))
-	if !endpointHostRE.MatchString(host) {
-		return "", fmt.Errorf("%w: host %q is not a DNS name", errBadCredentialRequest, raw)
-	}
-	return host, nil
-}
-
-// credentialEndpointRef resolves the endpoint a credential should bind:
-// an existing endpoint by name, or a new https endpoint declared in
-// target. It returns nil when the request names neither.
-func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTypeOption, req credentialConfigRequest, target string) (hcl.Traversal, error) {
-	if req.NewEndpoint != nil {
-		name := req.NewEndpoint.Name
-		if !configNameRE.MatchString(name) {
-			return nil, fmt.Errorf("%w: endpoint name %q: use letters, digits, - and _, starting with a letter", errBadCredentialRequest, name)
-		}
-		if _, exists := gw.Policy.Endpoints[name]; exists {
-			return nil, fmt.Errorf("%w: an endpoint named %q already exists", errBadCredentialRequest, name)
-		}
-		if !slices.Contains(typ.Families, "http") {
-			return nil, fmt.Errorf("%w: a %s credential cannot bind an https endpoint", errBadCredentialRequest, typ.Type)
-		}
-		host, err := endpointHost(req.NewEndpoint.Host)
-		if err != nil {
-			return nil, err
-		}
-		f, err := t.file(target)
-		if err != nil {
-			return nil, err
-		}
-		if err := t.declareEndpoint(gw, f, name, host); err != nil {
-			return nil, err
-		}
-		return entityRef(newEndpointType, name), nil
-	}
+// credentialEndpointRef resolves the endpoint a credential should bind,
+// or nil when the request names none.
+func credentialEndpointRef(gw *config.Gateway, typ credentialTypeOption, req credentialConfigRequest) (hcl.Traversal, error) {
 	if req.Endpoint == nil {
 		return nil, nil
 	}
@@ -522,24 +535,40 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 }
 
 // declareEndpoint appends an https endpoint for host to f, then a rule
-// for each defaults.new_endpoint_rule, so the endpoint never loads
-// without them.
+// for each defaults.new_endpoint_rule, as a host added from a request
+// gets them.
 func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name, host string) error {
 	blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
 	blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
-	seen := map[string]bool{}
-	for _, def := range t.newEndpointRules() {
-		label := def.Labels()[0]
-		if seen[label] {
-			return fmt.Errorf("%w: defaults declares new_endpoint_rule %q more than once", errBadCredentialRequest, label)
+	names, err := appendNewEndpointRules(f, name, t.newEndpointRules())
+	if err != nil {
+		return err
+	}
+	return checkNewEndpointRuleNames(gw, name, names)
+}
+
+func checkNewEndpointRuleNames(gw *config.Gateway, endpoint string, names []string) error {
+	for _, name := range names {
+		if _, exists := gw.Policy.Rules[name]; exists {
+			return fmt.Errorf("endpoint %q would add the rule %q, which already exists", endpoint, name)
 		}
-		seen[label] = true
-		ruleName := newEndpointRuleName(name, label)
-		if _, exists := gw.Policy.Rules[ruleName]; exists {
-			return fmt.Errorf("%w: endpoint %q would add the rule %q, which already exists", errBadCredentialRequest, name, ruleName)
+	}
+	return nil
+}
+
+// appendNewEndpointRules appends a rule for endpoint to f for each
+// defaults.new_endpoint_rule, its body copied as written, and returns
+// their names.
+func appendNewEndpointRules(f *hclwrite.File, endpoint string, defs []*hclwrite.Block) ([]string, error) {
+	var names []string
+	for _, def := range defs {
+		ruleName := newEndpointRuleName(endpoint, def.Labels()[0])
+		if slices.Contains(names, ruleName) {
+			return nil, fmt.Errorf("defaults declares new_endpoint_rule %q more than once", def.Labels()[0])
 		}
+		names = append(names, ruleName)
 		rule := appendBlock(f, "rule", []string{ruleName})
-		rule.Body().SetAttributeTraversal("endpoint", entityRef(newEndpointType, name))
+		rule.Body().SetAttributeTraversal("endpoint", entityRef(newEndpointType, endpoint))
 		// Copies: formatting the file rewrites tokens' spacing in place,
 		// which would re-indent the defaults block too.
 		var body hclwrite.Tokens
@@ -557,7 +586,7 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 		}
 		rule.Body().AppendUnstructuredTokens(body)
 	}
-	return nil
+	return names, nil
 }
 
 func (t *configTree) newEndpointRules() []*hclwrite.Block {
@@ -722,11 +751,10 @@ type credentialConfigEntry struct {
 }
 
 // apiCredentialOptions lists what the credential form needs: the types
-// it declares, the endpoints and profiles to pick from, where each
+// it declares, the endpoints and profiles to pick from, and where each
 // credential and profile is declared, so the form can tell which ones
-// it may change, and the rules a new host gets. The loaded config and
-// the files are read under the config lock, so both describe the same
-// revision.
+// it may change. The loaded config and the files are read under the
+// config lock, so both describe the same revision.
 func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	w.g.configMu.Lock()
 	gw := w.g.cfg.Load()
@@ -805,21 +833,13 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		creds[name] = entry
 	}
 
-	newEndpointRules := []string{}
-	for _, def := range tree.newEndpointRules() {
-		if suffix := newEndpointRuleName("", def.Labels()[0]); !slices.Contains(newEndpointRules, suffix) {
-			newEndpointRules = append(newEndpointRules, suffix)
-		}
-	}
-
 	writeJSON(rw, map[string]any{
-		"writes":             gw.DashboardConfigWrites(),
-		"file":               target,
-		"types":              editableCredentialTypes,
-		"endpoints":          endpoints,
-		"profiles":           profiles,
-		"credentials":        creds,
-		"new_endpoint_rules": newEndpointRules,
+		"writes":      gw.DashboardConfigWrites(),
+		"file":        target,
+		"types":       editableCredentialTypes,
+		"endpoints":   endpoints,
+		"profiles":    profiles,
+		"credentials": creds,
 	})
 }
 
@@ -834,9 +854,9 @@ type credentialPlan struct {
 	secretCleared bool
 }
 
-// apiCredentialDeclare declares a credential in the dashboard's file,
-// optionally with a new https endpoint for it, and adds it to the
-// requested profiles wherever they are declared.
+// apiCredentialDeclare declares a credential in the dashboard's file
+// for an existing endpoint, and adds it to the requested profiles
+// wherever they are declared.
 func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 	w.editCredentialConfig(rw, r, func(tree *configTree, gw *config.Gateway, req credentialConfigRequest) (credentialPlan, error) {
 		typ, ok := editableCredentialType(req.Type)
@@ -856,12 +876,12 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			return credentialPlan{}, err
 		}
-		ref, err := tree.credentialEndpointRef(gw, typ, req, target)
+		ref, err := credentialEndpointRef(gw, typ, req)
 		if err != nil {
 			return credentialPlan{}, err
 		}
 		if ref == nil {
-			return credentialPlan{}, fmt.Errorf("%w: pick an endpoint or declare a new host", errBadCredentialRequest)
+			return credentialPlan{}, fmt.Errorf("%w: pick an endpoint; a host with none is added from a request to it in the log", errBadCredentialRequest)
 		}
 		f, err := tree.file(target)
 		if err != nil {
@@ -876,7 +896,11 @@ func (w *webMux) apiCredentialDeclare(rw http.ResponseWriter, r *http.Request) {
 		if req.Profiles != nil {
 			profiles = *req.Profiles
 		}
-		if err := tree.setCredentialProfiles(typ.Type, req.Name, profiles); err != nil {
+		replaced, err := tree.setCredentialProfiles(typ.Type, req.Name, profiles, placeholderCredentials(gw, *req.Endpoint))
+		if err != nil {
+			return credentialPlan{}, err
+		}
+		if err := checkReplacedCredentials(gw, replaced); err != nil {
 			return credentialPlan{}, err
 		}
 		// A secret left under this name by an earlier credential must
@@ -895,11 +919,7 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			return credentialPlan{}, fmt.Errorf("%w %q", errNoSuchCredential, req.Name)
 		}
 		credType := blk.Labels()[0]
-		target, _, err := resolveConfigFile(w.g.cfgPath, "")
-		if err != nil {
-			return credentialPlan{}, err
-		}
-		settings := req.Header != nil || req.Prefix != nil || req.Endpoint != nil || req.NewEndpoint != nil
+		settings := req.Header != nil || req.Prefix != nil || req.Endpoint != nil
 		rebound := false
 		if settings {
 			typ, ok := editableCredentialType(credType)
@@ -909,7 +929,7 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 			if err := setCredentialFields(blk, typ, req); err != nil {
 				return credentialPlan{}, err
 			}
-			ref, err := tree.credentialEndpointRef(gw, typ, req, target)
+			ref, err := credentialEndpointRef(gw, typ, req)
 			if err != nil {
 				return credentialPlan{}, err
 			}
@@ -921,18 +941,36 @@ func (w *webMux) apiCredentialEdit(rw http.ResponseWriter, r *http.Request) {
 				rebound = len(current) != 1 || current[0] != newEndpoint
 			}
 		}
-		if req.Profiles != nil {
-			if err := tree.setCredentialProfiles(credType, req.Name, *req.Profiles); err != nil {
+		profiles := req.Profiles
+		if profiles == nil && rebound {
+			// The profiles listing it keep it, and lose the endpoint's
+			// passthrough credential.
+			listing := []string{}
+			_, blocks := tree.blocks("profile")
+			for _, profile := range blocks {
+				if list, err := parseProfileCredentials(profile); err == nil && len(profile.Labels()) == 1 && list.has(req.Name) {
+					listing = append(listing, profile.Labels()[0])
+				}
+			}
+			profiles = &listing
+		}
+		if profiles != nil {
+			endpoint := ""
+			if targets := config.CredentialEndpointTargets(gw.Policy.Credentials[req.Name]); len(targets) == 1 {
+				endpoint = targets[0]
+			}
+			if req.Endpoint != nil {
+				endpoint = *req.Endpoint
+			}
+			replaced, err := tree.setCredentialProfiles(credType, req.Name, *profiles, placeholderCredentials(gw, endpoint))
+			if err != nil {
+				return credentialPlan{}, err
+			}
+			if err := checkReplacedCredentials(gw, replaced); err != nil {
 				return credentialPlan{}, err
 			}
 		}
-		first := file
-		if req.NewEndpoint != nil {
-			// The new endpoint's file lands before the credential
-			// that references it.
-			first = target
-		}
-		p := credentialPlan{changes: tree.changes(first, "")}
+		p := credentialPlan{changes: tree.changes(file, "")}
 		switch {
 		case rebound:
 			// The secret was issued for the old endpoint's host: it must
@@ -967,7 +1005,7 @@ func (w *webMux) apiCredentialRemove(rw http.ResponseWriter, r *http.Request) {
 		if _, ok := editableCredentialType(credType); !ok {
 			return credentialPlan{}, fmt.Errorf("%w: the form cannot remove a %s credential; remove it from %s", errBadCredentialRequest, credType, file)
 		}
-		if err := tree.setCredentialProfiles(credType, req.Name, nil); err != nil {
+		if _, err := tree.setCredentialProfiles(credType, req.Name, nil, nil); err != nil {
 			return credentialPlan{}, err
 		}
 		tree.files[file].Body().RemoveBlock(blk)
