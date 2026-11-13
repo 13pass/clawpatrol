@@ -118,8 +118,6 @@ func (t *configTree) path(name string) string {
 	return t.cfgPath
 }
 
-// newConfigTree builds a tree from file contents already read, keyed
-// by file name.
 func newConfigTree(cfgPath string, sources map[string][]byte) (*configTree, error) {
 	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
 	for _, name := range slices.Sorted(maps.Keys(sources)) {
@@ -562,8 +560,6 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 	return nil
 }
 
-// newEndpointRules returns the defaults.new_endpoint_rule blocks in
-// declaration order.
 func (t *configTree) newEndpointRules() []*hclwrite.Block {
 	var rules []*hclwrite.Block
 	_, defaults := t.blocks("defaults")
@@ -581,8 +577,6 @@ func newEndpointRuleName(endpoint, rule string) string {
 	return endpoint + "-" + rule
 }
 
-// newEndpointRuleProbe names the endpoint checkNewEndpointRules
-// declares; a number is appended while the config already has one.
 const newEndpointRuleProbe = "new-endpoint-rule-probe"
 
 // checkNewEndpointRules declares a probe endpoint in the config's
@@ -664,8 +658,6 @@ func configSourcesSum(path string, sources map[string][]byte, isDir bool) [sha25
 	return [sha256.Size]byte(h.Sum(nil))
 }
 
-// probeNameTaken reports whether the probe endpoint name, or a rule
-// name derived from it, is already declared.
 func probeNameTaken(tree *configTree, gw *config.Gateway, name string) bool {
 	if gw.Policy.Endpoints[name] != nil {
 		return true
@@ -732,8 +724,9 @@ type credentialConfigEntry struct {
 // apiCredentialOptions lists what the credential form needs: the types
 // it declares, the endpoints and profiles to pick from, where each
 // credential and profile is declared, so the form can tell which ones
-// it may change, and the rules a new host gets. The loaded config and the files are read under the
-// config lock, so both describe the same revision.
+// it may change, and the rules a new host gets. The loaded config and
+// the files are read under the config lock, so both describe the same
+// revision.
 func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	w.g.configMu.Lock()
 	gw := w.g.cfg.Load()
@@ -812,7 +805,6 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		creds[name] = entry
 	}
 
-	// The form shows each rule as the new endpoint's name + its suffix.
 	newEndpointRules := []string{}
 	for _, def := range tree.newEndpointRules() {
 		if suffix := newEndpointRuleName("", def.Labels()[0]); !slices.Contains(newEndpointRules, suffix) {

@@ -31,8 +31,6 @@ defaults {
 }
 `
 
-// setNewEndpointRules writes a defaults block to the config directory
-// and reloads, returning the reload's error.
 func setNewEndpointRules(t *testing.T, w *webMux, src string) error {
 	t.Helper()
 	if err := os.WriteFile(filepath.Join(w.g.cfgPath, newEndpointRulesFile), []byte(src), 0o640); err != nil {

@@ -226,8 +226,6 @@ func loadConfigOverlay(path string, overrides map[string][]byte) (*config.Gatewa
 	return gw, cp, nil
 }
 
-// compileConfigSources loads and compiles config files already read
-// by config.ReadSources.
 func compileConfigSources(path string, sources map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
 	return compileLoadedConfig(config.LoadSources(path, sources))
 }
