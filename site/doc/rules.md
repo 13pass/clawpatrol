@@ -499,7 +499,9 @@ defaults {
 }
 ```
 
-A block's body is everything a `rule` takes except `endpoint`. The
+A block's name starts with a letter or digit and holds only letters,
+digits, `_` and `-` (at most 64), and each name is used once. A block's
+body is everything a `rule` takes except `endpoint`. The
 gateway checks the blocks each time it loads the config, by declaring
 a probe endpoint with them the way the dashboard would, so a condition
 that does not compile or an approver that does not exist fails the

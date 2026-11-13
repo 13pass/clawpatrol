@@ -262,8 +262,49 @@ func TestDuplicateNewEndpointRuleLabelFailsTheLoad(t *testing.T) {
   new_endpoint_rule "deny" { verdict = "deny" }
 }
 `
-	if err := setNewEndpointRules(t, w, src); err == nil || !strings.Contains(err.Error(), `new_endpoint_rule "deny" more than once`) {
+	err := setNewEndpointRules(t, w, src)
+	if err == nil || !strings.Contains(err.Error(), `new_endpoint_rule "deny" more than once`) {
 		t.Fatalf("reload error = %v, want one naming the duplicated label", err)
+	}
+	if strings.Contains(err.Error(), "bad request") || !strings.Contains(err.Error(), newEndpointRulesFile+":3") {
+		t.Errorf("reload error = %v, want the duplicate's position and no HTTP wording", err)
+	}
+}
+
+func TestInvalidNewEndpointRuleLabelFailsTheLoad(t *testing.T) {
+	w := configDirTestMux(t)
+	for _, label := range []string{"no delete", "", "-x"} {
+		src := "defaults {\n  new_endpoint_rule \"" + label + "\" { verdict = \"deny\" }\n}\n"
+		if err := setNewEndpointRules(t, w, src); err == nil || !strings.Contains(err.Error(), "Invalid new_endpoint_rule name") {
+			t.Errorf("label %q: reload error = %v", label, err)
+		}
+	}
+}
+
+func TestRuleCopiedFromABlockEndingInACommentHasNoBlankLine(t *testing.T) {
+	w := configDirTestMux(t)
+	if err := setNewEndpointRules(t, w, "defaults {\n  new_endpoint_rule \"deny\" {\n    verdict = \"deny\" # why\n  }\n}\n"); err != nil {
+		t.Fatal(err)
+	}
+	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "bearer_token", "name": "forge-tok",
+		"new_endpoint": map[string]string{"name": "forge", "host": "git.example.org"},
+	})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	if got := readCfgFile(t, w, dashboardConfigFile); strings.Contains(got, "# why\n\n") {
+		t.Errorf("a blank line follows the copied comment:\n%s", got)
+	}
+}
+
+func TestNewEndpointRulesCheckedOnceForASingleFileWrite(t *testing.T) {
+	dir := t.TempDir()
+	src := []byte("defaults {\n  new_endpoint_rule \"deny\" { verdict = \"deny\" }\n}\n")
+	tmp := configSourcesSum(filepath.Join(dir, ".clawpatrol-config-1.hcl"), map[string][]byte{".clawpatrol-config-1.hcl": src}, false)
+	real := configSourcesSum(filepath.Join(dir, "gateway.hcl"), map[string][]byte{"gateway.hcl": src}, false)
+	if tmp != real {
+		t.Error("a single file's temporary copy and the file itself have different sums")
 	}
 }
 

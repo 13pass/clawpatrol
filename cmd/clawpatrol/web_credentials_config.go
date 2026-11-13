@@ -551,8 +551,10 @@ func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name,
 		for len(body) > 0 && body[0].Type == hclsyntax.TokenNewline {
 			body = body[1:]
 		}
-		if len(body) > 0 && body[len(body)-1].Type != hclsyntax.TokenNewline {
-			// A one-line block's body ends at its closing brace.
+		if last := len(body) - 1; last >= 0 && body[last].Type != hclsyntax.TokenNewline &&
+			!(body[last].Type == hclsyntax.TokenComment && bytes.HasSuffix(body[last].Bytes, []byte("\n"))) {
+			// A one-line block's body ends at its closing brace; a line
+			// comment already ends its line.
 			body = append(body, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
 		}
 		rule.Body().AppendUnstructuredTokens(body)
@@ -591,7 +593,7 @@ func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Ga
 	if gw.Defaults == nil || len(gw.Defaults.NewEndpointRules) == 0 {
 		return nil
 	}
-	sum := configSourcesSum(path, sources)
+	sum := configSourcesSum(path, sources, configIsDir(path))
 	newEndpointRulesChecked.Lock()
 	defer newEndpointRulesChecked.Unlock()
 	if newEndpointRulesChecked.sum == sum {
@@ -622,8 +624,13 @@ func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Ga
 		probe[c.Name] = c.Content
 	}
 	if _, _, err := compileConfigSources(path, probe); err != nil {
+		// A single file may be a dashboard write's temporary copy.
+		where := target
+		if !configIsDir(path) {
+			where = "the config file"
+		}
 		return fmt.Errorf("defaults.new_endpoint_rule: the rules a host added on the dashboard gets would not load "+
-			"(checked by adding endpoint %q to %s in memory, so positions there are not in the file): %w", name, target, err)
+			"(checked by adding endpoint %q to %s in memory, so positions there are not in the file): %w", name, where, err)
 	}
 	newEndpointRulesChecked.sum = sum
 	return nil
@@ -637,11 +644,21 @@ var newEndpointRulesChecked struct {
 	sum [sha256.Size]byte
 }
 
-func configSourcesSum(path string, sources map[string][]byte) [sha256.Size]byte {
+// configSourcesSum identifies a config by its directory and contents.
+// A single file's name is left out: a dashboard write validates it as
+// a temporary file next to it, then reloads it under its own name.
+func configSourcesSum(path string, sources map[string][]byte, isDir bool) [sha256.Size]byte {
 	h := sha256.New()
-	fmt.Fprintf(h, "%q\n", path)
+	dir := path
+	if !isDir {
+		dir = filepath.Dir(path)
+	}
+	fmt.Fprintf(h, "%q %t\n", dir, isDir)
 	for _, name := range slices.Sorted(maps.Keys(sources)) {
-		fmt.Fprintf(h, "%q %d\n", name, len(sources[name]))
+		if isDir {
+			fmt.Fprintf(h, "%q ", name)
+		}
+		fmt.Fprintf(h, "%d\n", len(sources[name]))
 		h.Write(sources[name])
 	}
 	return [sha256.Size]byte(h.Sum(nil))
@@ -798,7 +815,9 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	// The form shows each rule as the new endpoint's name + its suffix.
 	newEndpointRules := []string{}
 	for _, def := range tree.newEndpointRules() {
-		newEndpointRules = append(newEndpointRules, newEndpointRuleName("", def.Labels()[0]))
+		if suffix := newEndpointRuleName("", def.Labels()[0]); !slices.Contains(newEndpointRules, suffix) {
+			newEndpointRules = append(newEndpointRules, suffix)
+		}
 	}
 
 	writeJSON(rw, map[string]any{

@@ -1254,7 +1254,15 @@ func LoadSources(path string, sources map[string][]byte) (*Gateway, hcl.Diagnost
 	if info, err := os.Stat(path); err == nil && info.IsDir() {
 		return LoadDirSources(path, sources)
 	}
-	return LoadBytes(sources[filepath.Base(path)], path)
+	src, ok := sources[filepath.Base(path)]
+	if !ok || len(sources) != 1 {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Config sources do not match the path",
+			Detail:   fmt.Sprintf("%q is a single file, so the sources must hold exactly %q.", path, filepath.Base(path)),
+		}}
+	}
+	return LoadBytes(src, path)
 }
 
 // ReadDirSources reads the files LoadDirOverlay would load, keyed by
@@ -1409,6 +1417,7 @@ func loadFiles(files []*hcl.File, configDir string, diags hcl.Diagnostics) (*Gat
 	}
 
 	diags = append(diags, validateOperational(gw)...)
+	diags = append(diags, validateNewEndpointRules(gw.Defaults)...)
 
 	// Pass 1: extract the policy blocks from the remainder body. With
 	// a merged body, gw.Remain is itself a merged body whose Content
@@ -1487,6 +1496,42 @@ func dedupGohclDiags(in hcl.Diagnostics) hcl.Diagnostics {
 // fields that gohcl can't express in a struct tag. Catches the typical
 // shapes that boot a gateway in a degraded state (silent fallback to
 // plain TCP, missing WireGuard endpoint, dashboard-with-no-auth).
+// newEndpointRuleLabelRe is what a new_endpoint_rule label may hold:
+// it ends a rule name, after "<endpoint>-".
+var newEndpointRuleLabelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+// validateNewEndpointRules checks what the load alone can: each label
+// is a name and is used once. The rule bodies are checked by the
+// gateway, which declares a probe endpoint with them.
+func validateNewEndpointRules(d *Defaults) hcl.Diagnostics {
+	if d == nil {
+		return nil
+	}
+	var diags hcl.Diagnostics
+	seen := map[string]bool{}
+	for _, r := range d.NewEndpointRules {
+		subject := r.Body.MissingItemRange()
+		switch {
+		case !newEndpointRuleLabelRe.MatchString(r.Name):
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid new_endpoint_rule name",
+				Detail:   fmt.Sprintf("%q must start with a letter or digit and hold only letters, digits, `_` and `-` (at most 64): it ends the name of every rule it adds.", r.Name),
+				Subject:  &subject,
+			})
+		case seen[r.Name]:
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Duplicate new_endpoint_rule name",
+				Detail:   fmt.Sprintf("defaults declares new_endpoint_rule %q more than once.", r.Name),
+				Subject:  &subject,
+			})
+		}
+		seen[r.Name] = true
+	}
+	return diags
+}
+
 func validateOperational(gw *Gateway) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 
