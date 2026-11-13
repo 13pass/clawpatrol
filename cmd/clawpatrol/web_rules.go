@@ -263,7 +263,7 @@ func (w *webMux) apiRulePreview(rw http.ResponseWriter, r *http.Request) {
 		"recent_matches": matched,
 		"recent_sampled": sampled,
 		"writes_enabled": w.g.cfg.Load().DashboardConfigWrites() && fileErr == nil,
-		"needs_review":   !v.admin && ruleCreateNeedsReview(rule.Verdict),
+		"needs_review":   !v.admin && ruleCreateNeedsReview(rule),
 	}
 	if fileErr != nil {
 		out["writes_unavailable"] = fileErr.Error()
@@ -386,7 +386,7 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		http.Error(rw, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	if !v.admin && ruleCreateNeedsReview(rule.Verdict) {
+	if !v.admin && ruleCreateNeedsReview(rule) {
 		// Hand the admins a rule that loads today.
 		if err := w.g.validateConfigChangesLocked(changes); err != nil {
 			http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -394,7 +394,7 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		}
 		w.fileRuleRequest(rw, ruleChangeRequest{
 			Username: v.username, Kind: ruleChangeCreate, RuleName: rule.RuleName, Profile: rule.Profile,
-			Summary: ruleCreateSummary(rule.Verdict, asked.Scope, ev), HCL: rule.HCL, Reason: asked.Reason,
+			Summary: ruleCreateSummary(rule, ev), HCL: rule.HCL, Reason: asked.Reason,
 		}, map[string]any{"file": file})
 		return
 	}

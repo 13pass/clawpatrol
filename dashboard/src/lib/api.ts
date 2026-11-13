@@ -669,13 +669,14 @@ export function updateUser(
 
 // A request turned into a rule: what it does and how much it matches.
 export type RuleVerdict = "deny" | "allow" | "approve";
-export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
+export type RuleScope = "exact" | "any_method" | "any_path" | "pattern" | "any_name";
 export type RuleRequest = {
   verdict: RuleVerdict;
   scope: RuleScope;
   // approver applies to admins only; a member's own approver is used.
   approver?: string;
   pin_header?: string;
+  condition?: string;
 };
 
 export type ScopedRule = {
@@ -684,6 +685,7 @@ export type ScopedRule = {
   endpoint_name: string;
   family: string;
   condition?: string;
+  hand_written?: boolean;
   credential?: string;
   profile?: string;
   hcl: string;

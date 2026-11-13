@@ -79,13 +79,15 @@ type ruleChangeRequest struct {
 	Edited       bool   `json:"edited,omitempty"`
 }
 
-// ruleCreateNeedsReview reports whether a member's new rule with this
-// verdict could let through what the profile's other rules stop. Only
-// a deny cannot. A pre-approval skips admin approvals; a required
-// approval sits above admin rules, so it can stand in for an admin's
-// deny or approver.
-func ruleCreateNeedsReview(verdict string) bool {
-	return verdict != ruleVerdictDeny
+// ruleCreateNeedsReview reports whether a member's new rule goes to an
+// admin first. A rule that could let through what the profile's other
+// rules stop does: only a deny cannot. A pre-approval skips admin
+// approvals; a required approval sits above admin rules, so it can
+// stand in for an admin's deny or approver. A condition written by
+// hand does too, whatever its verdict: it is free-form CEL that runs
+// on every request.
+func ruleCreateNeedsReview(rule *ScopedRule) bool {
+	return rule.Verdict != ruleVerdictDeny || rule.HandWritten
 }
 
 // ruleEditNeedsReview reports whether a change to a member's existing
@@ -130,25 +132,32 @@ func ruleOutcomeLabel(r *rules.Rule) string {
 
 // ruleCreateSummary describes a new rule in a line: what it does to
 // which requests.
-func ruleCreateSummary(verdict, scope string, ev *Event) string {
+func ruleCreateSummary(rule *ScopedRule, ev *Event) string {
 	what := map[string]string{
 		ruleVerdictDeny:    "block",
 		ruleVerdictAllow:   "pre-approve",
 		ruleVerdictApprove: "require approval for",
-	}[verdict]
-	target := strings.TrimSpace(ev.Method + " " + ev.Path)
-	if target == "" {
-		target = ev.Host
-	}
+	}[rule.Verdict]
 	where := ev.Endpoint
 	if where == "" {
 		where = ev.Host
 	}
+	if rule.HandWritten {
+		return fmt.Sprintf("%s requests on %s matching a condition written by hand", what, where)
+	}
+	target := strings.TrimSpace(ev.Method + " " + ev.Path)
+	if rule.scope == ruleScopeAnyPath {
+		target = ev.Method
+	}
+	if target == "" {
+		target = ev.Host
+	}
 	scopeLabel := map[string]string{
 		ruleScopeAnyMethod: ", any method",
+		ruleScopeAnyPath:   ", any path",
 		ruleScopePattern:   ", IDs generalized",
 		ruleScopeAnyName:   ", any object name",
-	}[scope]
+	}[rule.scope]
 	return fmt.Sprintf("%s %s on %s%s", what, target, where, scopeLabel)
 }
 

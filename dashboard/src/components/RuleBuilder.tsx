@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useId, useMemo, useRef, useState } from "react";
 import {
   createRule,
   listUsers,
@@ -6,6 +6,7 @@ import {
   type EventRecord,
   type RuleChangeResult,
   type RulePreviewResp,
+  type RuleRequest,
   type RuleScope,
   type RuleVerdict,
   type Whoami,
@@ -36,6 +37,7 @@ function scopesFor(ev: EventRecord): { value: RuleScope; label: string }[] {
       return [
         { value: "exact", label: "This method and path" },
         { value: "any_method", label: "This path, any method" },
+        { value: "any_path", label: "This method, any path" },
         { value: "pattern", label: "This method, same path shape (IDs generalized)" },
       ];
     case "k8s":
@@ -67,11 +69,18 @@ export function RuleBuilderModal({
   const [pinHeader, setPinHeader] = useState("");
   const [approver, setApprover] = useState("");
   const [approvers, setApprovers] = useState<string[]>([]);
-  const [preview, setPreview] = useState<RulePreviewResp | null>(null);
+  // preview answers the request whose JSON is key; a preview for an
+  // older request stays on screen but cannot be acted on.
+  const [previewed, setPreviewed] = useState<{ key: string; resp: RulePreviewResp } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
+  // null while the editor is closed.
+  const [conditionText, setConditionText] = useState<string | null>(null);
+  const condition = conditionText?.trim() ? conditionText : undefined;
+  const prefillOnPreview = useRef(false);
+  const conditionId = useId();
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -89,39 +98,62 @@ export function RuleBuilderModal({
     }
   }, [isAdmin]);
 
+  // scope and pin_header go along with a condition: the server ignores
+  // them then, but uses them to tell an unedited condition from one
+  // written by hand.
+  const request = useMemo<RuleRequest>(
+    () => ({ verdict, scope, approver, pin_header: pinHeader || undefined, condition }),
+    [verdict, scope, approver, pinHeader, condition],
+  );
+  const requestKey = JSON.stringify(request);
+  const preview = previewed?.resp ?? null;
+  const fresh = previewed?.key === requestKey;
+
   useEffect(() => {
     if (!ev.id || created) return;
-    let cancelled = false;
+    const id = ev.id;
+    // An object, not a let: the linter forbids reassigning a local after render.
+    const ctl = { cancelled: false };
     const t = setTimeout(() => {
-      previewRule(ev.id!, { verdict, scope, approver, pin_header: pinHeader || undefined })
+      previewRule(id, request)
         .then((p) => {
-          if (cancelled) return;
-          setPreview(p);
+          if (ctl.cancelled) return;
+          setPreviewed({ key: requestKey, resp: p });
           setErr(null);
+          if (prefillOnPreview.current) {
+            prefillOnPreview.current = false;
+            setConditionText((text) => (text === "" ? (p.rule.condition ?? "") : text));
+          }
         })
         .catch((e: Error) => {
-          if (cancelled) return;
-          setPreview(null);
+          if (ctl.cancelled) return;
+          prefillOnPreview.current = false;
+          setPreviewed(null);
           setErr(e.message || "preview failed");
         });
     }, PREVIEW_DEBOUNCE_MS);
     return () => {
-      cancelled = true;
+      ctl.cancelled = true;
       clearTimeout(t);
     };
-  }, [ev.id, verdict, scope, pinHeader, approver, created]);
+  }, [ev.id, request, requestKey, created]);
+
+  // While a preview is on its way, the editor opens empty and that preview fills it.
+  function editCondition() {
+    prefillOnPreview.current = !fresh && !err;
+    setConditionText(fresh ? (preview?.rule.condition ?? "") : "");
+  }
+
+  function closeConditionEditor() {
+    prefillOnPreview.current = false;
+    setConditionText(null);
+  }
 
   async function create() {
-    if (!ev.id) return;
+    if (!ev.id || !fresh) return;
     setBusy(true);
     try {
-      setCreated(
-        await createRule(
-          ev.id,
-          { verdict, scope, approver, pin_header: pinHeader || undefined },
-          preview?.needs_review ? reason : undefined,
-        ),
-      );
+      setCreated(await createRule(ev.id, request, preview?.needs_review ? reason : undefined));
       setErr(null);
     } catch (e) {
       setErr((e as Error).message || "create failed");
@@ -199,8 +231,9 @@ export function RuleBuilderModal({
                 <span className={labelClass}>Matching</span>
                 <select
                   value={scope}
+                  disabled={condition !== undefined}
                   onChange={(e) => setScope(e.target.value as RuleScope)}
-                  className={selectClass}
+                  className={selectClass + " disabled:opacity-60"}
                 >
                   {scopes.map((s) => (
                     <option key={s.value} value={s.value}>
@@ -214,8 +247,9 @@ export function RuleBuilderModal({
                   <span className={labelClass}>Only when header</span>
                   <select
                     value={pinHeader}
+                    disabled={condition !== undefined}
                     onChange={(e) => setPinHeader(e.target.value)}
-                    className={selectClass}
+                    className={selectClass + " disabled:opacity-60"}
                   >
                     <option value="">— any request —</option>
                     {pinnable.map((h) => (
@@ -254,9 +288,55 @@ export function RuleBuilderModal({
               )}
             </div>
 
+            {ev.endpoint && conditionText !== null && (
+              <div className="space-y-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <label htmlFor={conditionId} className={labelClass}>
+                    Condition (CEL)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={closeConditionEditor}
+                    className="text-2xs underline text-text-muted"
+                  >
+                    Use the generated condition
+                  </button>
+                </div>
+                <textarea
+                  id={conditionId}
+                  value={conditionText}
+                  onChange={(e) => {
+                    prefillOnPreview.current = false;
+                    setConditionText(e.target.value);
+                  }}
+                  rows={4}
+                  spellCheck={false}
+                  className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
+                />
+                <span className="block text-2xs text-text-subtle">
+                  {pinnable.length > 0
+                    ? "Replaces what Matching and Only when header generate; they apply again while it is empty."
+                    : "Replaces what Matching generates; it applies again while this is empty."}{" "}
+                  The rule keeps its endpoint{isAdmin ? "" : ", your profile and its credential"}.
+                  {fresh && condition && !preview?.rule.hand_written
+                    ? " This is the generated condition, so the generated rule is created."
+                    : ""}
+                </span>
+              </div>
+            )}
+            {ev.endpoint && conditionText === null && (
+              <button
+                type="button"
+                onClick={editCondition}
+                className="text-xs underline text-text-muted"
+              >
+                Edit the condition
+              </button>
+            )}
+
             {err && <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>}
             {preview && (
-              <div className="space-y-2">
+              <div className={"space-y-2" + (fresh ? "" : " opacity-60")}>
                 <p className="text-xs text-text">
                   Would have matched{" "}
                   <span className="font-bold">
@@ -279,11 +359,14 @@ export function RuleBuilderModal({
                 <pre className="border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text overflow-auto max-h-[22rem]">
                   {preview.rule.hcl}
                 </pre>
+
                 {preview.needs_review && (
                   <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
                     <p>
-                      This rule could let through requests your profile's other rules stop, so an
-                      admin reviews it first. They may approve it, narrow it or reject it.
+                      {preview.rule.hand_written
+                        ? "A condition written by hand runs on every request, so an admin reviews it first."
+                        : "This rule could let through requests your profile's other rules stop, so an admin reviews it first."}{" "}
+                      They may approve it, narrow it or reject it.
                     </p>
                     <label className="block space-y-1">
                       <span className="text-text-muted">Why do you need it? (optional)</span>
@@ -311,7 +394,7 @@ export function RuleBuilderModal({
             <Button variant="outline" onClick={onClose}>
               Cancel
             </Button>
-            <Button disabled={!preview?.writes_enabled || busy} onClick={create}>
+            <Button disabled={!fresh || !preview?.writes_enabled || busy} onClick={create}>
               {busy ? "Sending…" : preview?.needs_review ? "Send for review" : "Create rule"}
             </Button>
           </>
