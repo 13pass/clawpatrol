@@ -740,6 +740,18 @@ export function previewRule(actionID: string, req: RuleRequest) {
   return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
 }
 
+export function previewEndpointRule(endpoint: string, req: RuleRequest) {
+  return postJSON<RulePreviewResp>("/api/rules/preview", { endpoint, ...req });
+}
+
+export function createEndpointRule(endpoint: string, req: RuleRequest) {
+  return postJSON<RuleChangeResult>("/api/rules/create", { endpoint, ...req });
+}
+
+export function addEndpointDefaultRules(endpoint: string) {
+  return postJSON<RuleChangeResult>("/api/rules/endpoint-defaults", { endpoint });
+}
+
 export function createRule(actionID: string, req: RuleRequest, reason?: string) {
   return postJSON<RuleChangeResult>("/api/rules/create", {
     action_id: actionID,
@@ -796,6 +808,8 @@ export async function getMyRules(): Promise<{
   file: string;
   rules: MyRule[];
   unavailable?: string;
+  // default_rules: the defaults.new_endpoint_rule names, for an admin.
+  default_rules?: string[];
 }> {
   const r = await api("/api/my/rules");
   if (!r.ok) throw new Error(await r.text());

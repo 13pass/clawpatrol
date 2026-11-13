@@ -445,6 +445,48 @@ func approverListTokens(ref string) hclwrite.Tokens {
 	return append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")})
 }
 
+// GenerateEndpointRule is an admin's rule for an endpoint, with no
+// request to generate the condition from: the condition is the one
+// written, or none for a rule on every request.
+func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint string, req RuleRequest) (*ScopedRule, error) {
+	if policy == nil {
+		return nil, fmt.Errorf("policy not loaded")
+	}
+	switch req.Verdict {
+	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
+	default:
+		return nil, fmt.Errorf("verdict must be deny, allow or approve")
+	}
+	ep := policy.Endpoints[endpoint]
+	if ep == nil {
+		return nil, fmt.Errorf("no endpoint %q", endpoint)
+	}
+	req.Condition = strings.TrimSpace(req.Condition)
+	req.Scope, req.PinHeader = "", ""
+	rule := &ScopedRule{
+		RuleName:     scopedRuleName(nil, req, &Event{Endpoint: endpoint}, ep.Name),
+		Verdict:      req.Verdict,
+		EndpointName: ep.Name,
+		Family:       ep.Family,
+		Condition:    req.Condition,
+		HandWritten:  req.Condition != "",
+	}
+	if req.Condition != "" {
+		m, err := facet.NewMatcher(ep.Family, req.Condition)
+		if err != nil {
+			return nil, fmt.Errorf("condition: %w", err)
+		}
+		rule.matcher = m
+		if m.InspectsTruncatableFacet() {
+			rule.Warnings = append(rule.Warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
+		}
+	}
+	f := hclwrite.NewEmptyFile()
+	writeScopedRuleBlock(f.Body(), rule, endpointRef(ep), req, nil)
+	rule.HCL = string(f.Bytes())
+	return rule, nil
+}
+
 func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName string) string {
 	prefix := map[string]string{
 		ruleVerdictDeny:    "block",

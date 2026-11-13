@@ -1,6 +1,8 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
+  addEndpointDefaultRules,
   deleteMyRule,
+  getCredentialConfigOptions,
   getMyRules,
   getRules,
   setMyRuleDisabled,
@@ -8,7 +10,10 @@ import {
   type RuleSummary,
 } from "../lib/api";
 import { Button } from "./Button";
+import { EndpointRuleModal } from "./EndpointRuleModal";
 import { Tag, type Tone } from "./Tag";
+
+type Endpoint = { endpoint: string; family: string };
 
 export function RulesPanel({
   profile,
@@ -26,30 +31,60 @@ export function RulesPanel({
   const [unavailable, setUnavailable] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [info, setInfo] = useState("");
+  const [defaultRules, setDefaultRules] = useState<string[]>([]);
+  // endpoints are those an admin may add a rule to, with or without one.
+  const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
+  const [ruleFor, setRuleFor] = useState<Endpoint | null>(null);
   const loads = useRef(0);
 
-  function refresh() {
+  const refresh = useCallback(() => {
     const load = ++loads.current;
     const my = getMyRules().catch((e) => ({
       file: "",
       unavailable: `The rules you can change could not be loaded: ${e instanceof Error ? e.message : e}`,
+      default_rules: [],
     }));
-    return Promise.all([getRules(), my])
-      .then(([all, my]) => {
+    const options = isMember
+      ? Promise.resolve(null)
+      : getCredentialConfigOptions().catch(() => null);
+    return Promise.all([getRules(), my, options])
+      .then(([all, my, opts]) => {
         if (load !== loads.current) return;
         setRows(all ?? []);
         setMyFile(my.file);
         setUnavailable(my.unavailable ?? "");
+        setDefaultRules(my.default_rules ?? []);
+        let eps = opts?.endpoints ?? [];
+        if (profile && opts) {
+          const listed = opts.profiles.find((p) => p.name === profile)?.credentials ?? [];
+          const reached = new Set(listed.map((c) => opts.credentials[c]?.endpoint));
+          eps = eps.filter((e) => reached.has(e.name));
+        }
+        setEndpoints(eps.map((e) => ({ endpoint: e.name, family: e.family })));
         setErr(null);
       })
       .catch((e) => {
         if (load === loads.current) setErr(String(e instanceof Error ? e.message : e));
       });
-  }
+  }, [profile, isMember]);
 
   useEffect(() => {
     refresh();
-  }, [version]);
+  }, [refresh, version]);
+
+  async function addDefaults(endpoint: string, names: string[]) {
+    if (!window.confirm(`Add the rules ${names.join(", ")} to ${endpoint}?`)) return;
+    setInfo("");
+    setErr(null);
+    try {
+      const res = await addEndpointDefaultRules(endpoint);
+      setInfo(`Added ${(res.default_rules ?? []).join(", ")} to ${endpoint}.`);
+      onChanged?.();
+      await refresh();
+    } catch (e) {
+      setErr(String(e instanceof Error ? e.message : e));
+    }
+  }
 
   async function change(r: RuleSummary, kind: RuleChange) {
     let reason: string | undefined;
@@ -102,11 +137,26 @@ export function RulesPanel({
       <Section
         title="Rules"
         rows={visible}
+        endpoints={endpoints}
         myFile={myFile}
         isMember={isMember}
+        defaultRules={defaultRules}
         onChange={change}
+        onAddRule={setRuleFor}
+        onAddDefaults={addDefaults}
         allRulesLink={!!profile}
       />
+      {ruleFor && (
+        <EndpointRuleModal
+          endpoint={ruleFor.endpoint}
+          family={ruleFor.family}
+          onClose={() => setRuleFor(null)}
+          onCreated={() => {
+            onChanged?.();
+            refresh();
+          }}
+        />
+      )}
     </div>
   );
 }
@@ -114,21 +164,30 @@ export function RulesPanel({
 function Section({
   title,
   rows,
+  endpoints,
   myFile,
   isMember,
+  defaultRules,
   onChange,
+  onAddRule,
+  onAddDefaults,
   allRulesLink,
 }: {
   title: string;
   rows: RuleSummary[];
+  endpoints: Endpoint[];
   myFile: string;
   isMember: boolean;
+  defaultRules: string[];
   onChange: (r: RuleSummary, kind: RuleChange) => void;
+  onAddRule: (e: Endpoint) => void;
+  onAddDefaults: (endpoint: string, names: string[]) => void;
   allRulesLink: boolean;
 }) {
   // Highest priority first: the order rules are tried in.
   const groups = useMemo(() => {
     const m = new Map<string, { endpoint: string; family: string; rules: RuleSummary[] }>();
+    for (const e of endpoints) m.set(e.endpoint, { ...e, rules: [] });
     for (const r of rows) {
       const g = m.get(r.endpoint) ?? {
         endpoint: r.endpoint,
@@ -140,7 +199,8 @@ function Section({
     }
     for (const g of m.values()) g.rules.sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0));
     return Array.from(m.values()).sort((a, b) => a.endpoint.localeCompare(b.endpoint));
-  }, [rows]);
+  }, [rows, endpoints]);
+  const canAdd = !isMember && !!myFile;
 
   return (
     <div className="last:border-b-0">
@@ -170,7 +230,20 @@ function Section({
       ) : (
         <div className="flex flex-col">
           {groups.map((g) => (
-            <EndpointGroup key={g.endpoint} group={g} onChange={onChange} />
+            <EndpointGroup
+              key={g.endpoint}
+              group={g}
+              onChange={onChange}
+              missingDefaults={
+                canAdd && g.family === "http"
+                  ? defaultRules
+                      .map((d) => `${g.endpoint}-${d}`)
+                      .filter((name) => !g.rules.some((r) => r.name === name))
+                  : []
+              }
+              onAddRule={canAdd ? () => onAddRule(g) : undefined}
+              onAddDefaults={onAddDefaults}
+            />
           ))}
         </div>
       )}
@@ -181,9 +254,15 @@ function Section({
 function EndpointGroup({
   group,
   onChange,
+  missingDefaults,
+  onAddRule,
+  onAddDefaults,
 }: {
   group: { endpoint: string; family: string; rules: RuleSummary[] };
   onChange: (r: RuleSummary, kind: RuleChange) => void;
+  missingDefaults: string[];
+  onAddRule?: () => void;
+  onAddDefaults: (endpoint: string, names: string[]) => void;
 }) {
   return (
     <div className="border-b border-canvas-muted last:border-b-0">
@@ -194,6 +273,20 @@ function EndpointGroup({
         <span className="ml-auto text-2xs text-navy/70 tabular-nums">
           {group.rules.length} rule{group.rules.length === 1 ? "" : "s"}
         </span>
+        {missingDefaults.length > 0 && (
+          <Button
+            size="xs"
+            variant="outline"
+            onClick={() => onAddDefaults(group.endpoint, missingDefaults)}
+          >
+            Add default rules
+          </Button>
+        )}
+        {onAddRule && (
+          <Button size="xs" variant="outline" onClick={onAddRule}>
+            Add rule
+          </Button>
+        )}
       </div>
       {group.rules.map((r, i) => (
         <RuleRow key={`${r.name}/${i}`} rule={r} onChange={onChange} />
