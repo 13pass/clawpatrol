@@ -687,6 +687,8 @@ export type ScopedRule = {
   endpoint_name: string;
   family: string;
   condition?: string;
+  // hand_written: the condition was written by hand, not generated.
+  hand_written?: boolean;
   credential?: string;
   profile?: string;
   hcl: string;

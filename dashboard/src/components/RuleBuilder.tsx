@@ -128,6 +128,7 @@ export function RuleBuilderModal({
         })
         .catch((e: Error) => {
           if (ctl.cancelled) return;
+          prefillOnPreview.current = false;
           setPreviewed(null);
           setErr(e.message || "preview failed");
         });
@@ -138,10 +139,11 @@ export function RuleBuilderModal({
     };
   }, [ev.id, request, requestKey, created]);
 
-  // editCondition opens the editor on the generated condition. While
-  // the preview is behind, it opens empty and the next preview fills it.
+  // editCondition opens the editor on the generated condition. While a
+  // preview is on its way, it opens empty and that preview fills it,
+  // unless the user types first. After a failed preview it stays empty.
   function editCondition() {
-    prefillOnPreview.current = !fresh;
+    prefillOnPreview.current = !fresh && !err;
     setConditionText(fresh ? (preview?.rule.condition ?? "") : "");
   }
 
@@ -306,7 +308,10 @@ export function RuleBuilderModal({
                 <textarea
                   id={conditionId}
                   value={conditionText}
-                  onChange={(e) => setConditionText(e.target.value)}
+                  onChange={(e) => {
+                    prefillOnPreview.current = false;
+                    setConditionText(e.target.value);
+                  }}
                   rows={4}
                   spellCheck={false}
                   className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
@@ -316,6 +321,9 @@ export function RuleBuilderModal({
                     ? "Replaces what Matching and Only when header generate; they apply again while it is empty."
                     : "Replaces what Matching generates; it applies again while this is empty."}{" "}
                   The rule keeps its endpoint{isAdmin ? "" : ", your profile and its credential"}.
+                  {fresh && condition && !preview?.rule.hand_written
+                    ? " This is the generated condition, so the generated rule is created."
+                    : ""}
                 </span>
               </div>
             )}

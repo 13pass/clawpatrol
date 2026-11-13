@@ -394,7 +394,7 @@ func (w *webMux) apiRuleCreate(rw http.ResponseWriter, r *http.Request) {
 		}
 		w.fileRuleRequest(rw, ruleChangeRequest{
 			Username: v.username, Kind: ruleChangeCreate, RuleName: rule.RuleName, Profile: rule.Profile,
-			Summary: ruleCreateSummary(rule, asked.Scope, ev), HCL: rule.HCL, Reason: asked.Reason,
+			Summary: ruleCreateSummary(rule, ev), HCL: rule.HCL, Reason: asked.Reason,
 		}, map[string]any{"file": file})
 		return
 	}

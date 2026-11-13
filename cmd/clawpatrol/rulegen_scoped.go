@@ -15,6 +15,7 @@ import (
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 	"github.com/google/cel-go/cel"
 	celast "github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/operators"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -46,6 +47,9 @@ const (
 // dashboardApproverRef routes "require approval" to the dashboard when
 // the author has no approver of their own.
 const dashboardApproverRef = "builtin.dashboard"
+
+// memberConditionMaxBytes bounds a member's hand-written condition.
+const memberConditionMaxBytes = 4096
 
 // patternMinHexSegment is the shortest all-hex path segment the
 // pattern scope treats as an ID (commit SHAs, hex tokens).
@@ -104,6 +108,11 @@ type ScopedRule struct {
 
 	// credentialRef is Credential as a typed HCL reference.
 	credentialRef string
+	// scope is the scope the rule was generated for; empty for a
+	// hand-written condition.
+	scope string
+	// matcher is the compiled condition, when it was compiled already.
+	matcher match.Matcher
 }
 
 // GenerateScopedRule turns a recorded request into a rule. For a member
@@ -140,22 +149,26 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		return nil, fmt.Errorf("endpoint %q no longer in policy", ev.Endpoint)
 	}
 	condition, warnings, genErr := scopedRuleCondition(ep.Family, ev, req)
+	var matcher match.Matcher
 	if req.Condition != "" && genErr == nil && req.Condition == condition {
 		// Edited back to, or never changed from, the generated condition:
 		// it is the generated rule, under the generated rule's name.
 		req.Condition = ""
 	}
 	if req.Condition != "" {
-		if len(req.Condition) > ruleRequestTextMaxLen {
-			return nil, fmt.Errorf("the condition is longer than %d characters", ruleRequestTextMaxLen)
-		}
-		if author != nil && usesComprehension(req.Condition) {
-			return nil, fmt.Errorf("condition: all, exists, exists_one, map and filter are for admins only, as they run on every request")
-		}
 		m, err := facet.NewMatcher(ep.Family, req.Condition)
 		if err != nil {
 			return nil, fmt.Errorf("condition: %w", err)
 		}
+		if author != nil {
+			if len(req.Condition) > memberConditionMaxBytes {
+				return nil, fmt.Errorf("the condition is longer than %d bytes", memberConditionMaxBytes)
+			}
+			if err := checkMemberCondition(req.Condition); err != nil {
+				return nil, fmt.Errorf("condition: %w", err)
+			}
+		}
+		matcher = m
 		// The condition replaces what the scope and header pin generate,
 		// so neither is checked nor part of the name.
 		condition, warnings = req.Condition, nil
@@ -174,6 +187,8 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		Condition:    condition,
 		Warnings:     warnings,
 		HandWritten:  req.Condition != "",
+		scope:        req.Scope,
+		matcher:      matcher,
 	}
 	if author != nil {
 		rule.Profile = ev.Profile
@@ -222,6 +237,7 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 		EndpointName: endpointName,
 		Family:       "http",
 		NewEndpoint:  true,
+		scope:        req.Scope,
 	}
 	rule.ProfileAdditions = hostRuleProfiles(policy, ev, author)
 	if author != nil {
@@ -305,20 +321,71 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 
 var parseOnlyCELEnv = sync.OnceValues(func() (*cel.Env, error) { return cel.NewEnv() })
 
-// usesComprehension reports whether condition calls a macro that loops
-// (all, exists, exists_one, map, filter). A condition that does not
-// parse reports false: compiling it reports the error.
-func usesComprehension(condition string) bool {
+// checkMemberCondition holds a member's condition to what the generated
+// ones do. A loop inside another loop is refused: it runs on every
+// request, and its cost grows with the product of the lists. A header
+// is read only by a quoted name (`'X' in http.headers`,
+// `http.headers['X']`) that is not one IsSensitiveHeader masks, as the
+// header pin does. Text the plain parser cannot read is refused, so
+// syntax a facet adds cannot slip past either check.
+func checkMemberCondition(condition string) error {
 	env, err := parseOnlyCELEnv()
 	if err != nil {
-		return false
+		return err
 	}
 	parsed, iss := env.Parse(condition)
 	if iss.Err() != nil {
+		return fmt.Errorf("this condition uses syntax only admins can use: %w", iss.Err())
+	}
+	root := celast.NavigateAST(parsed.NativeRep())
+	for _, loop := range celast.MatchDescendants(root, celast.KindMatcher(celast.ComprehensionKind)) {
+		if len(celast.MatchDescendants(loop, celast.KindMatcher(celast.ComprehensionKind))) > 1 {
+			return fmt.Errorf("a loop (all, exists, exists_one, map, filter) inside another is for admins only, as it runs on every request")
+		}
+	}
+	for _, headers := range celast.MatchDescendants(root, isHTTPHeaders) {
+		name, ok := quotedHeaderName(headers)
+		if !ok {
+			return fmt.Errorf("read a header by its quoted name: 'X-Name' in http.headers && http.headers['X-Name']")
+		}
+		if runtime.IsSensitiveHeader(name) {
+			return fmt.Errorf("header %q may carry a credential and cannot be in a rule", name)
+		}
+	}
+	return nil
+}
+
+func isHTTPHeaders(e celast.NavigableExpr) bool {
+	if e.Kind() != celast.SelectKind || e.AsSelect().FieldName() != "headers" {
 		return false
 	}
-	loops := celast.MatchDescendants(celast.NavigateAST(parsed.NativeRep()), celast.KindMatcher(celast.ComprehensionKind))
-	return len(loops) > 0
+	operand := e.AsSelect().Operand()
+	return operand.Kind() == celast.IdentKind && operand.AsIdent() == "http"
+}
+
+// quotedHeaderName returns the string literal headers is indexed by or
+// tested for with `in`.
+func quotedHeaderName(headers celast.NavigableExpr) (string, bool) {
+	parent, ok := headers.Parent()
+	if !ok || parent.Kind() != celast.CallKind {
+		return "", false
+	}
+	call := parent.AsCall()
+	args := call.Args()
+	var key celast.Expr
+	switch {
+	case call.FunctionName() == operators.Index && len(args) == 2 && args[0].ID() == headers.ID():
+		key = args[1]
+	case call.FunctionName() == operators.In && len(args) == 2 && args[1].ID() == headers.ID():
+		key = args[0]
+	default:
+		return "", false
+	}
+	if key.Kind() != celast.LiteralKind {
+		return "", false
+	}
+	name, ok := key.AsLiteral().Value().(string)
+	return name, ok
 }
 
 func approverListTokens(ref string) hclwrite.Tokens {
@@ -491,8 +558,8 @@ type ruleReplay struct {
 }
 
 func newRuleReplay(rule *ScopedRule) (*ruleReplay, error) {
-	rp := &ruleReplay{rule: rule}
-	if rule.Condition != "" {
+	rp := &ruleReplay{rule: rule, matcher: rule.matcher}
+	if rp.matcher == nil && rule.Condition != "" {
 		m, err := facet.NewMatcher(rule.Family, rule.Condition)
 		if err != nil {
 			return nil, err

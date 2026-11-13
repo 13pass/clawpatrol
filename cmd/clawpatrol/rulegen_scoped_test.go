@@ -204,8 +204,17 @@ func TestScopedRuleRefusals(t *testing.T) {
 		{"condition does not compile", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method =="}},
 		{"condition unknown variable", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "k8s.verb == 'get'"}},
 		{"condition too long", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
-			Condition: "http.path == '" + strings.Repeat("a", ruleRequestTextMaxLen) + "'"}},
-		{"member condition loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "['/a', '/b'].exists(p, http.path == p)"}},
+			Condition: "http.path == '" + strings.Repeat("a", memberConditionMaxBytes) + "'"}},
+		{"member nested loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "['/a', '/b'].exists(p, ['x', 'y'].all(q, http.path != p + q))"}},
+		{"member chained loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "['/a', '/b'].map(p, p + '/').exists(p, http.path == p)"}},
+		{"member sensitive header", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "'Authorization' in http.headers && http.headers['Authorization'][0].startsWith('Bearer a')"}},
+		{"member header by a computed name", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.headers['Author' + 'ization'][0] == 'x'"}},
+		{"member header map walked", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.headers.exists(k, k.startsWith('Auth'))"}},
 	}
 	for _, tc := range cases {
 		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, &RuleAuthor{Username: "alice"}); err == nil {
@@ -321,9 +330,24 @@ func TestScopedRuleKeepsTemplateSequencesAndQuotedAndsLiteral(t *testing.T) {
 	}
 }
 
+func TestScopedRuleMemberEditsTheHeaderPin(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	author := &RuleAuthor{Username: "alice"}
+	req := RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeAnyMethod, PinHeader: "X-Uninfo-Caller"}
+	generated, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Condition = generated.Condition + " && http.method != 'GET'"
+	rule, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil || !rule.HandWritten {
+		t.Fatalf("editing the generated header pin = %+v, %v", rule, err)
+	}
+}
+
 func TestScopedRuleAdminConditionMayLoop(t *testing.T) {
 	_, cp := scopedRuleTestDir(t)
-	cond := "['/a', '/b'].exists(p, http.path == p)"
+	cond := "['/a', '/b'].exists(p, ['x', 'y'].all(q, http.path != p + q)) || 'Authorization' in http.headers"
 	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: cond}, nil)
 	if err != nil || rule.Condition != cond {
 		t.Fatalf("admin loop condition = %+v, %v", rule, err)
