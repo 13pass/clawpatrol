@@ -32,11 +32,14 @@ const CONDITION_VARIABLES: Record<string, string> = {
 export function EndpointRuleModal({
   endpoint,
   family,
+  profile,
   onClose,
   onCreated,
 }: {
   endpoint: string;
   family: string;
+  // profile is the device page's: the rule may be limited to it.
+  profile?: string;
   onClose: () => void;
   onCreated: () => void;
 }) {
@@ -44,6 +47,8 @@ export function EndpointRuleModal({
   const [approver, setApprover] = useState("");
   const [approvers, setApprovers] = useState<string[]>([]);
   const [condition, setCondition] = useState("");
+  const [onlyProfile, setOnlyProfile] = useState(!!profile);
+  const pinned = onlyProfile && profile ? profile : "";
   const [previewed, setPreviewed] = useState<{ key: string; resp: RulePreviewResp } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
@@ -60,7 +65,7 @@ export function EndpointRuleModal({
     () => ({ verdict, scope: "exact", approver, condition: condition.trim() || undefined }),
     [verdict, approver, condition],
   );
-  const requestKey = JSON.stringify(request);
+  const requestKey = JSON.stringify({ ...request, pinned });
   const preview = previewed?.resp ?? null;
   const fresh = previewed?.key === requestKey;
 
@@ -69,7 +74,7 @@ export function EndpointRuleModal({
     // An object, not a let: the linter forbids reassigning a local after render.
     const ctl = { cancelled: false };
     const t = setTimeout(() => {
-      previewEndpointRule(endpoint, request)
+      previewEndpointRule(endpoint, pinned, request)
         .then((p) => {
           if (ctl.cancelled) return;
           setPreviewed({ key: requestKey, resp: p });
@@ -85,13 +90,13 @@ export function EndpointRuleModal({
       ctl.cancelled = true;
       clearTimeout(t);
     };
-  }, [endpoint, request, requestKey, created]);
+  }, [endpoint, pinned, request, requestKey, created]);
 
   async function create() {
     if (!fresh) return;
     setBusy(true);
     try {
-      setCreated(await createEndpointRule(endpoint, request));
+      setCreated(await createEndpointRule(endpoint, pinned, request));
       setErr(null);
       onCreated();
     } catch (e) {
@@ -155,6 +160,21 @@ export function EndpointRuleModal({
                   ))}
                 </select>
               </label>
+            )}
+
+            {profile ? (
+              <label className="flex items-center gap-2 text-xs">
+                <input
+                  type="checkbox"
+                  checked={onlyProfile}
+                  onChange={(e) => setOnlyProfile(e.target.checked)}
+                />
+                Only profile <code>{profile}</code>; unticked, every profile reaching {endpoint}
+              </label>
+            ) : (
+              <p className="text-xs text-text-muted">
+                It applies to every profile reaching {endpoint}.
+              </p>
             )}
 
             <div className="space-y-1">

@@ -169,9 +169,9 @@ func generateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		req.Condition = ""
 	}
 	if req.Condition != "" {
-		m, err := facet.NewMatcher(ep.Family, req.Condition)
+		m, bodyWarnings, err := handWrittenMatcher(ep.Family, req.Condition)
 		if err != nil {
-			return nil, fmt.Errorf("condition: %w", err)
+			return nil, err
 		}
 		if author != nil {
 			if len(req.Condition) > memberConditionMaxBytes {
@@ -184,10 +184,7 @@ func generateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		matcher = m
 		// The condition replaces what the scope and header pin generate,
 		// so neither is checked nor part of the name.
-		condition, warnings = req.Condition, nil
-		if m.InspectsTruncatableFacet() {
-			warnings = append(warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
-		}
+		condition, warnings = req.Condition, bodyWarnings
 		req.Scope, req.PinHeader = "", ""
 	} else if genErr != nil {
 		return nil, genErr
@@ -445,10 +442,23 @@ func approverListTokens(ref string) hclwrite.Tokens {
 	return append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")})
 }
 
+func handWrittenMatcher(family, condition string) (match.Matcher, []string, error) {
+	m, err := facet.NewMatcher(family, condition)
+	if err != nil {
+		return nil, nil, fmt.Errorf("condition: %w", err)
+	}
+	var warnings []string
+	if m.InspectsTruncatableFacet() {
+		warnings = append(warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
+	}
+	return m, warnings, nil
+}
+
 // GenerateEndpointRule is an admin's rule for an endpoint, with no
 // request to generate the condition from: the condition is the one
-// written, or none for a rule on every request.
-func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint string, req RuleRequest) (*ScopedRule, error) {
+// written, or none for a rule on every request. A profile, when set,
+// limits it to that profile.
+func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint, profile string, req RuleRequest) (*ScopedRule, error) {
 	if policy == nil {
 		return nil, fmt.Errorf("policy not loaded")
 	}
@@ -461,25 +471,30 @@ func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint string, req Ru
 	if ep == nil {
 		return nil, fmt.Errorf("no endpoint %q", endpoint)
 	}
+	if profile != "" && (policy.Profiles[profile] == nil || policy.Profiles[profile].Endpoints[endpoint] == nil) {
+		return nil, fmt.Errorf("profile %q does not reach endpoint %q", profile, endpoint)
+	}
 	req.Condition = strings.TrimSpace(req.Condition)
 	req.Scope, req.PinHeader = "", ""
+	sum := sha256.Sum256([]byte(strings.Join([]string{endpoint, profile, req.Verdict, req.Approver, req.Condition}, "\x00")))
 	rule := &ScopedRule{
-		RuleName:     scopedRuleName(nil, req, &Event{Endpoint: endpoint}, ep.Name),
+		RuleName:     fmt.Sprintf("%s_%s_%x", ruleNamePrefix(req.Verdict), safeRuleNamePart(ep.Name), sum[:3]),
 		Verdict:      req.Verdict,
 		EndpointName: ep.Name,
 		Family:       ep.Family,
 		Condition:    req.Condition,
+		Profile:      profile,
 		HandWritten:  req.Condition != "",
 	}
 	if req.Condition != "" {
-		m, err := facet.NewMatcher(ep.Family, req.Condition)
+		m, warnings, err := handWrittenMatcher(ep.Family, req.Condition)
 		if err != nil {
-			return nil, fmt.Errorf("condition: %w", err)
+			return nil, err
 		}
-		rule.matcher = m
-		if m.InspectsTruncatableFacet() {
-			rule.Warnings = append(rule.Warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
-		}
+		rule.matcher, rule.Warnings = m, warnings
+	}
+	if req.Verdict == ruleVerdictAllow {
+		rule.Warnings = append(rule.Warnings, fmt.Sprintf("A pre-approval at priority %d is tried before the endpoint's rules of lower priority, deny rules included: the requests it matches skip them.", adminGuardrailPriority))
 	}
 	f := hclwrite.NewEmptyFile()
 	writeScopedRuleBlock(f.Body(), rule, endpointRef(ep), req, nil)
@@ -487,12 +502,16 @@ func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint string, req Ru
 	return rule, nil
 }
 
-func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName string) string {
-	prefix := map[string]string{
+func ruleNamePrefix(verdict string) string {
+	return map[string]string{
 		ruleVerdictDeny:    "block",
 		ruleVerdictAllow:   "allow",
 		ruleVerdictApprove: "approve",
-	}[req.Verdict]
+	}[verdict]
+}
+
+func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName string) string {
+	prefix := ruleNamePrefix(req.Verdict)
 	fields := []string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader}
 	if req.Condition != "" {
 		// Only then: a generated rule keeps the name it always had.

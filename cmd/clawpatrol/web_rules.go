@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -201,8 +202,9 @@ func (w *webMux) apiMyActions(rw http.ResponseWriter, r *http.Request) {
 type ruleRequestBody struct {
 	ActionID string `json:"action_id"`
 	// Endpoint, in place of ActionID, is an admin's rule for an endpoint
-	// with no request to start from.
+	// with no request to start from, limited to Profile when set.
 	Endpoint string `json:"endpoint,omitempty"`
+	Profile  string `json:"profile,omitempty"`
 	RuleRequest
 	// Reason tells the admins why a member asks for a rule that waits
 	// for review.
@@ -274,6 +276,43 @@ func (w *webMux) newHostConfig() (newHostConfig, error) {
 	return c, nil
 }
 
+type ruleEndpoint struct {
+	Name     string   `json:"name"`
+	Family   string   `json:"family"`
+	Profiles []string `json:"profiles"`
+	// MissingDefaults are the defaults.new_endpoint_rule rules an https
+	// endpoint lacks, by the name it would get.
+	MissingDefaults []string `json:"missing_defaults"`
+}
+
+// ruleEndpoints lists every endpoint an admin may add a rule to, with
+// the profiles reaching it.
+func (w *webMux) ruleEndpoints() []ruleEndpoint {
+	gw, policy := w.g.cfg.Load(), w.g.Policy()
+	out := []ruleEndpoint{}
+	if gw == nil || gw.Policy == nil || policy == nil {
+		return out
+	}
+	for _, name := range slices.Sorted(maps.Keys(policy.Endpoints)) {
+		ep := policy.Endpoints[name]
+		e := ruleEndpoint{Name: name, Family: ep.Family, Profiles: []string{}, MissingDefaults: []string{}}
+		for _, p := range slices.Sorted(maps.Keys(policy.Profiles)) {
+			if policy.Profiles[p].Endpoints[name] != nil {
+				e.Profiles = append(e.Profiles, p)
+			}
+		}
+		if ent := gw.Policy.Endpoints[name]; ent != nil && ent.Symbol != nil && ent.Symbol.Type == newEndpointType && gw.Defaults != nil {
+			for _, def := range gw.Defaults.NewEndpointRules {
+				if rule := newEndpointRuleName(name, def.Name); gw.Policy.Rules[rule] == nil {
+					e.MissingDefaults = append(e.MissingDefaults, rule)
+				}
+			}
+		}
+		out = append(out, e)
+	}
+	return out
+}
+
 func (w *webMux) endpointRuleFor(rw http.ResponseWriter, v viewer, body ruleRequestBody) (viewer, *Event, *ScopedRule, bool) {
 	if !v.admin {
 		http.Error(rw, "only an admin writes a rule for an endpoint; create yours from one of your requests", http.StatusForbidden)
@@ -283,7 +322,7 @@ func (w *webMux) endpointRuleFor(rw http.ResponseWriter, v viewer, body ruleRequ
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return viewer{}, nil, nil, false
 	}
-	rule, err := GenerateEndpointRule(w.g.Policy(), body.Endpoint, body.RuleRequest)
+	rule, err := GenerateEndpointRule(w.g.Policy(), body.Endpoint, body.Profile, body.RuleRequest)
 	if err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
 		return viewer{}, nil, nil, false
@@ -586,7 +625,7 @@ type myRule struct {
 }
 
 // apiMyRules lists the rules declared in the caller's rules file, and
-// for an admin the names of the defaults.new_endpoint_rule blocks.
+// for an admin the endpoints a rule can be added to.
 func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(rw, "GET", http.StatusMethodNotAllowed)
@@ -626,13 +665,7 @@ func (w *webMux) apiMyRules(rw http.ResponseWriter, r *http.Request) {
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	resp := map[string]any{"file": file, "rules": out}
 	if v.admin {
-		labels := []string{}
-		if gw := w.g.cfg.Load(); gw != nil && gw.Defaults != nil {
-			for _, def := range gw.Defaults.NewEndpointRules {
-				labels = append(labels, def.Name)
-			}
-		}
-		resp["default_rules"] = labels
+		resp["endpoints"] = w.ruleEndpoints()
 	}
 	writeJSON(rw, resp)
 }

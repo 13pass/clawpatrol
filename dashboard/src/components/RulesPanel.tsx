@@ -2,18 +2,18 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   addEndpointDefaultRules,
   deleteMyRule,
-  getCredentialConfigOptions,
   getMyRules,
   getRules,
   setMyRuleDisabled,
   type RuleChange,
+  type RuleEndpoint,
   type RuleSummary,
 } from "../lib/api";
 import { Button } from "./Button";
 import { EndpointRuleModal } from "./EndpointRuleModal";
 import { Tag, type Tone } from "./Tag";
 
-type Endpoint = { endpoint: string; family: string };
+type Endpoint = { endpoint: string; family: string; missingDefaults: string[] };
 
 export function RulesPanel({
   profile,
@@ -31,7 +31,6 @@ export function RulesPanel({
   const [unavailable, setUnavailable] = useState("");
   const [err, setErr] = useState<string | null>(null);
   const [info, setInfo] = useState("");
-  const [defaultRules, setDefaultRules] = useState<string[]>([]);
   // endpoints are those an admin may add a rule to, with or without one.
   const [endpoints, setEndpoints] = useState<Endpoint[]>([]);
   const [ruleFor, setRuleFor] = useState<Endpoint | null>(null);
@@ -42,31 +41,29 @@ export function RulesPanel({
     const my = getMyRules().catch((e) => ({
       file: "",
       unavailable: `The rules you can change could not be loaded: ${e instanceof Error ? e.message : e}`,
-      default_rules: [],
+      endpoints: [] as RuleEndpoint[],
     }));
-    const options = isMember
-      ? Promise.resolve(null)
-      : getCredentialConfigOptions().catch(() => null);
-    return Promise.all([getRules(), my, options])
-      .then(([all, my, opts]) => {
+    return Promise.all([getRules(), my])
+      .then(([all, my]) => {
         if (load !== loads.current) return;
         setRows(all ?? []);
         setMyFile(my.file);
         setUnavailable(my.unavailable ?? "");
-        setDefaultRules(my.default_rules ?? []);
-        let eps = opts?.endpoints ?? [];
-        if (profile && opts) {
-          const listed = opts.profiles.find((p) => p.name === profile)?.credentials ?? [];
-          const reached = new Set(listed.map((c) => opts.credentials[c]?.endpoint));
-          eps = eps.filter((e) => reached.has(e.name));
-        }
-        setEndpoints(eps.map((e) => ({ endpoint: e.name, family: e.family })));
+        setEndpoints(
+          (my.endpoints ?? [])
+            .filter((e) => !profile || e.profiles.includes(profile))
+            .map((e) => ({
+              endpoint: e.name,
+              family: e.family,
+              missingDefaults: e.missing_defaults,
+            })),
+        );
         setErr(null);
       })
       .catch((e) => {
         if (load === loads.current) setErr(String(e instanceof Error ? e.message : e));
       });
-  }, [profile, isMember]);
+  }, [profile]);
 
   useEffect(() => {
     refresh();
@@ -140,7 +137,6 @@ export function RulesPanel({
         endpoints={endpoints}
         myFile={myFile}
         isMember={isMember}
-        defaultRules={defaultRules}
         onChange={change}
         onAddRule={setRuleFor}
         onAddDefaults={addDefaults}
@@ -150,6 +146,7 @@ export function RulesPanel({
         <EndpointRuleModal
           endpoint={ruleFor.endpoint}
           family={ruleFor.family}
+          profile={profile}
           onClose={() => setRuleFor(null)}
           onCreated={() => {
             onChanged?.();
@@ -167,7 +164,6 @@ function Section({
   endpoints,
   myFile,
   isMember,
-  defaultRules,
   onChange,
   onAddRule,
   onAddDefaults,
@@ -178,7 +174,6 @@ function Section({
   endpoints: Endpoint[];
   myFile: string;
   isMember: boolean;
-  defaultRules: string[];
   onChange: (r: RuleSummary, kind: RuleChange) => void;
   onAddRule: (e: Endpoint) => void;
   onAddDefaults: (endpoint: string, names: string[]) => void;
@@ -186,12 +181,13 @@ function Section({
 }) {
   // Highest priority first: the order rules are tried in.
   const groups = useMemo(() => {
-    const m = new Map<string, { endpoint: string; family: string; rules: RuleSummary[] }>();
+    const m = new Map<string, Endpoint & { rules: RuleSummary[] }>();
     for (const e of endpoints) m.set(e.endpoint, { ...e, rules: [] });
     for (const r of rows) {
       const g = m.get(r.endpoint) ?? {
         endpoint: r.endpoint,
         family: r.family,
+        missingDefaults: [],
         rules: [],
       };
       g.rules.push(r);
@@ -234,13 +230,7 @@ function Section({
               key={g.endpoint}
               group={g}
               onChange={onChange}
-              missingDefaults={
-                canAdd && g.family === "http"
-                  ? defaultRules
-                      .map((d) => `${g.endpoint}-${d}`)
-                      .filter((name) => !g.rules.some((r) => r.name === name))
-                  : []
-              }
+              missingDefaults={canAdd ? g.missingDefaults : []}
               onAddRule={canAdd ? () => onAddRule(g) : undefined}
               onAddDefaults={onAddDefaults}
             />

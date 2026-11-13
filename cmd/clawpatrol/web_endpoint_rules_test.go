@@ -72,8 +72,8 @@ func TestAdminAddsTheDefaultRulesToAnEndpoint(t *testing.T) {
 		t.Fatal(err)
 	}
 	rw := serveAs(t, env.h, env.root, http.MethodGet, "/api/my/rules", "")
-	if !strings.Contains(rw.Body.String(), `"default_rules":["no-delete","writes"]`) {
-		t.Errorf("/api/my/rules = %s, want the default rule names", rw.Body.String())
+	if !strings.Contains(rw.Body.String(), `{"name":"gitlab","family":"http","profiles":["team-a","team-b"],"missing_defaults":["gitlab-no-delete","gitlab-writes"]}`) {
+		t.Errorf("/api/my/rules = %s, want gitlab with its profiles and missing defaults", rw.Body.String())
 	}
 	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/endpoint-defaults", `{"endpoint":"gitlab"}`); rw.Code != http.StatusForbidden {
 		t.Errorf("member = %d, want 403", rw.Code)
@@ -89,7 +89,50 @@ func TestAdminAddsTheDefaultRulesToAnEndpoint(t *testing.T) {
 	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/endpoint-defaults", `{"endpoint":"gitlab"}`); rw.Code != http.StatusConflict {
 		t.Errorf("a second time = %d, want 409", rw.Code)
 	}
+	if rw := serveAs(t, env.h, env.root, http.MethodGet, "/api/my/rules", ""); !strings.Contains(rw.Body.String(), `"name":"gitlab","family":"http","profiles":["team-a","team-b"],"missing_defaults":[]`) {
+		t.Errorf("/api/my/rules = %s, want gitlab missing nothing", rw.Body.String())
+	}
 	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/endpoint-defaults", `{"endpoint":"nope"}`); rw.Code != http.StatusNotFound {
 		t.Errorf("unknown endpoint = %d, want 404", rw.Code)
+	}
+}
+
+func TestEndpointRuleForAProfile(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create", `{"endpoint":"sentry","profile":"team-a","verdict":"deny"}`)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("create = %d %s", rw.Code, rw.Body.String())
+	}
+	if got := strings.Join(strings.Fields(readCfgFile(t, env.w, dashboardConfigFile)), " "); !strings.Contains(got, "profile = profile.team-a") {
+		t.Errorf("%s = %q, want the profile pin", dashboardConfigFile, got)
+	}
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create", `{"endpoint":"sentry","profile":"team-b","verdict":"deny"}`); rw.Code != http.StatusBadRequest {
+		t.Errorf("a profile that does not reach the endpoint = %d, want 400", rw.Code)
+	}
+}
+
+func TestEndpointRulesDifferingByApproverHaveDifferentNames(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	a, err := GenerateEndpointRule(cp, "gitlab", "", RuleRequest{Verdict: ruleVerdictApprove, Approver: "x"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	b, err := GenerateEndpointRule(cp, "gitlab", "", RuleRequest{Verdict: ruleVerdictApprove, Approver: "y"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a.RuleName == b.RuleName {
+		t.Errorf("both rules are named %q", a.RuleName)
+	}
+}
+
+func TestEndpointPreApprovalWarnsItSkipsDenies(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	rule, err := GenerateEndpointRule(cp, "gitlab", "", RuleRequest{Verdict: ruleVerdictAllow})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.Warnings) == 0 || !strings.Contains(rule.Warnings[0], "deny rules included") {
+		t.Errorf("warnings = %q", rule.Warnings)
 	}
 }
