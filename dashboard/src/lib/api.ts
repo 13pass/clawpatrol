@@ -181,6 +181,8 @@ export type CredentialConfigOptions = {
     string,
     CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
   >;
+  // new_endpoint_rules: suffixes of the new endpoint's name.
+  new_endpoint_rules: string[];
 };
 
 export type CredentialConfigChange = {

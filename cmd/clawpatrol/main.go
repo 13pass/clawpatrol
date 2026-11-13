@@ -204,16 +204,30 @@ func newReqID() string {
 // through config's package-global PluginLoader, installed once at
 // process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
-	gw, diags := config.Load(path)
-	return compileLoadedConfig(gw, diags)
+	return loadConfigOverlay(path, nil)
 }
 
 // loadConfigOverlay is loadConfig for a config directory with some
 // files' contents replaced in memory (nil removes a file). Used to
-// validate a candidate change before writing it.
-func loadConfigOverlay(dir string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
-	gw, diags := config.LoadDirOverlay(dir, overrides)
-	return compileLoadedConfig(gw, diags)
+// validate a candidate change before writing it. The files are read
+// once; defaults.new_endpoint_rule is checked against that copy.
+func loadConfigOverlay(path string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	sources, diags := config.ReadSources(path, overrides)
+	if diags.HasErrors() {
+		return nil, nil, fmt.Errorf("%s", diags.Error())
+	}
+	gw, cp, err := compileConfigSources(path, sources)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkNewEndpointRules(path, sources, gw); err != nil {
+		return nil, nil, err
+	}
+	return gw, cp, nil
+}
+
+func compileConfigSources(path string, sources map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	return compileLoadedConfig(config.LoadSources(path, sources))
 }
 
 func compileLoadedConfig(gw *config.Gateway, diags hcl.Diagnostics) (*config.Gateway, *config.CompiledPolicy, error) {

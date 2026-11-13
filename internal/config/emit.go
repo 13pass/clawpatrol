@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"sort"
 	"strings"
 	"sync"
@@ -141,6 +142,11 @@ func TraversalTokens(s string) hclwrite.Tokens {
 // objects, family-specific endpoint fields all live next to the
 // schema they correspond to.
 func Emit(gw *Gateway) ([]byte, error) {
+	if gw.Defaults != nil && len(gw.Defaults.NewEndpointRules) > 0 {
+		// Their bodies are kept undecoded, so there is nothing to emit
+		// them from; dropping them would leave dashboard hosts open.
+		return nil, errors.New("emit: defaults.new_endpoint_rule blocks cannot be emitted")
+	}
 	f := hclwrite.NewEmptyFile()
 	body := f.Body()
 

@@ -112,8 +112,10 @@ type Gateway struct {
 	Settings *GatewaySettings `hcl:"gateway,block"`
 
 	// Defaults holds the optional `defaults { ... }` block with the
-	// policy defaults (unknown_host, unknown_peer, relay_*, llm_*, human_*). nil when the
-	// block is absent — every field has a built-in default.
+	// policy defaults (unknown_host, unknown_peer, relay_*, llm_*,
+	// human_*, and the new_endpoint_rule blocks the dashboard writes for
+	// each host it declares). nil when the block is absent — every field
+	// has a built-in default.
 	Defaults *Defaults `hcl:"defaults,block"`
 
 	// Plugins lists every `plugin "<name>" { source = "..." }` block
@@ -625,6 +627,22 @@ type Defaults struct {
 	// HumanOnTimeout is the default outcome when a human approver
 	// does not answer before timeout. "deny" or "allow".
 	HumanOnTimeout string `hcl:"human_on_timeout,optional"`
+
+	// NewEndpointRules are the rules the dashboard writes for every
+	// https endpoint it declares, in the same change as the endpoint,
+	// so a host added from a device's Credentials panel is never
+	// served without them. Each one becomes `rule "<endpoint>-<name>"`
+	// with `endpoint` set to the new endpoint and this block's body
+	// copied as written. The gateway checks them against a probe
+	// endpoint whenever it loads the config.
+	NewEndpointRules []NewEndpointRule `hcl:"new_endpoint_rule,block"`
+}
+
+// NewEndpointRule is a `new_endpoint_rule "<name>" { ... }` block: the
+// body of a rule, without its endpoint.
+type NewEndpointRule struct {
+	Name string   `hcl:"name,label"`
+	Body hcl.Body `hcl:",remain"`
 }
 
 // IsWireGuardEnabled reports whether the operator declared a
@@ -1191,6 +1209,65 @@ func IsDirConfigFileName(name string) bool {
 // is LoadDir's, so a candidate change can be validated in place
 // before it is written.
 func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	sources, diags := ReadDirSources(dir, overrides)
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	return LoadDirSources(dir, sources)
+}
+
+// ReadSources reads the config at path, keyed by file name, for
+// LoadSources: the single file, or a directory's files with overrides
+// applied as for LoadDirOverlay. A single file takes no overrides.
+func ReadSources(path string, overrides map[string][]byte) (map[string][]byte, hcl.Diagnostics) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Cannot read config path",
+			Detail:   err.Error(),
+		}}
+	}
+	if info.IsDir() {
+		return ReadDirSources(path, overrides)
+	}
+	if len(overrides) > 0 {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Overrides need a config directory",
+			Detail:   fmt.Sprintf("%q is a single file; only a config directory takes replaced files.", path),
+		}}
+	}
+	src, err := os.ReadFile(path)
+	if err != nil {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Cannot read config file",
+			Detail:   err.Error(),
+		}}
+	}
+	return map[string][]byte{filepath.Base(path): src}, nil
+}
+
+// LoadSources loads the config at path from ReadSources' result.
+func LoadSources(path string, sources map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	if info, err := os.Stat(path); err == nil && info.IsDir() {
+		return LoadDirSources(path, sources)
+	}
+	src, ok := sources[filepath.Base(path)]
+	if !ok || len(sources) != 1 {
+		return nil, hcl.Diagnostics{{
+			Severity: hcl.DiagError,
+			Summary:  "Config sources do not match the path",
+			Detail:   fmt.Sprintf("%q is a single file, so the sources must hold exactly %q.", path, filepath.Base(path)),
+		}}
+	}
+	return LoadBytes(src, path)
+}
+
+// ReadDirSources reads the files LoadDirOverlay would load, keyed by
+// file name. Every file that cannot be read is reported.
+func ReadDirSources(dir string, overrides map[string][]byte) (map[string][]byte, hcl.Diagnostics) {
 	onDisk, err := DirFileNames(dir)
 	if err != nil {
 		return nil, hcl.Diagnostics{{
@@ -1213,11 +1290,46 @@ func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diag
 		}
 		present[n] = src != nil
 	}
-	var names []string
+	sources := map[string][]byte{}
+	var diags hcl.Diagnostics
 	for n, ok := range present {
-		if ok {
-			names = append(names, n)
+		if !ok {
+			continue
 		}
+		src, overridden := overrides[n]
+		if !overridden {
+			path := filepath.Join(dir, n)
+			if src, err = os.ReadFile(path); err != nil {
+				diags = append(diags, &hcl.Diagnostic{
+					Severity: hcl.DiagError,
+					Summary:  "Cannot read config file",
+					Detail:   fmt.Sprintf("%s: %v", path, err),
+				})
+				continue
+			}
+		}
+		sources[n] = src
+	}
+	if diags.HasErrors() {
+		return nil, diags
+	}
+	return sources, nil
+}
+
+// LoadDirSources loads a config directory from file contents already
+// read, keyed by file name: exactly those files, nothing from disk.
+// dir anchors relative paths, as for LoadDir.
+func LoadDirSources(dir string, sources map[string][]byte) (*Gateway, hcl.Diagnostics) {
+	names := make([]string, 0, len(sources))
+	for n := range sources {
+		if !IsDirConfigFileName(n) {
+			return nil, hcl.Diagnostics{{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid config file name",
+				Detail:   fmt.Sprintf("%q is not a `*.hcl` file name the directory loader reads.", n),
+			}}
+		}
+		names = append(names, n)
 	}
 	sort.Strings(names)
 	if len(names) == 0 {
@@ -1232,20 +1344,7 @@ func LoadDirOverlay(dir string, overrides map[string][]byte) (*Gateway, hcl.Diag
 	var diags hcl.Diagnostics
 	files := make([]*hcl.File, 0, len(names))
 	for _, name := range names {
-		path := filepath.Join(dir, name)
-		src, overridden := overrides[name]
-		if !overridden {
-			src, err = os.ReadFile(path)
-			if err != nil {
-				diags = append(diags, &hcl.Diagnostic{
-					Severity: hcl.DiagError,
-					Summary:  "Cannot read config file",
-					Detail:   fmt.Sprintf("%s: %v", path, err),
-				})
-				continue
-			}
-		}
-		file, parseDiags := parser.ParseHCL(src, path)
+		file, parseDiags := parser.ParseHCL(sources[name], filepath.Join(dir, name))
 		diags = append(diags, parseDiags...)
 		if file != nil {
 			files = append(files, file)
@@ -1318,6 +1417,7 @@ func loadFiles(files []*hcl.File, configDir string, diags hcl.Diagnostics) (*Gat
 	}
 
 	diags = append(diags, validateOperational(gw)...)
+	diags = append(diags, validateNewEndpointRules(gw.Defaults)...)
 
 	// Pass 1: extract the policy blocks from the remainder body. With
 	// a merged body, gw.Remain is itself a merged body whose Content
@@ -1396,6 +1496,42 @@ func dedupGohclDiags(in hcl.Diagnostics) hcl.Diagnostics {
 // fields that gohcl can't express in a struct tag. Catches the typical
 // shapes that boot a gateway in a degraded state (silent fallback to
 // plain TCP, missing WireGuard endpoint, dashboard-with-no-auth).
+// newEndpointRuleLabelRe is what a new_endpoint_rule label may hold:
+// it ends a rule name, after "<endpoint>-".
+var newEndpointRuleLabelRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$`)
+
+// validateNewEndpointRules checks what the load alone can: each label
+// is a name and is used once. The rule bodies are checked by the
+// gateway, which declares a probe endpoint with them.
+func validateNewEndpointRules(d *Defaults) hcl.Diagnostics {
+	if d == nil {
+		return nil
+	}
+	var diags hcl.Diagnostics
+	seen := map[string]bool{}
+	for _, r := range d.NewEndpointRules {
+		subject := r.Body.MissingItemRange()
+		switch {
+		case !newEndpointRuleLabelRe.MatchString(r.Name):
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Invalid new_endpoint_rule name",
+				Detail:   fmt.Sprintf("%q must start with a letter or digit and hold only letters, digits, `_` and `-` (at most 64): it ends the name of every rule it adds.", r.Name),
+				Subject:  &subject,
+			})
+		case seen[r.Name]:
+			diags = append(diags, &hcl.Diagnostic{
+				Severity: hcl.DiagError,
+				Summary:  "Duplicate new_endpoint_rule name",
+				Detail:   fmt.Sprintf("defaults declares new_endpoint_rule %q more than once.", r.Name),
+				Subject:  &subject,
+			})
+		}
+		seen[r.Name] = true
+	}
+	return diags
+}
+
 func validateOperational(gw *Gateway) hcl.Diagnostics {
 	var diags hcl.Diagnostics
 

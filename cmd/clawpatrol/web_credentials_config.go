@@ -2,10 +2,12 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"path/filepath"
@@ -13,6 +15,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
@@ -98,13 +101,14 @@ func loadConfigTree(cfgPath string) (*configTree, error) {
 	if err != nil {
 		return nil, err
 	}
-	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
+	paths := &configTree{cfgPath: cfgPath}
+	sources := map[string][]byte{}
 	for _, info := range infos {
-		if err := t.add(info.Name); err != nil {
+		if sources[info.Name], err = readConfigFileOrEmpty(paths.path(info.Name)); err != nil {
 			return nil, err
 		}
 	}
-	return t, nil
+	return newConfigTree(cfgPath, sources)
 }
 
 func (t *configTree) path(name string) string {
@@ -114,11 +118,25 @@ func (t *configTree) path(name string) string {
 	return t.cfgPath
 }
 
+func newConfigTree(cfgPath string, sources map[string][]byte) (*configTree, error) {
+	t := &configTree{cfgPath: cfgPath, files: map[string]*hclwrite.File{}, orig: map[string][]byte{}, ro: map[string]bool{}}
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		if err := t.addContent(name, sources[name]); err != nil {
+			return nil, err
+		}
+	}
+	return t, nil
+}
+
 func (t *configTree) add(name string) error {
 	content, err := readConfigFileOrEmpty(t.path(name))
 	if err != nil {
 		return err
 	}
+	return t.addContent(name, content)
+}
+
+func (t *configTree) addContent(name string, content []byte) error {
 	f, diags := hclwrite.ParseConfig(content, name, hcl.InitialPos)
 	if diags.HasErrors() {
 		return errors.New(diags.Error())
@@ -485,8 +503,9 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 		if err != nil {
 			return nil, err
 		}
-		blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
-		blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
+		if err := t.declareEndpoint(gw, f, name, host); err != nil {
+			return nil, err
+		}
 		return entityRef(newEndpointType, name), nil
 	}
 	if req.Endpoint == nil {
@@ -500,6 +519,155 @@ func (t *configTree) credentialEndpointRef(gw *config.Gateway, typ credentialTyp
 		return nil, fmt.Errorf("%w: a %s credential cannot bind the %s endpoint %q", errBadCredentialRequest, typ.Type, ent.Symbol.Type, *req.Endpoint)
 	}
 	return entityRef(ent.Symbol.Type, *req.Endpoint), nil
+}
+
+// declareEndpoint appends an https endpoint for host to f, then a rule
+// for each defaults.new_endpoint_rule, so the endpoint never loads
+// without them.
+func (t *configTree) declareEndpoint(gw *config.Gateway, f *hclwrite.File, name, host string) error {
+	blk := appendBlock(f, "endpoint", []string{newEndpointType, name})
+	blk.Body().SetAttributeValue("hosts", cty.ListVal([]cty.Value{cty.StringVal(host)}))
+	seen := map[string]bool{}
+	for _, def := range t.newEndpointRules() {
+		label := def.Labels()[0]
+		if seen[label] {
+			return fmt.Errorf("%w: defaults declares new_endpoint_rule %q more than once", errBadCredentialRequest, label)
+		}
+		seen[label] = true
+		ruleName := newEndpointRuleName(name, label)
+		if _, exists := gw.Policy.Rules[ruleName]; exists {
+			return fmt.Errorf("%w: endpoint %q would add the rule %q, which already exists", errBadCredentialRequest, name, ruleName)
+		}
+		rule := appendBlock(f, "rule", []string{ruleName})
+		rule.Body().SetAttributeTraversal("endpoint", entityRef(newEndpointType, name))
+		// Copies: formatting the file rewrites tokens' spacing in place,
+		// which would re-indent the defaults block too.
+		var body hclwrite.Tokens
+		for _, tok := range def.Body().BuildTokens(nil) {
+			body = append(body, &hclwrite.Token{Type: tok.Type, Bytes: slices.Clone(tok.Bytes), SpacesBefore: tok.SpacesBefore})
+		}
+		for len(body) > 0 && body[0].Type == hclsyntax.TokenNewline {
+			body = body[1:]
+		}
+		if last := len(body) - 1; last >= 0 && body[last].Type != hclsyntax.TokenNewline &&
+			!(body[last].Type == hclsyntax.TokenComment && bytes.HasSuffix(body[last].Bytes, []byte("\n"))) {
+			// A one-line block's body ends at its closing brace; a line
+			// comment already ends its line.
+			body = append(body, &hclwrite.Token{Type: hclsyntax.TokenNewline, Bytes: []byte("\n")})
+		}
+		rule.Body().AppendUnstructuredTokens(body)
+	}
+	return nil
+}
+
+func (t *configTree) newEndpointRules() []*hclwrite.Block {
+	var rules []*hclwrite.Block
+	_, defaults := t.blocks("defaults")
+	for _, d := range defaults {
+		for _, blk := range d.Body().Blocks() {
+			if blk.Type() == "new_endpoint_rule" && len(blk.Labels()) == 1 {
+				rules = append(rules, blk)
+			}
+		}
+	}
+	return rules
+}
+
+func newEndpointRuleName(endpoint, rule string) string {
+	return endpoint + "-" + rule
+}
+
+const newEndpointRuleProbe = "new-endpoint-rule-probe"
+
+// checkNewEndpointRules declares a probe endpoint in the config's
+// sources the way the dashboard declares a new host, and loads the
+// result. A defaults.new_endpoint_rule that cannot become a rule then
+// fails this load, not the first host added on the dashboard.
+func checkNewEndpointRules(path string, sources map[string][]byte, gw *config.Gateway) error {
+	if gw.Defaults == nil || len(gw.Defaults.NewEndpointRules) == 0 {
+		return nil
+	}
+	sum := configSourcesSum(path, sources, configIsDir(path))
+	newEndpointRulesChecked.Lock()
+	defer newEndpointRulesChecked.Unlock()
+	if newEndpointRulesChecked.sum == sum {
+		return nil
+	}
+	tree, err := newConfigTree(path, sources)
+	if err != nil {
+		return err
+	}
+	target, _, err := resolveConfigFile(path, "")
+	if err != nil {
+		return err
+	}
+	if _, ok := tree.files[target]; !ok {
+		if err := tree.addContent(target, nil); err != nil {
+			return err
+		}
+	}
+	name := newEndpointRuleProbe
+	for i := 2; probeNameTaken(tree, gw, name); i++ {
+		name = fmt.Sprintf("%s%d", newEndpointRuleProbe, i)
+	}
+	if err := tree.declareEndpoint(gw, tree.files[target], name, "probe.invalid"); err != nil {
+		return fmt.Errorf("defaults.new_endpoint_rule: %w", err)
+	}
+	probe := maps.Clone(sources)
+	for _, c := range tree.changes(target, "") {
+		probe[c.Name] = c.Content
+	}
+	if _, _, err := compileConfigSources(path, probe); err != nil {
+		// A single file may be a dashboard write's temporary copy.
+		where := target
+		if !configIsDir(path) {
+			where = "the config file"
+		}
+		return fmt.Errorf("defaults.new_endpoint_rule: the rules a host added on the dashboard gets would not load "+
+			"(checked by adding endpoint %q to %s in memory, so positions there are not in the file): %w", name, where, err)
+	}
+	newEndpointRulesChecked.sum = sum
+	return nil
+}
+
+// newEndpointRulesChecked holds the sum of the last config that passed
+// checkNewEndpointRules: a dashboard write validates a change, then
+// reloads the same files, and the check runs once.
+var newEndpointRulesChecked struct {
+	sync.Mutex
+	sum [sha256.Size]byte
+}
+
+// configSourcesSum identifies a config by its directory and contents.
+// A single file's name is left out: a dashboard write validates it as
+// a temporary file next to it, then reloads it under its own name.
+func configSourcesSum(path string, sources map[string][]byte, isDir bool) [sha256.Size]byte {
+	h := sha256.New()
+	dir := path
+	if !isDir {
+		dir = filepath.Dir(path)
+	}
+	fmt.Fprintf(h, "%q %t\n", dir, isDir)
+	for _, name := range slices.Sorted(maps.Keys(sources)) {
+		if isDir {
+			fmt.Fprintf(h, "%q ", name)
+		}
+		fmt.Fprintf(h, "%d\n", len(sources[name]))
+		h.Write(sources[name])
+	}
+	return [sha256.Size]byte(h.Sum(nil))
+}
+
+func probeNameTaken(tree *configTree, gw *config.Gateway, name string) bool {
+	if gw.Policy.Endpoints[name] != nil {
+		return true
+	}
+	for _, def := range tree.newEndpointRules() {
+		if gw.Policy.Rules[newEndpointRuleName(name, def.Labels()[0])] != nil {
+			return true
+		}
+	}
+	return false
 }
 
 // setCredentialFields applies the request's type-specific settings to
@@ -554,10 +722,11 @@ type credentialConfigEntry struct {
 }
 
 // apiCredentialOptions lists what the credential form needs: the types
-// it declares, the endpoints and profiles to pick from, and where each
+// it declares, the endpoints and profiles to pick from, where each
 // credential and profile is declared, so the form can tell which ones
-// it may change. The loaded config and the files are read under the
-// config lock, so both describe the same revision.
+// it may change, and the rules a new host gets. The loaded config and
+// the files are read under the config lock, so both describe the same
+// revision.
 func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 	w.g.configMu.Lock()
 	gw := w.g.cfg.Load()
@@ -636,13 +805,21 @@ func (w *webMux) apiCredentialOptions(rw http.ResponseWriter, r *http.Request) {
 		creds[name] = entry
 	}
 
+	newEndpointRules := []string{}
+	for _, def := range tree.newEndpointRules() {
+		if suffix := newEndpointRuleName("", def.Labels()[0]); !slices.Contains(newEndpointRules, suffix) {
+			newEndpointRules = append(newEndpointRules, suffix)
+		}
+	}
+
 	writeJSON(rw, map[string]any{
-		"writes":      gw.DashboardConfigWrites(),
-		"file":        target,
-		"types":       editableCredentialTypes,
-		"endpoints":   endpoints,
-		"profiles":    profiles,
-		"credentials": creds,
+		"writes":             gw.DashboardConfigWrites(),
+		"file":               target,
+		"types":              editableCredentialTypes,
+		"endpoints":          endpoints,
+		"profiles":           profiles,
+		"credentials":        creds,
+		"new_endpoint_rules": newEndpointRules,
 	})
 }
 
