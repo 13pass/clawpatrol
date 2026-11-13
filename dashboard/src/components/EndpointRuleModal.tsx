@@ -13,6 +13,7 @@ import {
   RuleDialogFooter,
   RulePreviewPane,
   VerdictPicker,
+  useApprovers,
   useRulePreview,
 } from "./RuleDialogParts";
 
@@ -49,10 +50,11 @@ export function EndpointRuleModal({
     () => ({ verdict, scope: "exact", approver, condition: condition.trim() || undefined }),
     [verdict, approver, condition],
   );
-  const { preview, fresh, err, setErr } = useRulePreview({
-    key: JSON.stringify({ ...request, pinned }),
+  const approvers = useApprovers(true);
+  const { preview, fresh, canCreate, err, setErr } = useRulePreview({
+    inputs: { endpoint, pinned, request },
     enabled: !created,
-    load: () => previewEndpointRule(endpoint, pinned, request),
+    load: (i) => previewEndpointRule(i.endpoint, i.pinned, i.request),
   });
 
   async function create() {
@@ -86,9 +88,12 @@ export function EndpointRuleModal({
             />
 
             {verdict === "approve" && (
-              <div className="w-fit">
-                <ReviewerSelect value={approver} onChange={setApprover} />
-              </div>
+              <ReviewerSelect
+                approvers={approvers}
+                value={approver}
+                onChange={setApprover}
+                className="w-fit"
+              />
             )}
 
             {profile ? (
@@ -138,7 +143,7 @@ export function EndpointRuleModal({
       </div>
       <RuleDialogFooter
         done={!!created}
-        canCreate={fresh && !!preview?.writes_enabled}
+        canCreate={canCreate}
         busy={busy}
         createLabel="Create rule"
         onCreate={create}

@@ -61,23 +61,38 @@ export function VerdictPicker({
   );
 }
 
+// useApprovers loads the human approvers once per dialog, for
+// ReviewerSelect.
+export function useApprovers(enabled: boolean) {
+  const [approvers, setApprovers] = useState<string[]>([]);
+  useEffect(() => {
+    if (!enabled) return;
+    const ctl = { cancelled: false };
+    listUsers()
+      .then((u) => {
+        if (!ctl.cancelled) setApprovers(u.human_approvers);
+      })
+      .catch(() => {});
+    return () => {
+      ctl.cancelled = true;
+    };
+  }, [enabled]);
+  return approvers;
+}
+
 export function ReviewerSelect({
+  approvers,
   value,
   onChange,
+  className = "",
 }: {
+  approvers: string[];
   value: string;
   onChange: (approver: string) => void;
+  className?: string;
 }) {
-  const [approvers, setApprovers] = useState<string[]>([]);
-
-  useEffect(() => {
-    listUsers()
-      .then((u) => setApprovers(u.human_approvers))
-      .catch(() => setApprovers([]));
-  }, []);
-
   return (
-    <label className="flex flex-col gap-1">
+    <label className={"flex flex-col gap-1 " + className}>
       <span className={RULE_LABEL_CLASS}>Reviewed by</span>
       <select
         value={value}
@@ -85,6 +100,7 @@ export function ReviewerSelect({
         className={RULE_SELECT_CLASS}
       >
         <option value="">the dashboard</option>
+        {value && !approvers.includes(value) && <option value={value}>{value}</option>}
         {approvers.map((a) => (
           <option key={a} value={a}>
             {a}
@@ -95,28 +111,30 @@ export function ReviewerSelect({
   );
 }
 
-// useRulePreview previews the rule a dialog describes, debounced. key
-// identifies what is on screen: a preview for an older key stays shown
-// but is not fresh, so it cannot be created.
-export function useRulePreview({
-  key,
+// useRulePreview previews the rule a dialog describes, debounced.
+// inputs is everything the preview depends on, and load reads only
+// them: a preview for older inputs stays shown but is not fresh, so it
+// cannot be created.
+export function useRulePreview<T>({
+  inputs,
   enabled,
   load,
   onPreview,
   onError,
 }: {
-  key: string;
+  inputs: T;
   enabled: boolean;
-  load: () => Promise<RulePreviewResp>;
+  load: (inputs: T) => Promise<RulePreviewResp>;
   onPreview?: (p: RulePreviewResp) => void;
   onError?: () => void;
 }) {
+  const key = JSON.stringify(inputs);
   const [previewed, setPreviewed] = useState<{ key: string; resp: RulePreviewResp } | null>(null);
   const [err, setErr] = useState<string | null>(null);
   // The callbacks change every render; key decides when to preview.
-  const latest = useRef({ load, onPreview, onError });
+  const latest = useRef({ inputs, load, onPreview, onError });
   useEffect(() => {
-    latest.current = { load, onPreview, onError };
+    latest.current = { inputs, load, onPreview, onError };
   });
 
   useEffect(() => {
@@ -124,8 +142,8 @@ export function useRulePreview({
     // An object, not a let: the linter forbids reassigning a local after render.
     const ctl = { cancelled: false };
     const t = setTimeout(() => {
-      latest.current
-        .load()
+      const { inputs, load } = latest.current;
+      load(inputs)
         .then((p) => {
           if (ctl.cancelled) return;
           setPreviewed({ key, resp: p });
@@ -145,7 +163,9 @@ export function useRulePreview({
     };
   }, [key, enabled]);
 
-  return { preview: previewed?.resp ?? null, fresh: previewed?.key === key, err, setErr };
+  const preview = previewed?.resp ?? null;
+  const fresh = previewed?.key === key;
+  return { preview, fresh, canCreate: fresh && !!preview?.writes_enabled, err, setErr };
 }
 
 export function RulePreviewPane({

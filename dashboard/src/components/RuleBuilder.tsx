@@ -18,6 +18,7 @@ import {
   RuleDialogFooter,
   RulePreviewPane,
   VerdictPicker,
+  useApprovers,
   useRulePreview,
 } from "./RuleDialogParts";
 
@@ -96,10 +97,11 @@ export function RuleBuilderModal({
     () => ({ verdict, scope, approver, pin_header: pinHeader || undefined, condition }),
     [verdict, scope, approver, pinHeader, condition],
   );
-  const { preview, fresh, err, setErr } = useRulePreview({
-    key: JSON.stringify(request),
+  const approvers = useApprovers(isAdmin);
+  const { preview, fresh, canCreate, err, setErr } = useRulePreview({
+    inputs: { id: ev.id ?? "", request },
     enabled: !!ev.id && !created,
-    load: () => previewRule(ev.id!, request),
+    load: (i) => previewRule(i.id, i.request),
     onPreview: (p: RulePreviewResp) => {
       if (prefillOnPreview.current) {
         prefillOnPreview.current = false;
@@ -226,7 +228,7 @@ export function RuleBuilderModal({
                 </label>
               )}
               {verdict === "approve" && isAdmin && (
-                <ReviewerSelect value={approver} onChange={setApprover} />
+                <ReviewerSelect approvers={approvers} value={approver} onChange={setApprover} />
               )}
               {verdict === "approve" && !isAdmin && (
                 <div className="flex flex-col gap-1">
@@ -318,7 +320,7 @@ export function RuleBuilderModal({
       </div>
       <RuleDialogFooter
         done={!!created}
-        canCreate={fresh && !!preview?.writes_enabled}
+        canCreate={canCreate}
         busy={busy}
         createLabel={
           preview?.needs_review
