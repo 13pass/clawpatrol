@@ -79,13 +79,15 @@ type ruleChangeRequest struct {
 	Edited       bool   `json:"edited,omitempty"`
 }
 
-// ruleCreateNeedsReview reports whether a member's new rule with this
-// verdict could let through what the profile's other rules stop. Only
-// a deny cannot. A pre-approval skips admin approvals; a required
-// approval sits above admin rules, so it can stand in for an admin's
-// deny or approver.
-func ruleCreateNeedsReview(verdict string) bool {
-	return verdict != ruleVerdictDeny
+// ruleCreateNeedsReview reports whether a member's new rule goes to an
+// admin first. A rule that could let through what the profile's other
+// rules stop does: only a deny cannot. A pre-approval skips admin
+// approvals; a required approval sits above admin rules, so it can
+// stand in for an admin's deny or approver. A condition written by
+// hand does too, whatever its verdict: it is free-form CEL that runs
+// on every request.
+func ruleCreateNeedsReview(rule *ScopedRule) bool {
+	return rule.Verdict != ruleVerdictDeny || rule.HandWritten
 }
 
 // ruleEditNeedsReview reports whether a change to a member's existing

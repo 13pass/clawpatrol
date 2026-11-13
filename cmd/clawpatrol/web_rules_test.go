@@ -397,3 +397,24 @@ func TestRuleSummariesRespectTheProfilePin(t *testing.T) {
 		}
 	}
 }
+
+func TestMemberHandWrittenConditionGoesToReview(t *testing.T) {
+	env := newRulesTestEnv(t, true)
+	req := `{"action_id":"` + env.aliceNotes + `","verdict":"deny","condition":"http.path.startsWith('/api/v4/')"}`
+	rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/preview", req)
+	var preview struct {
+		NeedsReview bool `json:"needs_review"`
+	}
+	if err := json.Unmarshal(rw.Body.Bytes(), &preview); err != nil || !preview.NeedsReview {
+		t.Fatalf("preview of a hand-written deny = %d %s, want needs_review", rw.Code, rw.Body.String())
+	}
+	pendingRequestID(t, serveAs(t, env.h, env.alice, http.MethodPost, "/api/rules/create", req))
+	if _, err := os.Stat(filepath.Join(env.w.g.cfgPath, "50-user-alice.hcl")); !os.IsNotExist(err) {
+		t.Error("a member's hand-written deny was written before review")
+	}
+
+	// An admin's hand-written condition applies at once.
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/rules/create", req); rw.Code != http.StatusOK {
+		t.Fatalf("admin create = %d %s", rw.Code, rw.Body.String())
+	}
+}

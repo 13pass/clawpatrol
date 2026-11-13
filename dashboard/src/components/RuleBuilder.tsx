@@ -366,8 +366,10 @@ export function RuleBuilderModal({
                 {preview.needs_review && (
                   <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
                     <p>
-                      This rule could let through requests your profile's other rules stop, so an
-                      admin reviews it first. They may approve it, narrow it or reject it.
+                      {preview.rule.hand_written
+                        ? "A condition written by hand runs on every request, so an admin reviews it first."
+                        : "This rule could let through requests your profile's other rules stop, so an admin reviews it first."}{" "}
+                      They may approve it, narrow it or reject it.
                     </p>
                     <label className="block space-y-1">
                       <span className="text-text-muted">Why do you need it? (optional)</span>
