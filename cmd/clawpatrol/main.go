@@ -208,18 +208,25 @@ func requestRuleLink(publicURL, requestID string) string {
 	if publicURL == "" || requestID == "" {
 		return ""
 	}
-	return strings.TrimRight(publicURL, "/") + requestLinkPath + url.PathEscape(requestID) + "?rule"
+	return dashboardLink(publicURL, requestLinkPath+url.PathEscape(requestID)+"?rule")
+}
+
+// dashboardLink is a dashboard route under the gateway's public URL.
+func dashboardLink(publicURL, route string) string {
+	return strings.TrimRight(publicURL, "/") + route
 }
 
 // writeDenied answers a request the policy or an approver refused. The
-// ID and the rule link are also in the body: agents often see only it.
-func writeDenied(w io.Writer, reason, requestID, ruleLink string) {
-	body := reason + "\nClaw Patrol request: " + requestID + "\n"
+// rule link and the ID are also in the body, the ID on its last line:
+// agents often see only the body.
+func writeDenied(w io.Writer, reason, publicURL, requestID string) {
+	body := reason + "\n"
 	headers := requestIDHeader + ": " + requestID + "\r\n"
-	if ruleLink != "" {
-		body += "To propose a rule for it, give your human this link (append &verdict=…&condition=…&note=… to fill it in): " + ruleLink + "\n"
-		headers += ruleLinkHeader + ": " + ruleLink + "\r\n"
+	if link := requestRuleLink(publicURL, requestID); link != "" {
+		body += "To propose a rule for it, give your human this link (append &verdict=…&condition=…&note=… to fill it in): " + link + "\n"
+		headers += ruleLinkHeader + ": " + link + "\r\n"
 	}
+	body += "Claw Patrol request: " + requestID + "\n"
 	_, _ = fmt.Fprintf(w, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n%sContent-Length: %d\r\nConnection: close\r\n\r\n%s",
 		headers, len(body), body)
 }
@@ -3014,7 +3021,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 				log.Printf("denied %s %s %s: %s (by %s/%s/%s)",
 					host, req.Method, req.URL.Path, reason, v.ApproverType, v.ApproverName, v.By)
-				writeDenied(tc, reason, ev.ID, requestRuleLink(g.cfg.Load().PublicURL(), ev.ID))
+				writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 				ev.Status = "403"
 				ev.Action = "denied"
 				ev.Approver = v.ApproverName
@@ -3056,7 +3063,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, err)
 				}
 			}
-			writeDenied(tc, reason, ev.ID, requestRuleLink(g.cfg.Load().PublicURL(), ev.ID))
+			writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 			ev.Status = "403"
 			ev.Action = "deny"
 			ev.Reason = reason

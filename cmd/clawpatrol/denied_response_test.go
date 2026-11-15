@@ -12,7 +12,7 @@ import (
 
 func TestDeniedResponseCarriesTheRequestID(t *testing.T) {
 	var buf bytes.Buffer
-	writeDenied(&buf, "deleting is not allowed", "0194-abc", "")
+	writeDenied(&buf, "deleting is not allowed", "", "0194-abc")
 	resp, err := http.ReadResponse(bufio.NewReader(&buf), nil)
 	if err != nil {
 		t.Fatal(err)
@@ -35,13 +35,14 @@ func TestDeniedResponseCarriesTheRuleLink(t *testing.T) {
 		t.Error("a link without a public URL")
 	}
 	var buf bytes.Buffer
-	writeDenied(&buf, "no", "0194-abc", link)
+	writeDenied(&buf, "no", "https://gw.example.test/", "0194-abc")
 	resp, err := http.ReadResponse(bufio.NewReader(&buf), nil)
 	if err != nil {
 		t.Fatal(err)
 	}
 	body, _ := io.ReadAll(resp.Body)
-	if resp.Header.Get(ruleLinkHeader) != link || !strings.Contains(string(body), link) {
+	if resp.Header.Get(ruleLinkHeader) != link || !strings.Contains(string(body), link) ||
+		!strings.HasSuffix(string(body), "Claw Patrol request: 0194-abc\n") {
 		t.Errorf("%s = %q, body = %q", ruleLinkHeader, resp.Header.Get(ruleLinkHeader), body)
 	}
 }

@@ -21,8 +21,6 @@ export type RuleLink = {
   problems: string[];
 };
 
-const LINK_FIELDS = ["verdict", "condition", "note", "approver", "profile", "endpoint"];
-
 export function parseRuleLink(query: string): RuleLink {
   const q = new URLSearchParams(query);
   const problems: string[] = [];
@@ -56,7 +54,7 @@ export function parseRuleLink(query: string): RuleLink {
     approver,
     profile: q.get("profile") ?? "",
     note: (q.get("note") ?? "").trim().slice(0, NOTE_MAX_CHARS),
-    prepared: LINK_FIELDS.some((f) => q.has(f)),
+    prepared: [...q.keys()].some((k) => k !== "rule"),
     problems,
   };
 }

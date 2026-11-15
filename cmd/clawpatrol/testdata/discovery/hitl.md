@@ -53,7 +53,7 @@ When a rule would help (a request was blocked or held, or you want a guard), you
 
 URL-encode every value (encodeURIComponent).
 
-Request link: `https://gw.example.test/#/request/<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
+Request link: `https://gw.example.test/#/request/<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
 
 Endpoint link: `https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
 

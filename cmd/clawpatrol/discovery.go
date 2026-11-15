@@ -585,10 +585,9 @@ const (
 )
 
 func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
-	base := strings.TrimRight(dashboard, "/")
 	return &DiscoveryRuleLinks{
-		RequestTemplate: base + requestLinkPath + "<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
-		Template:        base + ruleLinkPath + "?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
+		RequestTemplate: dashboardLink(dashboard, requestLinkPath+"<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
+		Template:        dashboardLink(dashboard, ruleLinkPath+"?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
 		Explanation: "When a rule would help (a request was blocked or held, or you want a guard), " +
 			"you can propose one instead of describing it: build a link and give it to your human. " +
 			"It opens the dashboard's rule dialog filled in; nothing changes until they check the " +
