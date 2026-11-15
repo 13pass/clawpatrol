@@ -672,10 +672,12 @@ func TestDiscoveryRuleLinks(t *testing.T) {
 	}
 	cp.DashboardURL = "https://gw.example.test/"
 	m := buildDiscoveryManifest(cp, "ops")
-	if m.RuleLinks == nil || !strings.HasPrefix(m.RuleLinks.Template, "https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=") {
+	if m.RuleLinks == nil || !strings.HasPrefix(m.RuleLinks.Template, "https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=") ||
+		!strings.HasPrefix(m.RuleLinks.RequestTemplate, "https://gw.example.test/#/request/<request id>?verdict=") {
 		t.Fatalf("rule links = %+v", m.RuleLinks)
 	}
-	if md := m.Markdown(); !strings.Contains(md, "## Proposing a rule") || !strings.Contains(md, m.RuleLinks.Template) {
+	if md := m.Markdown(); !strings.Contains(md, "## Proposing a rule") || !strings.Contains(md, m.RuleLinks.Template) ||
+		!strings.Contains(md, m.RuleLinks.RequestTemplate) {
 		t.Errorf("markdown lacks the rule link section:\n%s", md)
 	}
 	if m := buildDiscoveryManifest(cp, "nobody"); m.RuleLinks != nil {

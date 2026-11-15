@@ -25,7 +25,7 @@ type Route =
   | { name: "device"; ip: string }
   | { name: "analytics"; ip?: string }
   | { name: "onboard"; code: string }
-  | { name: "request"; id: string }
+  | { name: "request"; id: string; query: string }
   | { name: "settings" }
   | { name: "plugins" }
   | { name: "users" }
@@ -44,7 +44,12 @@ function parseRoute(): Route {
       code: decodeURIComponent(h.slice("#/onboard/".length)),
     };
   const r = h.match(/^#\/request\/([^/]+)$/);
-  if (r) return { name: "request", id: decodeURIComponent(r[1]) };
+  if (r)
+    return {
+      name: "request",
+      id: decodeURIComponent(r[1]),
+      query: qi < 0 ? "" : raw.slice(qi + 1),
+    };
   if (h === "#/settings") return { name: "settings" };
   if (h === "#/plugins") return { name: "plugins" };
   if (h === "#/devices") return { name: "devices" };
@@ -164,7 +169,13 @@ export default function App() {
       ) : route.name === "analytics" ? (
         <AnalyticsPage ip={route.ip} agents={agents} />
       ) : route.name === "request" ? (
-        <RequestDetailPage id={route.id} agents={agents} whoami={whoami} />
+        <RequestDetailPage
+          id={route.id}
+          agents={agents}
+          whoami={whoami}
+          ruleLink={route.query || undefined}
+          onRuleLinkDone={() => navigate(`#/request/${encodeURIComponent(route.id)}`, true)}
+        />
       ) : route.name === "onboard" ? (
         <OnboardPage code={route.code} />
       ) : route.name === "settings" ? (

@@ -12,6 +12,7 @@ import {
 } from "../lib/api";
 import { Modal } from "./Modal";
 import {
+  AgentLinkNotice,
   RULE_LABEL_CLASS,
   RULE_SELECT_CLASS,
   ReviewerSelect,
@@ -21,6 +22,7 @@ import {
   useApprovers,
   useRulePreview,
 } from "./RuleDialogParts";
+import type { RuleLink } from "./RuleLinkDialog";
 
 // Recorded values the gateway masked; a rule cannot pin them.
 const MASKED_HEADER_VALUE = "***";
@@ -47,16 +49,45 @@ function scopesFor(ev: EventRecord): { value: RuleScope; label: string }[] {
   }
 }
 
+// requestLinkProblems lists what a request link asked for and this
+// request's dialog cannot take.
+function requestLinkProblems(
+  link: RuleLink,
+  ev: EventRecord,
+  verdicts: RuleVerdict[],
+  isAdmin: boolean,
+): string[] {
+  const problems = [...link.problems];
+  if (!verdicts.includes(link.verdict)) {
+    problems.push(`This request does not offer the link's verdict "${link.verdict}".`);
+  }
+  if (link.condition && !ev.endpoint) {
+    problems.push("A host with no endpoint takes no condition: the link's condition is ignored.");
+  }
+  if (link.approver && !isAdmin) {
+    problems.push("Your reviewer is set by an admin: the link's reviewer is ignored.");
+  }
+  if (link.profile) {
+    problems.push(
+      "A rule from a request keeps that request's profile: the link's profile is ignored.",
+    );
+  }
+  return problems;
+}
+
 // RuleBuilderModal turns one recorded request into a rule. The server
 // generates the HCL: for a member it is pinned to the request's
 // profile and credential and written to the member's own file.
 export function RuleBuilderModal({
   ev,
   whoami,
+  initial,
   onClose,
 }: {
   ev: EventRecord;
   whoami: Whoami | null;
+  // initial fills the dialog from a link an agent prepared.
+  initial?: RuleLink;
   onClose: () => void;
 }) {
   const isAdmin = whoami?.role !== "member";
@@ -69,15 +100,22 @@ export function RuleBuilderModal({
       ? ["none", "deny", "approve"]
       : ["deny", "approve"]
     : ["deny", "allow", "approve"];
-  const [verdict, setVerdict] = useState<RuleVerdict>(verdicts[0]);
+  const [linkProblems] = useState(() =>
+    initial ? requestLinkProblems(initial, ev, verdicts, isAdmin) : [],
+  );
+  const [verdict, setVerdict] = useState<RuleVerdict>(
+    initial && verdicts.includes(initial.verdict) ? initial.verdict : verdicts[0],
+  );
   const [scope, setScope] = useState<RuleScope>(scopes[0].value);
   const [pinHeader, setPinHeader] = useState("");
-  const [approver, setApprover] = useState("");
+  const [approver, setApprover] = useState(isAdmin ? (initial?.approver ?? "") : "");
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
   // null while the editor is closed.
-  const [conditionText, setConditionText] = useState<string | null>(null);
+  const [conditionText, setConditionText] = useState<string | null>(
+    initial?.condition && ev.endpoint ? initial.condition : null,
+  );
   const condition = conditionText?.trim() ? conditionText : undefined;
   const prefillOnPreview = useRef(false);
   const conditionId = useId();
@@ -191,6 +229,7 @@ export function RuleBuilderModal({
           </div>
         ) : (
           <>
+            {initial && <AgentLinkNotice note={initial.note} problems={linkProblems} />}
             <VerdictPicker verdicts={verdicts} value={verdict} onChange={setVerdict} />
 
             <div className="flex flex-wrap gap-4">

@@ -324,9 +324,10 @@ type DiscoveryManifest struct {
 // checks the preview and creates the rule. Opening it changes nothing.
 type DiscoveryRuleLinks struct {
 	Explanation string `json:"explanation"`
-	// Template is the link, with each value to fill in between angle
-	// brackets.
-	Template string `json:"template"`
+	// RequestTemplate starts from a refused request, Template from an
+	// endpoint; each value to fill in is between angle brackets.
+	RequestTemplate string `json:"request_template"`
+	Template        string `json:"template"`
 }
 
 // DiscoveryHITL is the profile-scoped human-in-the-loop summary embedded
@@ -575,28 +576,39 @@ func buildDiscoveryManifest(policy *config.CompiledPolicy, profileName string) *
 	return m
 }
 
-// ruleLinkPath is the dashboard route that opens the rule dialog from a
-// link's query parameters.
-const ruleLinkPath = "/#/rules/new"
+// ruleLinkPath and requestLinkPath are the dashboard routes that open
+// the rule dialog from a link's query parameters: for an endpoint, or
+// for a recorded request.
+const (
+	ruleLinkPath    = "/#/rules/new"
+	requestLinkPath = "/#/request/"
+)
 
 func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
+	base := strings.TrimRight(dashboard, "/")
 	return &DiscoveryRuleLinks{
-		Template: strings.TrimRight(dashboard, "/") + ruleLinkPath +
-			"?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
+		RequestTemplate: base + requestLinkPath + "<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
+		Template:        base + ruleLinkPath + "?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
 		Explanation: "When a rule would help (a request was blocked or held, or you want a guard), " +
-			"you can propose one instead of describing it: build the link below and give it to your " +
-			"human. It opens the dashboard's rule dialog filled in; nothing changes until they check " +
-			"the preview and confirm. An admin of the dashboard must open it.\n\n" +
-			"- endpoint: an endpoint name from this manifest.\n" +
+			"you can propose one instead of describing it: build a link and give it to your human. " +
+			"It opens the dashboard's rule dialog filled in; nothing changes until they check the " +
+			"preview and confirm.\n\n" +
+			"- For a request the gateway refused, use the request link. The 403 carries the request " +
+			"ID in its " + requestIDHeader + " header and on the last line of its body. Anyone who " +
+			"owns your profile can open it, member or admin; a member's rule may go to an admin for " +
+			"review.\n" +
+			"- Otherwise use the endpoint link, with endpoint set to an endpoint name from this " +
+			"manifest. Only an admin of the dashboard can open it.\n\n" +
 			"- verdict: deny, allow (pre-approve) or approve (hold for a human).\n" +
 			"- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. " +
 			"HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; " +
 			"Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL " +
-			"ones have sql.verb, sql.tables, sql.function, sql.statement. Omit it for every request " +
-			"to the endpoint. Keep it as narrow as the need.\n" +
+			"ones have sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link " +
+			"matches that request's method and path, the endpoint link every request to the " +
+			"endpoint. Keep it as narrow as the need.\n" +
 			"- note: one sentence on why, shown to your human.\n" +
-			"- Optional: approver=<human approver> for verdict approve, profile=<profile> to limit " +
-			"the rule to one profile.\n\n" +
+			"- Optional, endpoint link only: approver=<human approver> for verdict approve, " +
+			"profile=<profile> to limit the rule to one profile.\n\n" +
 			"URL-encode every value (encodeURIComponent).",
 	}
 }
@@ -1159,7 +1171,8 @@ func (m *DiscoveryManifest) Markdown() string {
 	if m.RuleLinks != nil {
 		b.WriteString("## Proposing a rule\n\n")
 		b.WriteString(m.RuleLinks.Explanation)
-		b.WriteString("\n\nLink: `" + m.RuleLinks.Template + "`\n\n")
+		b.WriteString("\n\nRequest link: `" + m.RuleLinks.RequestTemplate + "`\n\n")
+		b.WriteString("Endpoint link: `" + m.RuleLinks.Template + "`\n\n")
 	}
 
 	fmt.Fprintf(&b, "## Endpoints (%d)\n\n", len(m.Endpoints))

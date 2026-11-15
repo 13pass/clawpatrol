@@ -192,6 +192,19 @@ func parseDurationOr(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// requestIDHeader carries a refused request's ID, the one the dashboard
+// shows it under (#/request/<id>), so the agent can point its human at
+// it, or build a rule link for it.
+const requestIDHeader = "X-Clawpatrol-Request"
+
+// writeDenied answers a request the policy or an approver refused. The
+// ID is also the body's last line: agents often see only the body.
+func writeDenied(w io.Writer, reason, requestID string) {
+	body := reason + "\nClaw Patrol request: " + requestID + "\n"
+	_, _ = fmt.Fprintf(w, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n%s: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		requestIDHeader, requestID, len(body), body)
+}
+
 // newReqID returns a UUIDv7 string. Time-ordered + random tail;
 // used both for start/end/frame correlation and as the persistent
 // action key in the DB / detail page URL.
@@ -2982,7 +2995,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 				log.Printf("denied %s %s %s: %s (by %s/%s/%s)",
 					host, req.Method, req.URL.Path, reason, v.ApproverType, v.ApproverName, v.By)
-				_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
+				writeDenied(tc, reason, ev.ID)
 				ev.Status = "403"
 				ev.Action = "denied"
 				ev.Approver = v.ApproverName
@@ -3024,7 +3037,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, err)
 				}
 			}
-			_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
+			writeDenied(tc, reason, ev.ID)
 			ev.Status = "403"
 			ev.Action = "deny"
 			ev.Reason = reason
