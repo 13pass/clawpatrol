@@ -303,13 +303,9 @@ function RuleRow({
         <div className="flex items-center gap-2 flex-wrap">
           <Verdict r={r} />
           {r.disabled && <span className="text-2xs text-text-muted">(disabled)</span>}
-          {r.reason && (
-            <span className="text-xs text-text-muted truncate" title={r.reason}>
-              {r.reason}
-            </span>
-          )}
+          {r.reason && <span className="text-xs text-text-muted break-words">{r.reason}</span>}
         </div>
-        <div className="text-xs text-text-muted mt-1 font-mono truncate" title={renderCondition(r)}>
+        <div className="text-xs text-text-muted mt-1 font-mono whitespace-pre-wrap break-all">
           {renderCondition(r)}
         </div>
         {r.pinned_profile && (
@@ -322,7 +318,7 @@ function RuleRow({
         )}
       </div>
       <div className="flex flex-col items-end gap-0.5 shrink-0">
-        <span className="text-xs text-text-subtle truncate max-w-[10rem]" title={r.name}>
+        <span className="text-xs text-text-subtle break-all text-right max-w-[16rem]">
           {r.name}
         </span>
         {(r.priority ?? 0) !== 0 && (
