@@ -43,11 +43,11 @@ Endpoints below that may park a request for human approval: admin, deploy.
 
 When a rule would help (a request was blocked or held, or you want a guard), you can propose one instead of describing it: build a link and give it to your human. It opens the dashboard's rule dialog filled in; nothing changes until they check the preview and confirm.
 
-- For a request the gateway refused, use the request link. The 403 carries the request ID in its X-Clawpatrol-Request header and on the last line of its body. Anyone who owns your profile can open it, member or admin; a member's rule may go to an admin for review.
+- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 carries the request ID in its X-Clawpatrol-Request header and on the last line of its body. Anyone who owns your profile can open it, member or admin; a member's rule may go to an admin for review.
 - Otherwise use the endpoint link, with endpoint set to an endpoint name from this manifest. Only an admin of the dashboard can open it.
 
 - verdict: deny, allow (pre-approve) or approve (hold for a human).
-- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL ones have sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link matches that request's method and path, the endpoint link every request to the endpoint. Keep it as narrow as the need.
+- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL ones have sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link matches requests like that one (same method and path, or same Kubernetes object; a host with no endpoint as a whole), the endpoint link every request to the endpoint. Keep it as narrow as the need.
 - note: one sentence on why, shown to your human.
 - Optional, endpoint link only: approver=<human approver> for verdict approve, profile=<profile> to limit the rule to one profile.
 

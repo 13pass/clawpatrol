@@ -170,6 +170,7 @@ export default function App() {
         <AnalyticsPage ip={route.ip} agents={agents} />
       ) : route.name === "request" ? (
         <RequestDetailPage
+          key={route.id}
           id={route.id}
           agents={agents}
           whoami={whoami}

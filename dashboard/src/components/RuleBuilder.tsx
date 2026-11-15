@@ -59,7 +59,9 @@ function requestLinkProblems(
 ): string[] {
   const problems = [...link.problems];
   if (!verdicts.includes(link.verdict)) {
-    problems.push(`This request does not offer the link's verdict "${link.verdict}".`);
+    problems.push(
+      `This request does not offer the link's verdict "${link.verdict}": "${verdicts[0]}" is selected, check it.`,
+    );
   }
   if (link.condition && !ev.endpoint) {
     problems.push("A host with no endpoint takes no condition: the link's condition is ignored.");
@@ -70,6 +72,11 @@ function requestLinkProblems(
   if (link.profile) {
     problems.push(
       "A rule from a request keeps that request's profile: the link's profile is ignored.",
+    );
+  }
+  if (link.endpoint && link.endpoint !== ev.endpoint) {
+    problems.push(
+      `The link names endpoint "${link.endpoint}", but this request went to ${ev.endpoint || "a host with no endpoint"}: the link's endpoint is ignored.`,
     );
   }
   return problems;
@@ -100,9 +107,7 @@ export function RuleBuilderModal({
       ? ["none", "deny", "approve"]
       : ["deny", "approve"]
     : ["deny", "allow", "approve"];
-  const [linkProblems] = useState(() =>
-    initial ? requestLinkProblems(initial, ev, verdicts, isAdmin) : [],
-  );
+  const linkProblems = initial ? requestLinkProblems(initial, ev, verdicts, isAdmin) : [];
   const [verdict, setVerdict] = useState<RuleVerdict>(
     initial && verdicts.includes(initial.verdict) ? initial.verdict : verdicts[0],
   );
@@ -132,7 +137,13 @@ export function RuleBuilderModal({
   // them then, but uses them to tell an unedited condition from one
   // written by hand.
   const request = useMemo<RuleRequest>(
-    () => ({ verdict, scope, approver, pin_header: pinHeader || undefined, condition }),
+    () => ({
+      verdict,
+      scope,
+      approver: verdict === "approve" ? approver : "",
+      pin_header: pinHeader || undefined,
+      condition,
+    }),
     [verdict, scope, approver, pinHeader, condition],
   );
   const approvers = useApprovers(isAdmin);
