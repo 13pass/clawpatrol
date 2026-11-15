@@ -594,8 +594,10 @@ func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
 			"It opens the dashboard's rule dialog filled in; nothing changes until they check the " +
 			"preview and confirm.\n\n" +
 			"- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 " +
-			"carries the request ID in its " + requestIDHeader + " header and on the last line of " +
-			"its body. Anyone who " +
+			"(and the 202 of an approval that went asynchronous) carries it ready-made in its " +
+			ruleLinkHeader + " header and in its body, and the request ID in " + requestIDHeader +
+			". Give that link as is to let your human choose, or append &verdict=…&condition=…" +
+			"&note=… to fill the dialog in. Anyone who " +
 			"owns your profile can open it, member or admin; a member's rule may go to an admin for " +
 			"review.\n" +
 			"- Otherwise use the endpoint link, with endpoint set to an endpoint name from this " +

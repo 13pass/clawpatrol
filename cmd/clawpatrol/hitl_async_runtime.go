@@ -462,12 +462,12 @@ func hitlCredentialGeneration(ctx context.Context, db *sql.DB, credentialID stri
 	return "env-or-empty:" + credentialID, nil
 }
 
-func writeHITLOperationAcceptedToConn(w io.Writer, op HITLOperation, publicURL string) error {
+func writeHITLOperationAcceptedToConn(w io.Writer, op HITLOperation, publicURL, requestID string) error {
 	if w == nil {
 		return nil
 	}
 	rr := httptest.NewRecorder()
-	writeHITLOperationAccepted(rr, op, publicURL)
+	writeHITLOperationAccepted(rr, op, publicURL, requestID)
 	resp := rr.Result()
 	defer func() { _ = resp.Body.Close() }()
 	resp.ContentLength = int64(rr.Body.Len())

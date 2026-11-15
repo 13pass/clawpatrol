@@ -290,7 +290,7 @@ function ActionButtons({
             key={ruleLink}
             ev={ev}
             whoami={whoami}
-            initial={link}
+            initial={link.prepared ? link : undefined}
             onClose={onRuleLinkDone}
           />
         ) : (

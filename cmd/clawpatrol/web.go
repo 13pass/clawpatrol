@@ -17,6 +17,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -1058,19 +1059,31 @@ func hitlPeerPrincipalID(peerIP string) string {
 	return "peer:" + peerIP
 }
 
-func writeHITLOperationAccepted(rw http.ResponseWriter, op HITLOperation, publicURL string) {
+// writeHITLOperationAccepted answers a request held for approval that
+// went asynchronous. requestID, when set, names the held request and
+// links its rule dialog, as a refusal does.
+func writeHITLOperationAccepted(rw http.ResponseWriter, op HITLOperation, publicURL, requestID string) {
 	statusURL := hitlOperationStatusURL(publicURL, op.ID, op.StatusToken)
 	rw.Header().Set("Location", statusURL)
 	rw.Header().Set("Retry-After", strconv.Itoa(hitlDefaultRetryAfterSeconds))
-	writeHITLOperationResponse(rw, http.StatusAccepted, op, statusURL)
+	var extra map[string]any
+	if requestID != "" {
+		rw.Header().Set(requestIDHeader, requestID)
+		extra = map[string]any{"request_id": requestID}
+		if link := requestRuleLink(publicURL, requestID); link != "" {
+			rw.Header().Set(ruleLinkHeader, link)
+			extra["rule_link"] = link
+		}
+	}
+	writeHITLOperationResponse(rw, http.StatusAccepted, op, statusURL, extra)
 }
 
 func writeHITLOperationStatus(rw http.ResponseWriter, op HITLOperation, publicURL string) {
 	statusURL := hitlOperationStatusURL(publicURL, op.ID, op.StatusToken)
-	writeHITLOperationResponse(rw, http.StatusOK, op, statusURL)
+	writeHITLOperationResponse(rw, http.StatusOK, op, statusURL, nil)
 }
 
-func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOperation, statusURL string) {
+func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOperation, statusURL string, extra map[string]any) {
 	upstreamCalled := hitlOperationUpstreamCalled(op)
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Cache-Control", "no-store")
@@ -1081,6 +1094,7 @@ func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOpera
 		rw.Header().Set("Retry-After", strconv.Itoa(hitlDefaultRetryAfterSeconds))
 	}
 	body := hitlOperationStatusBody(op, statusURL, upstreamCalled)
+	maps.Copy(body, extra)
 	rw.WriteHeader(status)
 	_ = json.NewEncoder(rw).Encode(body)
 }

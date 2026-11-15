@@ -14,9 +14,14 @@ export type RuleLink = {
   approver: string;
   profile: string;
   note: string;
+  // prepared is false for a bare link, such as the one the gateway puts
+  // on a refused request: it opens the dialog without filling it in.
+  prepared: boolean;
   // problems are what the link asked for and the dialog could not take.
   problems: string[];
 };
+
+const LINK_FIELDS = ["verdict", "condition", "note", "approver", "profile", "endpoint"];
 
 export function parseRuleLink(query: string): RuleLink {
   const q = new URLSearchParams(query);
@@ -51,6 +56,7 @@ export function parseRuleLink(query: string): RuleLink {
     approver,
     profile: q.get("profile") ?? "",
     note: (q.get("note") ?? "").trim().slice(0, NOTE_MAX_CHARS),
+    prepared: LINK_FIELDS.some((f) => q.has(f)),
     problems,
   };
 }
