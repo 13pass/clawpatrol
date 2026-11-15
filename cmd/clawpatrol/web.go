@@ -1899,7 +1899,9 @@ var generatedProfileCredentialsBlockRE = regexp.MustCompile(`(?ms)\n*profile\s+"
 
 func mergeProfileCredentialRefs(current, profile string, addRefs []string) (string, bool) {
 	profileName := regexp.QuoteMeta(profile)
-	oneLineRE := regexp.MustCompile(`(?m)^(\s*profile\s+"` + profileName + `"\s*\{\s*)([^{}\n]*?)(\s*\}\s*)$`)
+	// Blanks, not \s: a newline would let this match a multi-line block
+	// and take the line break after its brace with it.
+	oneLineRE := regexp.MustCompile(`(?m)^([ \t]*profile[ \t]+"` + profileName + `"[ \t]*\{[ \t]*)([^{}\n]*?)([ \t]*\}[ \t]*)$`)
 	if loc := oneLineRE.FindStringSubmatchIndex(current); loc != nil {
 		body := strings.TrimSpace(current[loc[4]:loc[5]])
 		existing := credentialRefsFromProfileBody(body)
