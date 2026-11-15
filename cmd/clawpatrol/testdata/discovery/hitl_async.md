@@ -66,6 +66,20 @@ Endpoints that fall back to asynchronous approval, and the synchronous wait wind
 
 - deploy: returns 202 after 1m30s of waiting; the parked operation then stays pollable for 8m30s.
 
+## Proposing a rule
+
+When a rule would help (a request was blocked or held, or you want a guard), you can propose one instead of describing it: build the link below and give it to your human. It opens the dashboard's rule dialog filled in; nothing changes until they check the preview and confirm. An admin of the dashboard must open it.
+
+- endpoint: an endpoint name from this manifest.
+- verdict: deny, allow (pre-approve) or approve (hold for a human).
+- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL ones have sql.verb, sql.tables, sql.function, sql.statement. Omit it for every request to the endpoint. Keep it as narrow as the need.
+- note: one sentence on why, shown to your human.
+- Optional: approver=<human approver> for verdict approve, profile=<profile> to limit the rule to one profile.
+
+URL-encode every value (encodeURIComponent).
+
+Link: `https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
+
 ## Endpoints (4)
 
 ### admin  (https)

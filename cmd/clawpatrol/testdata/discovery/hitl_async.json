@@ -125,5 +125,9 @@
         }
       ]
     }
+  },
+  "rule_links": {
+    "explanation": "When a rule would help (a request was blocked or held, or you want a guard), you can propose one instead of describing it: build the link below and give it to your human. It opens the dashboard's rule dialog filled in; nothing changes until they check the preview and confirm. An admin of the dashboard must open it.\n\n- endpoint: an endpoint name from this manifest.\n- verdict: deny, allow (pre-approve) or approve (hold for a human).\n- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL ones have sql.verb, sql.tables, sql.function, sql.statement. Omit it for every request to the endpoint. Keep it as narrow as the need.\n- note: one sentence on why, shown to your human.\n- Optional: approver=\u003chuman approver\u003e for verdict approve, profile=\u003cprofile\u003e to limit the rule to one profile.\n\nURL-encode every value (encodeURIComponent).",
+    "template": "https://gw.example.test/#/rules/new?endpoint=\u003cendpoint\u003e\u0026verdict=\u003cdeny|allow|approve\u003e\u0026condition=\u003cCEL\u003e\u0026note=\u003cwhy\u003e"
   }
 }

@@ -7,6 +7,7 @@ import {
   type RuleVerdict,
 } from "../lib/api";
 import { Modal } from "./Modal";
+import type { RuleLink } from "./RuleLinkDialog";
 import {
   RULE_LABEL_CLASS,
   ReviewerSelect,
@@ -16,6 +17,9 @@ import {
   useApprovers,
   useRulePreview,
 } from "./RuleDialogParts";
+
+// Past this, the condition box scrolls.
+const CONDITION_MAX_ROWS = 12;
 
 const CONDITION_VARIABLES: Record<string, string> = {
   http: "http.method, http.path, http.query, http.headers, http.body_json",
@@ -27,19 +31,22 @@ export function EndpointRuleModal({
   endpoint,
   family,
   profile,
+  initial,
   onClose,
   onCreated,
 }: {
   endpoint: string;
   family: string;
-  // profile is the device page's: the rule may be limited to it.
+  // profile is the device page's, or a link's: the rule may be limited to it.
   profile?: string;
+  // initial fills the dialog from a link an agent prepared.
+  initial?: RuleLink;
   onClose: () => void;
   onCreated: () => void;
 }) {
-  const [verdict, setVerdict] = useState<RuleVerdict>("deny");
-  const [approver, setApprover] = useState("");
-  const [condition, setCondition] = useState("");
+  const [verdict, setVerdict] = useState<RuleVerdict>(initial?.verdict ?? "deny");
+  const [approver, setApprover] = useState(initial?.approver ?? "");
+  const [condition, setCondition] = useState(initial?.condition ?? "");
   const [onlyProfile, setOnlyProfile] = useState(!!profile);
   const pinned = onlyProfile && profile ? profile : "";
   const [busy, setBusy] = useState(false);
@@ -47,7 +54,12 @@ export function EndpointRuleModal({
   const conditionId = useId();
 
   const request = useMemo<RuleRequest>(
-    () => ({ verdict, scope: "exact", approver, condition: condition.trim() || undefined }),
+    () => ({
+      verdict,
+      scope: "exact",
+      approver: verdict === "approve" ? approver : "",
+      condition: condition.trim() || undefined,
+    }),
     [verdict, approver, condition],
   );
   const approvers = useApprovers(true);
@@ -81,6 +93,19 @@ export function EndpointRuleModal({
           </p>
         ) : (
           <>
+            {initial && (
+              <div className="space-y-1 border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
+                <p className="font-bold">
+                  Prepared by an agent. Check the rule and its preview before creating it.
+                </p>
+                {initial.note && (
+                  <p className="whitespace-pre-wrap break-words">Why: {initial.note}</p>
+                )}
+                {initial.problems.map((p) => (
+                  <p key={p}>{p}</p>
+                ))}
+              </div>
+            )}
             <VerdictPicker
               verdicts={["deny", "allow", "approve"]}
               value={verdict}
@@ -119,7 +144,7 @@ export function EndpointRuleModal({
                 id={conditionId}
                 value={condition}
                 onChange={(e) => setCondition(e.target.value)}
-                rows={3}
+                rows={Math.min(Math.max(3, condition.split("\n").length), CONDITION_MAX_ROWS)}
                 spellCheck={false}
                 placeholder={family === "http" ? "http.method == 'DELETE'" : ""}
                 className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"

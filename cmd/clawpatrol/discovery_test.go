@@ -663,3 +663,22 @@ func TestIsInternalHost(t *testing.T) {
 		}
 	}
 }
+
+func TestDiscoveryRuleLinks(t *testing.T) {
+	cp := compileDiscoveryFixture(t)
+	cp.DashboardURL = ""
+	if m := buildDiscoveryManifest(cp, "ops"); m.RuleLinks != nil {
+		t.Errorf("rule links without a public URL: %+v", m.RuleLinks)
+	}
+	cp.DashboardURL = "https://gw.example.test/"
+	m := buildDiscoveryManifest(cp, "ops")
+	if m.RuleLinks == nil || !strings.HasPrefix(m.RuleLinks.Template, "https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=") {
+		t.Fatalf("rule links = %+v", m.RuleLinks)
+	}
+	if md := m.Markdown(); !strings.Contains(md, "## Proposing a rule") || !strings.Contains(md, m.RuleLinks.Template) {
+		t.Errorf("markdown lacks the rule link section:\n%s", md)
+	}
+	if m := buildDiscoveryManifest(cp, "nobody"); m.RuleLinks != nil {
+		t.Error("an empty manifest got rule links")
+	}
+}
