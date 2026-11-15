@@ -314,6 +314,19 @@ type DiscoveryManifest struct {
 	// on a non-empty manifest so an agent learns the mechanism before it
 	// trips a gated rule.
 	HITL *DiscoveryHITL `json:"hitl,omitempty"`
+	// RuleLinks tells the agent how to propose a rule to its human, as a
+	// dashboard link. Present when the gateway has a public URL.
+	RuleLinks *DiscoveryRuleLinks `json:"rule_links,omitempty"`
+}
+
+// DiscoveryRuleLinks is how an agent proposes a rule: it builds a
+// dashboard link that opens the rule dialog filled in, and its human
+// checks the preview and creates the rule. Opening it changes nothing.
+type DiscoveryRuleLinks struct {
+	Explanation string `json:"explanation"`
+	// Template is the link, with each value to fill in between angle
+	// brackets.
+	Template string `json:"template"`
 }
 
 // DiscoveryHITL is the profile-scoped human-in-the-loop summary embedded
@@ -556,8 +569,35 @@ func buildDiscoveryManifest(policy *config.CompiledPolicy, profileName string) *
 	// everything actionable, so the pointer would just be noise there.
 	if m.isEmpty() {
 		m.Dashboard = policy.DashboardURL
+	} else if policy.DashboardURL != "" {
+		m.RuleLinks = buildDiscoveryRuleLinks(policy.DashboardURL)
 	}
 	return m
+}
+
+// ruleLinkPath is the dashboard route that opens the rule dialog from a
+// link's query parameters.
+const ruleLinkPath = "/#/rules/new"
+
+func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
+	return &DiscoveryRuleLinks{
+		Template: strings.TrimRight(dashboard, "/") + ruleLinkPath +
+			"?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
+		Explanation: "When a rule would help (a request was blocked or held, or you want a guard), " +
+			"you can propose one instead of describing it: build the link below and give it to your " +
+			"human. It opens the dashboard's rule dialog filled in; nothing changes until they check " +
+			"the preview and confirm. An admin of the dashboard must open it.\n\n" +
+			"- endpoint: an endpoint name from this manifest.\n" +
+			"- verdict: deny, allow (pre-approve) or approve (hold for a human).\n" +
+			"- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. " +
+			"HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; " +
+			"Kubernetes ones k8s.verb, k8s.resource, k8s.namespace, k8s.name. Omit it for every " +
+			"request to the endpoint. Keep it as narrow as the need.\n" +
+			"- note: one sentence on why, shown to your human.\n" +
+			"- Optional: approver=<human approver> for verdict approve, profile=<profile> to limit " +
+			"the rule to one profile.\n\n" +
+			"URL-encode every value (encodeURIComponent).",
+	}
 }
 
 // endpointHasHITL reports whether any enabled rule on ep routes matching
@@ -1113,6 +1153,12 @@ func (m *DiscoveryManifest) Markdown() string {
 			}
 			b.WriteString("\n")
 		}
+	}
+
+	if m.RuleLinks != nil {
+		b.WriteString("## Proposing a rule\n\n")
+		b.WriteString(m.RuleLinks.Explanation)
+		b.WriteString("\n\nLink: `" + m.RuleLinks.Template + "`\n\n")
 	}
 
 	fmt.Fprintf(&b, "## Endpoints (%d)\n\n", len(m.Endpoints))

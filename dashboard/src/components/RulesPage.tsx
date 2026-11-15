@@ -1,10 +1,21 @@
 import { useState } from "react";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
+import { RuleLinkDialog } from "./RuleLinkDialog";
+import { RuleLinkHelp } from "./RuleLinkHelp";
 import { RuleRequests } from "./RuleRequests";
 import { RulesPanel } from "./RulesPanel";
 
-export function RulesPage({ isMember }: { isMember: boolean }) {
+export function RulesPage({
+  isMember,
+  ruleLink,
+  onRuleLinkDone,
+}: {
+  isMember: boolean;
+  // ruleLink is the query of a #/rules/new link, when one opened the page.
+  ruleLink?: string;
+  onRuleLinkDone: () => void;
+}) {
   const [requestsVersion, setRequestsVersion] = useState(0);
   const [rulesVersion, setRulesVersion] = useState(0);
 
@@ -18,6 +29,7 @@ export function RulesPage({ isMember }: { isMember: boolean }) {
         </a>{" "}
         page.
       </p>
+      {!isMember && <RuleLinkHelp />}
       <RuleRequests
         isMember={isMember}
         version={requestsVersion}
@@ -28,6 +40,14 @@ export function RulesPage({ isMember }: { isMember: boolean }) {
         isMember={isMember}
         onChanged={() => setRequestsVersion((v) => v + 1)}
       />
+      {ruleLink !== undefined && (
+        <RuleLinkDialog
+          query={ruleLink}
+          isMember={isMember}
+          onDone={onRuleLinkDone}
+          onCreated={() => setRulesVersion((v) => v + 1)}
+        />
+      )}
     </Main>
   );
 }

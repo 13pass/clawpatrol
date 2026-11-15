@@ -31,6 +31,7 @@ type Route =
   | { name: "users" }
   | { name: "requests" }
   | { name: "rules" }
+  | { name: "rule-link"; query: string }
   | { name: "account" };
 
 function parseRoute(): Route {
@@ -51,6 +52,7 @@ function parseRoute(): Route {
   if (h === "#/users") return { name: "users" };
   if (h === "#/requests") return { name: "requests" };
   if (h === "#/rules") return { name: "rules" };
+  if (h === "#/rules/new") return { name: "rule-link", query: qi < 0 ? "" : raw.slice(qi + 1) };
   if (h === "#/analytics") return { name: "analytics" };
   const a = h.match(/^#\/analytics\/([^/]+)$/);
   if (a) return { name: "analytics", ip: decodeURIComponent(a[1]) };
@@ -114,7 +116,12 @@ export default function App() {
   // admins; those routes land on the account page.
   const isMember = whoami?.role === "member";
   const adminOnlyRoutes = ["users", "plugins"];
-  const shown = isMember && adminOnlyRoutes.includes(route.name) ? "account" : route.name;
+  const shown =
+    isMember && adminOnlyRoutes.includes(route.name)
+      ? "account"
+      : route.name === "rule-link"
+        ? "rules"
+        : route.name;
 
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
@@ -124,8 +131,12 @@ export default function App() {
         <AccountPage whoami={whoami} />
       ) : route.name === "requests" ? (
         <RequestsPage isMember={isMember} />
-      ) : route.name === "rules" ? (
-        <RulesPage isMember={isMember} />
+      ) : route.name === "rules" || route.name === "rule-link" ? (
+        <RulesPage
+          isMember={isMember}
+          ruleLink={route.name === "rule-link" ? route.query : undefined}
+          onRuleLinkDone={() => navigate("#/rules")}
+        />
       ) : route.name === "users" ? (
         <UsersPage whoami={whoami} />
       ) : route.name === "main" ? (
