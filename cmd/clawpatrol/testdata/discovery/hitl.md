@@ -43,7 +43,7 @@ Endpoints below that may park a request for human approval: admin, deploy.
 
 When a rule would help (a request was blocked or held, or you want a guard), you can propose one instead of describing it: build a link and give it to your human. It opens the dashboard's rule dialog filled in; nothing changes until they check the preview and confirm.
 
-- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 carries the request ID in its X-Clawpatrol-Request header and on the last line of its body. Anyone who owns your profile can open it, member or admin; a member's rule may go to an admin for review.
+- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 (and the 202 of an approval that went asynchronous) carries it ready-made in its X-Clawpatrol-Rule-Link header and in its body, and the request ID in X-Clawpatrol-Request. Give that link as is to let your human choose, or append &verdict=…&condition=…&note=… to fill the dialog in. Anyone who owns your profile can open it, member or admin; a member's rule may go to an admin for review.
 - Otherwise use the endpoint link, with endpoint set to an endpoint name from this manifest. Only an admin of the dashboard can open it.
 
 - verdict: deny, allow (pre-approve) or approve (hold for a human).
@@ -53,7 +53,7 @@ When a rule would help (a request was blocked or held, or you want a guard), you
 
 URL-encode every value (encodeURIComponent).
 
-Request link: `https://gw.example.test/#/request/<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
+Request link: `https://gw.example.test/#/request/<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
 
 Endpoint link: `https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
 

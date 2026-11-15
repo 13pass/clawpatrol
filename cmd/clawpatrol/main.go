@@ -17,6 +17,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -192,17 +193,42 @@ func parseDurationOr(s string, def time.Duration) time.Duration {
 	return d
 }
 
-// requestIDHeader carries a refused request's ID, the one the dashboard
-// shows it under (#/request/<id>), so the agent can point its human at
-// it, or build a rule link for it.
-const requestIDHeader = "X-Clawpatrol-Request"
+// requestIDHeader carries a refused or held request's ID, the one the
+// dashboard shows it under (#/request/<id>); ruleLinkHeader carries the
+// link that opens its rule dialog, when the gateway has a public URL.
+const (
+	requestIDHeader = "X-Clawpatrol-Request"
+	ruleLinkHeader  = "X-Clawpatrol-Rule-Link"
+)
+
+// requestRuleLink is the dashboard link that opens a request's rule
+// dialog, or "" without a public URL. An agent may append
+// &verdict=…&condition=…&note=… to fill it in.
+func requestRuleLink(publicURL, requestID string) string {
+	if publicURL == "" || requestID == "" {
+		return ""
+	}
+	return dashboardLink(publicURL, requestLinkPath+url.PathEscape(requestID)+"?rule")
+}
+
+// dashboardLink is a dashboard route under the gateway's public URL.
+func dashboardLink(publicURL, route string) string {
+	return strings.TrimRight(publicURL, "/") + route
+}
 
 // writeDenied answers a request the policy or an approver refused. The
-// ID is also the body's last line: agents often see only the body.
-func writeDenied(w io.Writer, reason, requestID string) {
-	body := reason + "\nClaw Patrol request: " + requestID + "\n"
-	_, _ = fmt.Fprintf(w, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n%s: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s",
-		requestIDHeader, requestID, len(body), body)
+// rule link and the ID are also in the body, the ID on its last line:
+// agents often see only the body.
+func writeDenied(w io.Writer, reason, publicURL, requestID string) {
+	body := reason + "\n"
+	headers := requestIDHeader + ": " + requestID + "\r\n"
+	if link := requestRuleLink(publicURL, requestID); link != "" {
+		body += "To propose a rule for it, give your human this link (append &verdict=…&condition=…&note=… to fill it in): " + link + "\n"
+		headers += ruleLinkHeader + ": " + link + "\r\n"
+	}
+	body += "Claw Patrol request: " + requestID + "\n"
+	_, _ = fmt.Fprintf(w, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n%sContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		headers, len(body), body)
 }
 
 // newReqID returns a UUIDv7 string. Time-ordered + random tail;
@@ -2970,7 +2996,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						asyncOp = updated
 					}
 					_ = tc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.Load().PublicURL()); err != nil {
+					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.Load().PublicURL(), ev.ID); err != nil {
 						log.Printf("hitl async pending response write %s: %v", asyncOp.ID, err)
 					}
 					_ = tc.SetWriteDeadline(time.Time{})
@@ -2995,7 +3021,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 				log.Printf("denied %s %s %s: %s (by %s/%s/%s)",
 					host, req.Method, req.URL.Path, reason, v.ApproverType, v.ApproverName, v.By)
-				writeDenied(tc, reason, ev.ID)
+				writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 				ev.Status = "403"
 				ev.Action = "denied"
 				ev.Approver = v.ApproverName
@@ -3037,7 +3063,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, err)
 				}
 			}
-			writeDenied(tc, reason, ev.ID)
+			writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 			ev.Status = "403"
 			ev.Action = "deny"
 			ev.Reason = reason

@@ -14,6 +14,9 @@ export type RuleLink = {
   approver: string;
   profile: string;
   note: string;
+  // prepared is false for a bare link, such as the one the gateway puts
+  // on a refused request: it opens the dialog without filling it in.
+  prepared: boolean;
   // problems are what the link asked for and the dialog could not take.
   problems: string[];
 };
@@ -51,6 +54,7 @@ export function parseRuleLink(query: string): RuleLink {
     approver,
     profile: q.get("profile") ?? "",
     note: (q.get("note") ?? "").trim().slice(0, NOTE_MAX_CHARS),
+    prepared: [...q.keys()].some((k) => k !== "rule"),
     problems,
   };
 }

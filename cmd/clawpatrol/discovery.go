@@ -585,17 +585,18 @@ const (
 )
 
 func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
-	base := strings.TrimRight(dashboard, "/")
 	return &DiscoveryRuleLinks{
-		RequestTemplate: base + requestLinkPath + "<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
-		Template:        base + ruleLinkPath + "?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>",
+		RequestTemplate: dashboardLink(dashboard, requestLinkPath+"<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
+		Template:        dashboardLink(dashboard, ruleLinkPath+"?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
 		Explanation: "When a rule would help (a request was blocked or held, or you want a guard), " +
 			"you can propose one instead of describing it: build a link and give it to your human. " +
 			"It opens the dashboard's rule dialog filled in; nothing changes until they check the " +
 			"preview and confirm.\n\n" +
 			"- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 " +
-			"carries the request ID in its " + requestIDHeader + " header and on the last line of " +
-			"its body. Anyone who " +
+			"(and the 202 of an approval that went asynchronous) carries it ready-made in its " +
+			ruleLinkHeader + " header and in its body, and the request ID in " + requestIDHeader +
+			". Give that link as is to let your human choose, or append &verdict=…&condition=…" +
+			"&note=… to fill the dialog in. Anyone who " +
 			"owns your profile can open it, member or admin; a member's rule may go to an admin for " +
 			"review.\n" +
 			"- Otherwise use the endpoint link, with endpoint set to an endpoint name from this " +

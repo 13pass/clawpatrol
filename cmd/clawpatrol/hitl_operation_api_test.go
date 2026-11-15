@@ -26,7 +26,7 @@ func TestHITLOperationAcceptedResponseIncludesPollingEnvelope(t *testing.T) {
 	}
 
 	rr := httptest.NewRecorder()
-	writeHITLOperationAccepted(rr, op, "https://gateway.example.test/")
+	writeHITLOperationAccepted(rr, op, "https://gateway.example.test/", "")
 
 	assertHITLOperationAcceptedResponse(t, rr.Code, rr.Header(), rr.Body.Bytes(), op)
 }
@@ -40,7 +40,7 @@ func TestHITLOperationAcceptedRawConnResponseHasDelimitedJSONBody(t *testing.T) 
 	}
 
 	var raw bytes.Buffer
-	if err := writeHITLOperationAcceptedToConn(&raw, op, "https://gateway.example.test/"); err != nil {
+	if err := writeHITLOperationAcceptedToConn(&raw, op, "https://gateway.example.test/", ""); err != nil {
 		t.Fatalf("write raw response: %v", err)
 	}
 	resp, body := parseRawHITLOperationAcceptedResponse(t, raw.Bytes())
@@ -64,7 +64,7 @@ func TestHITLOperationAcceptedRawConnResponseWritesCompleteEnvelopeInOnePayload(
 	}
 	w := &singleWriteRecorder{}
 
-	if err := writeHITLOperationAcceptedToConn(w, op, "https://gateway.example.test/"); err != nil {
+	if err := writeHITLOperationAcceptedToConn(w, op, "https://gateway.example.test/", ""); err != nil {
 		t.Fatalf("write raw response: %v", err)
 	}
 	if w.writes != 1 {
