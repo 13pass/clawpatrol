@@ -519,7 +519,76 @@ gateway checks the blocks each time it loads the config, by declaring
 a probe endpoint with them the way the dashboard would, so a condition
 that does not compile or an approver that does not exist fails the
 load, not the first host added. Endpoints that already exist, and ones
-declared in HCL, get no rules from these blocks.
+declared in HCL, get no rules from these blocks; an admin gives them
+these rules with "Add default rules" (below).
+
+### Managing rules on the dashboard
+
+The Rules page lists every rule the viewer can see, grouped by endpoint
+in the order they are tried: highest priority first, then in
+declaration order. A device page shows the same list for the device's
+profile. The rules of the viewer's own file (the dashboard's file for an
+admin, `50-user-<name>.hcl` for a member) can be disabled, enabled or
+deleted there, under the review rules above. For an admin, every other
+rule names the file it is declared in, where it is changed by hand.
+
+Each endpoint's header gives an admin two more actions. Endpoints with
+no rule are listed for admins, so both apply to them too:
+
+- **Add rule** writes a rule with no request to start from. The CEL
+  condition is typed, or left empty for every request to the endpoint.
+  On a device page the rule is limited to that profile (`profile = …`)
+  unless that box is unticked. The dialog previews it against the
+  endpoint's recent requests, and the rule is written to the dashboard
+  file at priority 100. A pre-approval warns that it is tried before
+  the endpoint's lower-priority rules, deny rules included.
+- **Add default rules** shows on an `https` endpoint that lacks one or
+  more of the `new_endpoint_rule` rules, and writes the missing ones as
+  `<endpoint>-<name>`.
+
+### Rule links
+
+An agent can propose a rule as a link that opens the rule dialog filled
+in. Opening it changes nothing: the human checks the preview and
+creates the rule, or closes the dialog. A banner says an agent prepared
+it, shows its note, and lists anything the dialog could not take from
+the link (an unknown verdict, a reviewer on a verdict other than
+approve, a profile that does not reach the endpoint, a condition
+spanning several lines).
+
+- **Request link:** `<public_url>/#/request/<request id>?rule`, with
+  `&verdict=deny|allow|approve&condition=<CEL>&note=<why>` appended to
+  fill it in. It opens that request's rule dialog for anyone who may
+  see the request, so a member can open it; a member's rule goes to
+  review as usual. Without a condition it makes the rule the request
+  would give: same method and path, same Kubernetes object, or a host
+  with no endpoint as a whole.
+- **Endpoint link:** `<public_url>/#/rules/new?endpoint=<name>&verdict=…&condition=…&note=…`,
+  with `approver=` and `profile=` optional. It opens Add rule, so only
+  an admin can use it. Without a condition the rule covers every
+  request to the endpoint.
+
+Every value is URL-encoded. A bare `?rule` request link opens the
+dialog unfilled and without the banner.
+
+The gateway hands the agent what it needs. A request refused by a rule
+or by an approver on an `https` or `kubernetes` endpoint gets a 403
+with:
+
+| Where | What |
+|---|---|
+| `X-Clawpatrol-Request` header, and the body's last line (`Claw Patrol request: <id>`) | the request's ID, as the dashboard shows it |
+| `X-Clawpatrol-Rule-Link` header, and a line in the body | the ready request link, when `gateway.public_url` is set |
+
+The 202 of an approval that went asynchronous carries the same headers,
+and `request_id` and `rule_link` in its JSON. SQL and SSH refusals do
+not carry them yet.
+
+Agents under `clawpatrol run` learn the links from the **Proposing a
+rule** section of their manifest at `https://clawpatrol.internal/`
+(`rule_links` in its JSON), present when `public_url` is set. For other
+agents, the Rules page gives admins a prompt to copy ("Let an agent
+propose rules").
 
 ### Synchronous human approval and timeouts
 
@@ -709,7 +778,9 @@ driver doesn't disconnect:
 
 - **`https`, `kubernetes`, `clickhouse_https`** — `HTTP/1.1 403
   Forbidden`, `Content-Type: text/plain`, reason in the body,
-  `Connection: close`.
+  `Connection: close`. For `https` and `kubernetes` the response also
+  names the request and links its rule dialog (see
+  [Rule links](#rule-links)).
 - **`postgres`** — `ErrorResponse` (severity `ERROR`, SQLSTATE
   `42501`, message = reason), followed by `ReadyForQuery` in idle
   state. The session stays open; the agent can run the next query.
