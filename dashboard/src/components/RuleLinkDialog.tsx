@@ -32,11 +32,23 @@ export function parseRuleLink(query: string): RuleLink {
         : "The link names no verdict: Deny is selected.",
     );
   }
+  let approver = q.get("approver") ?? "";
+  if (approver && verdict !== "approve") {
+    problems.push(
+      `The link names reviewer "${approver}", but a reviewer only applies to Require approval: it is ignored.`,
+    );
+    approver = "";
+  }
+  const condition = q.get("condition") ?? "";
+  const lines = condition.split("\n").length;
+  if (lines > 1) {
+    problems.push(`The condition spans ${lines} lines: read all of it before creating the rule.`);
+  }
   return {
     endpoint: q.get("endpoint") ?? "",
     verdict,
-    condition: q.get("condition") ?? "",
-    approver: q.get("approver") ?? "",
+    condition,
+    approver,
     profile: q.get("profile") ?? "",
     note: (q.get("note") ?? "").trim().slice(0, NOTE_MAX_CHARS),
     problems,
@@ -48,11 +60,14 @@ export function parseRuleLink(query: string): RuleLink {
 export function RuleLinkDialog({
   query,
   isMember,
+  roleKnown,
   onDone,
   onCreated,
 }: {
   query: string;
   isMember: boolean;
+  // roleKnown is false until the viewer's role has loaded.
+  roleKnown: boolean;
   onDone: () => void;
   onCreated: () => void;
 }) {
@@ -61,12 +76,16 @@ export function RuleLinkDialog({
   const [err, setErr] = useState("");
 
   useEffect(() => {
-    if (isMember) return;
+    if (!roleKnown || isMember) return;
     getMyRules()
-      .then((r) => setEndpoints(r.endpoints ?? []))
+      .then((r) => {
+        if (r.unavailable) setErr(r.unavailable);
+        else setEndpoints(r.endpoints ?? []);
+      })
       .catch((e) => setErr(String(e instanceof Error ? e.message : e)));
-  }, [isMember]);
+  }, [roleKnown, isMember]);
 
+  if (!roleKnown) return null;
   const message = isMember
     ? "This link opens the rule dialog for an admin. Send it to an admin of the dashboard, or create the rule from your request on the Requests page."
     : err ||
@@ -82,12 +101,20 @@ export function RuleLinkDialog({
   }
   const ep = endpoints?.find((e) => e.name === link.endpoint);
   if (!ep) return null;
+  const initial = { ...link, problems: [...link.problems] };
+  if (link.profile && !ep.profiles.includes(link.profile)) {
+    initial.problems.push(
+      `The link limits the rule to profile "${link.profile}", which does not reach ${ep.name}: the rule is not limited.`,
+    );
+    initial.profile = "";
+  }
   return (
     <EndpointRuleModal
+      key={query}
       endpoint={ep.name}
       family={ep.family}
-      profile={link.profile || undefined}
-      initial={link}
+      profile={initial.profile || undefined}
+      initial={initial}
       onClose={onDone}
       onCreated={onCreated}
     />

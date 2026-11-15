@@ -591,8 +591,9 @@ func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
 			"- verdict: deny, allow (pre-approve) or approve (hold for a human).\n" +
 			"- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. " +
 			"HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; " +
-			"Kubernetes ones k8s.verb, k8s.resource, k8s.namespace, k8s.name. Omit it for every " +
-			"request to the endpoint. Keep it as narrow as the need.\n" +
+			"Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL " +
+			"ones have sql.verb, sql.tables, sql.function, sql.statement. Omit it for every request " +
+			"to the endpoint. Keep it as narrow as the need.\n" +
 			"- note: one sentence on why, shown to your human.\n" +
 			"- Optional: approver=<human approver> for verdict approve, profile=<profile> to limit " +
 			"the rule to one profile.\n\n" +

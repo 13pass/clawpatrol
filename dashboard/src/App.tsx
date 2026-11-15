@@ -106,8 +106,10 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  function navigate(hash: string) {
-    window.location.hash = hash;
+  // replace leaves no history entry, so Back does not return to hash.
+  function navigate(hash: string, replace = false) {
+    if (replace) window.location.replace(hash);
+    else window.location.hash = hash;
     setRoute(parseRoute());
   }
 
@@ -135,7 +137,9 @@ export default function App() {
         <RulesPage
           isMember={isMember}
           ruleLink={route.name === "rule-link" ? route.query : undefined}
-          onRuleLinkDone={() => navigate("#/rules")}
+          roleKnown={whoami !== null}
+          publicURL={whoami?.public_url}
+          onRuleLinkDone={() => navigate("#/rules", true)}
         />
       ) : route.name === "users" ? (
         <UsersPage whoami={whoami} />

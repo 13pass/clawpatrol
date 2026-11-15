@@ -18,6 +18,9 @@ import {
   useRulePreview,
 } from "./RuleDialogParts";
 
+// Past this, the condition box scrolls.
+const CONDITION_MAX_ROWS = 12;
+
 const CONDITION_VARIABLES: Record<string, string> = {
   http: "http.method, http.path, http.query, http.headers, http.body_json",
   k8s: "k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params",
@@ -51,7 +54,12 @@ export function EndpointRuleModal({
   const conditionId = useId();
 
   const request = useMemo<RuleRequest>(
-    () => ({ verdict, scope: "exact", approver, condition: condition.trim() || undefined }),
+    () => ({
+      verdict,
+      scope: "exact",
+      approver: verdict === "approve" ? approver : "",
+      condition: condition.trim() || undefined,
+    }),
     [verdict, approver, condition],
   );
   const approvers = useApprovers(true);
@@ -136,7 +144,7 @@ export function EndpointRuleModal({
                 id={conditionId}
                 value={condition}
                 onChange={(e) => setCondition(e.target.value)}
-                rows={3}
+                rows={Math.min(Math.max(3, condition.split("\n").length), CONDITION_MAX_ROWS)}
                 spellCheck={false}
                 placeholder={family === "http" ? "http.method == 'DELETE'" : ""}
                 className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"

@@ -8,10 +8,14 @@ import { RulesPanel } from "./RulesPanel";
 
 export function RulesPage({
   isMember,
+  roleKnown,
+  publicURL,
   ruleLink,
   onRuleLinkDone,
 }: {
   isMember: boolean;
+  roleKnown: boolean;
+  publicURL?: string;
   // ruleLink is the query of a #/rules/new link, when one opened the page.
   ruleLink?: string;
   onRuleLinkDone: () => void;
@@ -29,7 +33,7 @@ export function RulesPage({
         </a>{" "}
         page.
       </p>
-      {!isMember && <RuleLinkHelp />}
+      {roleKnown && !isMember && <RuleLinkHelp publicURL={publicURL} />}
       <RuleRequests
         isMember={isMember}
         version={requestsVersion}
@@ -44,6 +48,7 @@ export function RulesPage({
         <RuleLinkDialog
           query={ruleLink}
           isMember={isMember}
+          roleKnown={roleKnown}
           onDone={onRuleLinkDone}
           onCreated={() => setRulesVersion((v) => v + 1)}
         />
