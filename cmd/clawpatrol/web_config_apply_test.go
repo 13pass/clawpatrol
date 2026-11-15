@@ -124,10 +124,10 @@ profile "default" {
 // disambiguator entries, here) — the fallback is a plain append that
 // validates as a duplicate-profile error rather than silently
 // corrupting the existing block.
-func TestConfigApplyBailsOnComplexProfileBody(t *testing.T) {
+func TestConfigApplyMergesIntoComplexProfileBody(t *testing.T) {
 	w := configApplyTestMux(t, true)
-	// Replace the simple "default" profile in the seed config with a
-	// disambiguator-heavy one so the merge has to bail.
+	// A profile whose credentials list holds disambiguator entries over
+	// several lines: the merge edits the list without touching them.
 	complexSrc := `gateway {
   state_dir = "` + filepath.ToSlash(filepath.Dir(w.g.cfgPath)) + `"
   dashboard_config_writes = true
@@ -178,23 +178,18 @@ profile "default" {
 		"base_revision": revisionForBytes(before),
 		"append_hcl":    snippet,
 	}))
-	// Plain append produces a duplicate "default" profile, which
-	// loadConfig rejects. We want the file unchanged and a 400 with
-	// the loader's error.
-	if rw.Code != http.StatusBadRequest {
+	if rw.Code != http.StatusOK {
 		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
 	}
 	after, err := os.ReadFile(w.g.cfgPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(before, after) {
-		t.Fatalf("config changed after rejected apply")
-	}
-	// The disambiguator entries must still be intact in the
-	// untouched config.
-	if !strings.Contains(string(after), `placeholder = "PH_a"`) {
-		t.Fatalf("disambiguator body corrupted:\n%s", after)
+	want := strings.Replace(string(before),
+		"    { placeholder = \"PH_b\", credential = bearer_token.tok-b },\n",
+		"    { placeholder = \"PH_b\", credential = bearer_token.tok-b },\n    passthrough.tinyclouds_org_passthrough,\n", 1)
+	if !strings.HasPrefix(string(after), want) || strings.Count(string(after), `profile "default"`) != 1 {
+		t.Fatalf("config after the merge:\n%s", after)
 	}
 }
 
