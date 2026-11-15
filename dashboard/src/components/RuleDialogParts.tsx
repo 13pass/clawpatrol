@@ -258,3 +258,19 @@ export function RuleDialogFooter({
     </div>
   );
 }
+
+// AgentLinkNotice heads a dialog an agent's link filled in: who
+// prepared it, its note, and what the dialog could not take from it.
+export function AgentLinkNotice({ note, problems }: { note: string; problems: string[] }) {
+  return (
+    <div className="space-y-1 border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
+      <p className="font-bold">
+        Prepared by an agent. Check the rule and its preview before creating it.
+      </p>
+      {note && <p className="whitespace-pre-wrap break-words">Why: {note}</p>}
+      {problems.map((p) => (
+        <p key={p}>{p}</p>
+      ))}
+    </div>
+  );
+}

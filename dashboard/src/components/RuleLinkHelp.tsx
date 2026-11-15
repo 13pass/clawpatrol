@@ -10,13 +10,13 @@ export function RuleLinkHelp({ publicURL }: { publicURL?: string }) {
   const base = publicURL
     ? publicURL.replace(/\/+$/, "") + "/"
     : `${window.location.origin}${window.location.pathname}`;
-  const link = `${base}#/rules/new`;
   const prompt = [
-    "When a Claw Patrol rule would help (a request was blocked or held, or a guard is needed), propose it as a link instead of describing it:",
-    `${link}?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`,
-    "- endpoint: the Claw Patrol endpoint name. verdict: deny, allow (pre-approve) or approve (hold for a human).",
-    "- condition: a CEL expression on the request, e.g. http.method == 'DELETE'. HTTP: http.method, http.path, http.query, http.headers, http.body_json. Kubernetes adds k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params. SQL: sql.verb, sql.tables, sql.function, sql.statement. Omit it for every request; keep it as narrow as the need.",
-    "- note: one sentence on why. Optional: approver=<human approver>, profile=<profile>.",
+    "When a Claw Patrol rule would help (a request was blocked or held, or a guard is needed), propose it as a link instead of describing it.",
+    `- For an HTTPS or Kubernetes request the gateway refused (403), its ID is in the X-Clawpatrol-Request header and on the body's last line: ${base}#/request/<request id>?verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`,
+    `- Otherwise, for an endpoint (an admin must open it): ${base}#/rules/new?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`,
+    "- verdict: deny, allow (pre-approve) or approve (hold for a human). endpoint (endpoint link only): the Claw Patrol endpoint name.",
+    "- condition: a CEL expression on the request, e.g. http.method == 'DELETE'. HTTP: http.method, http.path, http.query, http.headers, http.body_json. Kubernetes adds k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params. SQL: sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link matches requests like that one and the endpoint link every request to the endpoint; keep it as narrow as the need.",
+    "- note: one sentence on why. Endpoint link only, optional: approver=<human approver>, profile=<profile>.",
     "URL-encode every value. The link only fills in the dashboard's rule dialog; I check the preview and create the rule.",
   ].join("\n");
 

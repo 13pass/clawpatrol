@@ -87,7 +87,7 @@ export function RuleLinkDialog({
 
   if (!roleKnown) return null;
   const message = isMember
-    ? "This link opens the rule dialog for an admin. Send it to an admin of the dashboard, or create the rule from your request on the Requests page."
+    ? "This link opens the rule dialog for an admin. Send it to an admin of the dashboard, or ask the agent for the link to the request it was refused, which you can open."
     : err ||
       (endpoints && !endpoints.some((e) => e.name === link.endpoint)
         ? `The link names endpoint "${link.endpoint}", which this gateway does not declare.`

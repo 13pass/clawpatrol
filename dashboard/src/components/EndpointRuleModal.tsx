@@ -9,6 +9,7 @@ import {
 import { Modal } from "./Modal";
 import type { RuleLink } from "./RuleLinkDialog";
 import {
+  AgentLinkNotice,
   RULE_LABEL_CLASS,
   ReviewerSelect,
   RuleDialogFooter,
@@ -93,19 +94,7 @@ export function EndpointRuleModal({
           </p>
         ) : (
           <>
-            {initial && (
-              <div className="space-y-1 border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
-                <p className="font-bold">
-                  Prepared by an agent. Check the rule and its preview before creating it.
-                </p>
-                {initial.note && (
-                  <p className="whitespace-pre-wrap break-words">Why: {initial.note}</p>
-                )}
-                {initial.problems.map((p) => (
-                  <p key={p}>{p}</p>
-                ))}
-              </div>
-            )}
+            {initial && <AgentLinkNotice note={initial.note} problems={initial.problems} />}
             <VerdictPicker
               verdicts={["deny", "allow", "approve"]}
               value={verdict}
