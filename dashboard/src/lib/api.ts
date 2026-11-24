@@ -1202,3 +1202,63 @@ export async function oauthExchange(
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
+
+// Join intents: the Add device window's Agent prompt (onboard_intent.go).
+export type JoinIntent = {
+  id: string;
+  profile: string;
+  device_name: string;
+  expires_at: number;
+  ca_fingerprint: string;
+};
+
+export type JoinIntentState =
+  | "waiting"
+  | "pending"
+  | "approved"
+  | "joined"
+  | "rejected"
+  | "conflict"
+  | "expired";
+
+export type DeviceRef = { name: string; profile: string };
+
+export type JoinIntentStatus = {
+  id: string;
+  state: JoinIntentState;
+  profile: string;
+  expires_at: number;
+  device?: {
+    name: string;
+    os_hostname: string;
+    os_user: string;
+    os: string;
+    user_code: string;
+  };
+  replaces?: DeviceRef;
+  on_machine?: DeviceRef[];
+  warnings?: string[];
+  error?: string;
+};
+
+export function createJoinIntent(profile: string, deviceName: string) {
+  return postJSON<JoinIntent>("/api/onboard/intent", { profile, device_name: deviceName });
+}
+
+export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus> {
+  const r = await api(`/api/onboard/intent/status?id=${encodeURIComponent(id)}`);
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function rejectJoinIntent(id: string) {
+  return postJSON<JoinIntentStatus>("/api/onboard/intent/reject", { id });
+}
+
+export function approveJoin(code: string, profile: string, replace: boolean) {
+  return postJSON<{ approved?: boolean; profile: string }>("/api/onboard/approve", {
+    code,
+    profile,
+    replace,
+  });
+}

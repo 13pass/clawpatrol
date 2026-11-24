@@ -56,3 +56,19 @@ func TestReorderJoinArgsForFlagParseConsumesValueFlagsAfterURL(t *testing.T) {
 		}
 	}
 }
+
+func TestReorderJoinArgsForFlagParseKeepsIntentValue(t *testing.T) {
+	got := reorderJoinArgsForFlagParse([]string{
+		"https://gateway.example.com",
+		"--intent", "abc123",
+		"--ca-fingerprint", "AB:CD",
+	})
+	want := []string{
+		"--intent", "abc123",
+		"--ca-fingerprint", "AB:CD",
+		"https://gateway.example.com",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("reordered args mismatch\n got: %#v\nwant: %#v", got, want)
+	}
+}

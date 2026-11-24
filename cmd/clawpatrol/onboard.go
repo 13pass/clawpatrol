@@ -12,8 +12,8 @@ package main
 //   5. CLI: POST /api/onboard/poll?device_code=... → {auth_key} once
 //      approved; CLI runs `tailscale up --authkey=<key>`.
 //
-// Codes expire in 10 minutes; auth keys minted are single-use,
-// non-reusable, ephemeral=false.
+// Codes expire after onboardSessionTTL; auth keys minted are
+// single-use, non-reusable, ephemeral=false.
 
 import (
 	"context"
@@ -32,6 +32,9 @@ import (
 	"sync"
 	"time"
 )
+
+// onboardSessionTTL is how long a device-flow code stays valid.
+const onboardSessionTTL = 10 * time.Minute
 
 // randomString returns a URL-safe base64 string of n random bytes.
 // Used for onboard device codes, OAuth state/verifier, HITL IDs.
@@ -66,6 +69,16 @@ type onboardSession struct {
 	// per-process tsnet. Determines whether the minted auth key is
 	// ephemeral (per-process) or not (whole-machine).
 	wholeMachine bool
+	// osHostname, osUser and os describe the joining machine as the CLI
+	// reports them (os.Hostname, the OS account, GOOS). Self-asserted:
+	// shown to the approver and used to name intent joins, never to
+	// authorize anything.
+	osHostname string
+	osUser     string
+	os         string
+	// intent is the dashboard join intent this session was started
+	// with (`clawpatrol join --intent`), if any.
+	intent *joinIntent
 }
 
 // onboardRegistry persists onboarded peers in the `devices` table,
@@ -103,7 +116,9 @@ type onboardRegistry struct {
 	// from any IP that genuinely has no devices-table mapping would
 	// trigger a WhoIs lookup per packet.
 	resolveTriedAt map[string]time.Time
-	db             *sql.DB
+	// intents holds the dashboard's join intents (onboard_intent.go).
+	intents map[string]*joinIntent
+	db      *sql.DB
 }
 
 func newOnboardRegistry() *onboardRegistry {
@@ -119,6 +134,7 @@ func newOnboardRegistry() *onboardRegistry {
 		nodeIDByIP:       map[string]string{},
 		knownDeviceIPs:   map[string]bool{},
 		resolveTriedAt:   map[string]time.Time{},
+		intents:          map[string]*joinIntent{},
 	}
 }
 
@@ -753,13 +769,15 @@ func (r *onboardRegistry) byDeviceCode(code string) *onboardSession {
 }
 
 func (r *onboardRegistry) gcLocked() {
-	cutoff := time.Now().Add(-10 * time.Minute)
+	now := time.Now()
+	cutoff := now.Add(-onboardSessionTTL)
 	for k, s := range r.byDevice {
 		if s.created.Before(cutoff) {
 			delete(r.byDevice, k)
 			delete(r.byUser, s.userCode)
 		}
 	}
+	r.gcIntentsLocked(now)
 }
 
 // randomUserCode returns a friendly 8-char code "ABCD-1234".
@@ -951,17 +969,40 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 	// retired node's name from being claimed by another while its
 	// devices row still exists.
 	wm := r.URL.Query().Get("whole_machine") == "1"
-	if hn != "" || prof != "" || wm {
-		w.onboard.mu.Lock()
-		if hn != "" {
-			s.hostname = hn
-		}
-		if prof != "" {
-			s.profile = prof
-		}
-		s.wholeMachine = wm
-		w.onboard.mu.Unlock()
+	// The machine as the CLI describes it, for the approver and for
+	// naming an intent join. Values that could not be a host or
+	// account name are dropped rather than shown.
+	osUser := r.URL.Query().Get("os_user")
+	if !validDeviceName(osUser) {
+		osUser = ""
 	}
+	osName := r.URL.Query().Get("os")
+	if !validDeviceName(osName) {
+		osName = ""
+	}
+	intentID := r.URL.Query().Get("intent")
+	w.onboard.mu.Lock()
+	if hn != "" {
+		s.hostname = hn
+		if validDeviceName(hn) {
+			s.osHostname = hn
+		}
+	}
+	if prof != "" {
+		s.profile = prof
+	}
+	s.wholeMachine = wm
+	s.osUser = osUser
+	s.os = osName
+	if intentID != "" {
+		if err := w.onboard.bindIntentLocked(intentID, s); err != nil {
+			w.onboard.dropSessionLocked(s)
+			w.onboard.mu.Unlock()
+			http.Error(rw, err.msg, err.status)
+			return
+		}
+	}
+	w.onboard.mu.Unlock()
 	// Build the verify URL that points at the dashboard approval page.
 	// In tsnet mode the approving operator is on the tailnet — use the
 	// tailnet-direct HTTP URL (http://<100.x.x.x>:<info_port>) so they
@@ -994,7 +1035,7 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 		"user_code":   s.userCode,
 		"verify_url":  verifyURL,
 		"interval":    3,
-		"expires_in":  600,
+		"expires_in":  int(onboardSessionTTL.Seconds()),
 	})
 }
 
@@ -1047,6 +1088,9 @@ func (w *webMux) apiOnboardLookup(rw http.ResponseWriter, r *http.Request) {
 type onboardApproveBody struct {
 	Code    string `json:"code"`
 	Profile string `json:"profile"`
+	// Replace confirms that a join started from a dashboard join intent
+	// may take over the existing device of the same name and profile.
+	Replace bool `json:"replace"`
 }
 
 // decodeOnboardApproveBody reads the approve request's JSON body. An
@@ -1142,10 +1186,19 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 		// failing. With zero profiles this stays the raw suggestion.
 		profile = resolveProfileFromList(profiles, s.profile)
 	}
+	if err := w.checkIntentApproval(s, owner, profile, body.Replace); err != nil {
+		http.Error(rw, err.msg, err.status)
+		return
+	}
 	w.onboard.mu.Lock()
 	if s.approved {
 		w.onboard.mu.Unlock()
 		writeJSON(rw, map[string]any{"already": true, "profile": s.profile})
+		return
+	}
+	if in := s.intent; in != nil && (in.rejected || in.conflict) {
+		w.onboard.mu.Unlock()
+		http.Error(rw, "this join was cancelled", http.StatusConflict)
 		return
 	}
 	s.approved = true
