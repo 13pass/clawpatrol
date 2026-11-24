@@ -54,7 +54,7 @@ func (s *gatewaySecretStore) Get(name string) (runtime.Secret, error) {
 			return runtime.Secret{}, err
 		}
 		if ok {
-			return sec, nil
+			return fillFromEnv(sec, s.env, name), nil
 		}
 	}
 	if s.oauth != nil {
@@ -65,6 +65,29 @@ func (s *gatewaySecretStore) Get(name string) (runtime.Secret, error) {
 		}
 	}
 	return s.env.Get(name)
+}
+
+// fillFromEnv completes stored material with the env vars for the slots
+// it lacks, so a credential may take one half from the dashboard and
+// the other from the environment.
+func fillFromEnv(sec runtime.Secret, env runtime.SecretStore, name string) runtime.Secret {
+	fromEnv, err := env.Get(name)
+	if err != nil {
+		return sec
+	}
+	if len(sec.Bytes) == 0 {
+		sec.Bytes = fromEnv.Bytes
+	}
+	for k, v := range fromEnv.Extras {
+		if _, ok := sec.Extras[k]; ok {
+			continue
+		}
+		if sec.Extras == nil {
+			sec.Extras = map[string]string{}
+		}
+		sec.Extras[k] = v
+	}
+	return sec
 }
 
 // readCredentialSecrets fetches every slot persisted for the named

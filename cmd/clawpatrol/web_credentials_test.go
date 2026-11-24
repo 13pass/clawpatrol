@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/denoland/clawpatrol/internal/config"
+	"github.com/denoland/clawpatrol/internal/config/plugins/credentials"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
@@ -569,5 +570,62 @@ func TestAPICredentialsSetSerialisesPerCredential(t *testing.T) {
 	v, ok := getCredentialVerification(db, "slack-team")
 	if !ok || v.Status != "failed" {
 		t.Fatalf("verification row = %+v (ok=%v), want failed from the later save", v, ok)
+	}
+}
+
+func TestStatusListReportsAHalfFilledBasicAuth(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	g := &Gateway{db: db}
+	g.policy.Store(&config.CompiledPolicy{Credentials: map[string]*config.Entity{
+		"jira": {Plugin: &config.Plugin{Type: "basic_auth"}, Body: &credentials.BasicAuth{}},
+	}})
+	w := &webMux{g: g}
+	admin := viewer{admin: true}
+
+	if err := setCredentialSlot(db, "jira", "username", "alice@example.org"); err != nil {
+		t.Fatal(err)
+	}
+	row := w.statusListFor(admin, "")[0]
+	if row.Connected || len(row.MissingSlots) != 1 || row.MissingSlots[0] != "Password" {
+		t.Errorf("username only: connected=%v missing=%v, want disconnected, missing Password", row.Connected, row.MissingSlots)
+	}
+	if row.SlotValues["username"] != "alice@example.org" {
+		t.Errorf("slot values = %v, want the stored username", row.SlotValues)
+	}
+
+	if err := setCredentialSlot(db, "jira", "", "api-token"); err != nil {
+		t.Fatal(err)
+	}
+	row = w.statusListFor(admin, "")[0]
+	if !row.Connected || len(row.MissingSlots) != 0 {
+		t.Errorf("both: connected=%v missing=%v, want connected", row.Connected, row.MissingSlots)
+	}
+	if _, leaked := row.SlotValues[""]; leaked || len(row.SlotValues) != 1 {
+		t.Errorf("slot values = %v, want only the username", row.SlotValues)
+	}
+}
+
+func TestSecretStoreFillsMissingHalvesFromEnv(t *testing.T) {
+	db, err := OpenDB(filepath.Join(t.TempDir(), "state.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	if err := setCredentialSlot(db, "jira", "username", "alice@example.org"); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CLAWPATROL_SECRET_JIRA", "api-token")
+	t.Setenv("CLAWPATROL_SECRET_JIRA_USERNAME", "env-user")
+
+	sec, err := newGatewaySecretStore(db, nil).Get("jira")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(sec.Bytes) != "api-token" || sec.Extras["username"] != "alice@example.org" {
+		t.Errorf("secret = %q / %v, want the env password and the stored username", sec.Bytes, sec.Extras)
 	}
 }

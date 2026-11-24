@@ -6,15 +6,27 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 const credentialSampleRedaction = "[REDACTED credential]"
 
-func appendCredentialSecretRedactions(dst []string, sec runtime.Secret) []string {
+// appendCredentialSecretRedactions adds the secret's values, except
+// those of the credential's visible (non-secret) slots, such as a
+// username that would otherwise be blanked wherever it appears.
+func appendCredentialSecretRedactions(dst []string, sec runtime.Secret, credential any) []string {
 	dst = appendCredentialSecretRedaction(dst, string(sec.Bytes))
-	for _, extra := range sec.Extras {
-		dst = appendCredentialSecretRedaction(dst, extra)
+	visible := map[string]bool{}
+	if sp, ok := credential.(config.SecretSlotsProvider); ok {
+		for _, s := range sp.SecretSlots() {
+			visible[s.Name] = s.Visible
+		}
+	}
+	for name, extra := range sec.Extras {
+		if !visible[name] {
+			dst = appendCredentialSecretRedaction(dst, extra)
+		}
 	}
 	return dst
 }

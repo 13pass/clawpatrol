@@ -54,6 +54,7 @@ type credentialTypeOption struct {
 var editableCredentialTypes = []credentialTypeOption{
 	{Type: "header_token", Fields: []string{"header", "prefix"}, Families: []string{"http"}},
 	{Type: "bearer_token", Fields: []string{}, Families: []string{"http", "k8s"}},
+	{Type: "basic_auth", Fields: []string{}, Families: []string{"http"}},
 }
 
 func editableCredentialType(typ string) (credentialTypeOption, bool) {

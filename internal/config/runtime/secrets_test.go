@@ -51,3 +51,15 @@ func TestEnvSecretStore_MTLSParts(t *testing.T) {
 		}
 	}
 }
+
+func TestEnvSecretStore_Username(t *testing.T) {
+	t.Setenv("CLAWPATROL_SECRET_JIRA", "api-token")
+	t.Setenv("CLAWPATROL_SECRET_JIRA_USERNAME", "alice@example.org")
+	sec, err := runtime.EnvSecretStore{}.Get("jira")
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if string(sec.Bytes) != "api-token" || sec.Extras["username"] != "alice@example.org" {
+		t.Errorf("secret = %q / %v, want the token and Extras[username]", sec.Bytes, sec.Extras)
+	}
+}

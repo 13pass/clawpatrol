@@ -19,6 +19,7 @@ export type SecretSlot = {
   name: string;
   label: string;
   multiline?: boolean;
+  visible?: boolean;
   description?: string;
 };
 
@@ -105,6 +106,10 @@ export type Integration = {
   // most recent probe failed; absent for verified-ok credentials and
   // for plugins without a verifier.
   verify_error?: string;
+  // Slots still to fill before the credential injects anything.
+  missing_slots?: string[];
+  // Stored values of the visible (non-secret) slots, by slot name.
+  slot_values?: Record<string, string>;
   // True when the gateway's last OAuth refresh was rejected at the
   // grant level: the stored refresh token no longer buys an access
   // token, so the only way back is a new authorisation flow.

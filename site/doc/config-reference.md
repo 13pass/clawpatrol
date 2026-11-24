@@ -249,8 +249,11 @@ credential "aws_credential" "example" {}
 
 Injects `Authorization: Basic <base64(username:password)>`.
 
-The credential secret is the raw password; `username` lives in
-config. Common credential binding fields apply: use `endpoint` or
+The credential secret is the raw password. `username` is set in
+config or, when it is left out, entered on the dashboard next to the
+password (from the environment: CLAWPATROL_SECRET_<NAME>_USERNAME),
+which keeps a per-person account such as an email out of the config
+files. Common credential binding fields apply: use `endpoint` or
 `endpoints` to bind the credential to upstreams.
 
 When a profile has multiple Basic Auth credentials for the same HTTPS
@@ -261,12 +264,11 @@ request headers.
 
 | Attribute | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `username` | `string` | yes | The upstream HTTP Basic Auth username. |
+| `username` | `string` | no | The upstream HTTP Basic Auth username. Leave it out to have the dashboard ask for it with the password. |
 
 ```hcl
 credential "basic_auth" "example" {
   endpoint = https.example
-  username = "example"
 }
 ```
 
