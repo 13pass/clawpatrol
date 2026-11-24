@@ -69,7 +69,7 @@ against credential X.
 | Dashboard user, role | admin | `dashboard_users` |
 | User → profiles | admin | `dashboard_user_profiles` (phase 3) |
 | `gateway`, `defaults`, `plugin`, `tunnel`, shared endpoints/approvers, guardrail rules | admin | `00-*.hcl`, Git-managed |
-| Credentials and endpoints of a profile (declaration) | admin | `00-*.hcl` (v1); forms later |
+| Credentials and endpoints of a profile (declaration) | admin | `00-*.hcl`, or the Users page from a template profile |
 | Credential secrets (values, OAuth) of an owned profile | member | DB, existing screens, scoped |
 | Rules generated from owned requests | member | `50-user-<name>.hcl`, dashboard-managed |
 | Devices bound to an owned profile | member | `devices`, scoped |
@@ -265,6 +265,35 @@ channel kind is the first declared credential of that type
 declares `credential "teams_workflow" "<name>" {}`. A `teams_workflow`
 credential only serves users' channels, never an approver's own.
 Plan: `doc/notification-channels.md`.
+
+### Profiles from the Users page (done)
+
+With `dashboard_config_writes`, "Add a user" can also declare a profile
+for the new user, modelled on an existing one, and assign it
+(`new_profile` on `POST /api/users/create`). A credential is reused
+when a profile owned by someone other than the template's owners lists
+it too. Any other template credential may be its owner's own, even
+when it appears in several of their profiles: it is copied under the
+new profile's name (`gitlab-pat-sean` → `gitlab-pat-frank`,
+`gitlab-pat` → `gitlab-pat-frank`) with an empty secret the new user
+fills in. Profiles nobody owns don't count, so assign owners before
+using a profile as a template, or shared credentials are copied too. A
+template with inline credential entries (`{ credential = ...,
+placeholder = ... }`) is refused. Rules that name the template profile
+or its own credentials are not copied, and a copied credential keeps
+its whole body, so a field naming the template's owner (a database
+`user`, say) needs editing by hand. A secret, an OAuth token, a
+verification result or a profile assignment left in the database under
+one of the new names, from an earlier config, is dropped so the new
+user starts clean. A profile name that devices are still joined to is
+refused until those devices are removed. The profile is checked before
+the user is created, and the user is removed again if the config write
+fails. If the files were written but the reload failed, the user stays
+and owns the profile, and the error says so. The blocks go to the dashboard's file (`90-dashboard.hcl` in
+directory mode) and the gateway reloads without a restart. The
+dashboard then shows the install and join commands to send the user,
+with `--profile` set and an optional `--hostname`, which the Add device
+dialog also offers now.
 
 ### Rule change requests (done)
 

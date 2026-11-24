@@ -85,6 +85,7 @@ func (w *webMux) apiUsers(rw http.ResponseWriter, r *http.Request) {
 		"profiles":        declaredProfiles(policy),
 		"human_approvers": declaredHumanApprovers(policy),
 		"oidc":            oidc,
+		"config_writes":   w.g.cfg.Load().DashboardConfigWrites(),
 	})
 }
 
@@ -153,6 +154,8 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 		Role     dashboardRole `json:"role"`
 		// OIDC links provider names to accounts there.
 		OIDC map[string]string `json:"oidc"`
+		// NewProfile also declares a profile for the user and assigns it.
+		NewProfile *newUserProfile `json:"new_profile"`
 	}
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(rw, err.Error(), http.StatusBadRequest)
@@ -192,16 +195,89 @@ func (w *webMux) apiUsersCreate(rw http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	if err := createLinkedDashboardUser(w.g.db, body.Username, body.Password, body.Role, links); err != nil {
-		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
-			http.Error(rw, err.Error(), http.StatusConflict)
+	if body.NewProfile == nil {
+		if !w.createUser(rw, body.Username, body.Password, body.Role, links) {
 			return
 		}
-		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
 		return
 	}
-	log.Printf("dashboard auth: user %q created with role %s", body.Username, body.Role)
+	if !w.createUserWithProfile(rw, body.Username, body.Password, body.Role, links, *body.NewProfile) {
+		return
+	}
 	writeJSONError(rw, http.StatusCreated, map[string]any{"ok": true})
+}
+
+// createUser inserts the user row, or writes the error response and
+// returns false.
+func (w *webMux) createUser(rw http.ResponseWriter, username, password string, role dashboardRole, links map[string]string) bool {
+	if err := createLinkedDashboardUser(w.g.db, username, password, role, links); err != nil {
+		if errors.Is(err, errDashboardUserExists) || errors.Is(err, errOIDCUsernameTaken) {
+			http.Error(rw, err.Error(), http.StatusConflict)
+			return false
+		}
+		http.Error(rw, err.Error(), http.StatusInternalServerError)
+		return false
+	}
+	log.Printf("dashboard auth: user %q created with role %s", username, role)
+	return true
+}
+
+// createUserWithProfile declares the profile and creates the user as
+// one step: the profile is checked first, and the user is removed
+// again if the config write fails, so a refused request leaves neither
+// behind. It writes the error response and returns false on failure.
+func (w *webMux) createUserWithProfile(rw http.ResponseWriter, username, password string, role dashboardRole, links map[string]string, req newUserProfile) bool {
+	g := w.g
+	g.configMu.Lock()
+	defer g.configMu.Unlock()
+	plan, changes, err := g.planUserProfileLocked(req)
+	if err != nil {
+		http.Error(rw, err.Error(), userProfileErrorStatus(err))
+		return false
+	}
+	if !w.createUser(rw, username, password, role, links) {
+		return false
+	}
+	err = g.clearLeftoverCredentials(plan.clones)
+	if err == nil {
+		err = g.writeConfigFilesLocked(changes)
+	}
+	var reloadErr *configReloadError
+	if err != nil && !errors.As(err, &reloadErr) {
+		if delErr := deleteDashboardUser(g.db, username); delErr != nil {
+			http.Error(rw, fmt.Sprintf("profile %q was not declared (%v), and removing user %q again failed: %v", req.Name, err, username, delErr), http.StatusInternalServerError)
+			return false
+		}
+		http.Error(rw, err.Error(), userProfileErrorStatus(err))
+		return false
+	}
+	// From here the profile is in the config files, so the user stays
+	// and owns it even when the reload failed: the next reload that
+	// succeeds declares it.
+	log.Printf("dashboard config: profile %q declared from %q for user %q", req.Name, req.Template, username)
+	assignErr := assignNewProfile(g.db, username, req.Name)
+	w.bustStateCache()
+	switch {
+	case assignErr != nil:
+		http.Error(rw, fmt.Sprintf("user %q and profile %q were created, but the profile was not assigned (%v): tick it on the user's row", username, req.Name, assignErr), http.StatusInternalServerError)
+		return false
+	case reloadErr != nil:
+		http.Error(rw, fmt.Sprintf("user %q was created and owns profile %q, but %v", username, req.Name, reloadErr), http.StatusInternalServerError)
+		return false
+	}
+	return true
+}
+
+func userProfileErrorStatus(err error) int {
+	var invalid *configInvalidError
+	switch {
+	case errors.Is(err, errUserProfileConflict):
+		return http.StatusConflict
+	case errors.Is(err, errUserProfileInvalid), errors.As(err, &invalid):
+		return http.StatusBadRequest
+	}
+	return http.StatusInternalServerError
 }
 
 // apiUsersUpdate changes a user's role and/or resets a member's
