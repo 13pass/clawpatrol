@@ -1,9 +1,9 @@
-// api is fetch for the dashboard's own routes. A 401 means the
-// dashboard session ended (expired, or signed out elsewhere), so the
-// browser goes to sign in and comes back here.
+// api is fetch for the dashboard's own routes. When the gateway's
+// dashboard gate refuses a request (the session expired, or was ended
+// elsewhere), the browser goes to sign in and comes back here.
 async function api(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
   const r = await fetch(input, init);
-  if (r.status === 401) redirectToSignIn();
+  if (r.status === 401 && r.headers.has("X-Clawpatrol-Sign-In")) redirectToSignIn();
   return r;
 }
 

@@ -1364,11 +1364,18 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 
 	// 1. start — pass our hostname so the dashboard shows a real
 	// device name in WG mode (no whois fallback there). An intent join
-	// sends only a --hostname name: without one the gateway names the
-	// device <machine>-<account> from os_hostname and os_user.
+	// sends its --hostname as device_name and keeps hostname the OS
+	// hostname, which is all a gateway older than device_name reads.
 	q := neturl.Values{}
-	if hostname != "" || (hn != "" && intent == "") {
-		q.Set("hostname", hn)
+	startHost := hn
+	if intent != "" {
+		startHost = osHost
+		if hostname != "" {
+			q.Set("device_name", hostname)
+		}
+	}
+	if startHost != "" {
+		q.Set("hostname", startHost)
 	}
 	if osHost != "" {
 		q.Set("os_hostname", osHost)
@@ -1556,6 +1563,11 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		_ = pr.Body.Close()
 		if k, ok := pv["auth_key"]; ok && k != "" {
 			authKey = k
+			// The name the gateway gave an intent join; the claim and
+			// the daemon's registration must not undo it.
+			if n := pv["device_name"]; validDeviceName(n) {
+				hn = n
+			}
 			loginServer = pv["login_server"]
 			apiToken = pv["api_token"]
 			tailnetGWHost = pv["gateway_host"]

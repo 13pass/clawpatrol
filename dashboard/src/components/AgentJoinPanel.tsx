@@ -12,8 +12,8 @@ import { buildAgentJoinPrompt } from "../lib/agentJoinPrompt";
 import { copyText } from "../lib/clipboard";
 import { Button } from "./Button";
 
-// The gateway lets an unused prompt lapse two minutes after the last
-// poll (joinIntentIdle), so this keeps it alive with room to spare.
+// Each poll keeps an unused prompt alive; the gateway lets it lapse ten
+// minutes after the last one (joinIntentIdle).
 const POLL_INTERVAL_MS = 2000;
 const COPIED_FLASH_MS = 1500;
 const LIVE_STATES: JoinIntentState[] = ["waiting", "pending", "approved"];
@@ -112,14 +112,18 @@ export function useJoinIntent(profile: string | null) {
 // AgentJoinPanel is the Add device window's "Agent prompt" tab: the
 // prompt to give an agent on the new device, then the join it starts,
 // approved here.
+// blocked explains why no prompt can be made.
 export function AgentJoinPanel({
   gatewayURL,
   join,
+  blocked,
 }: {
   gatewayURL: string;
   join: JoinIntentHandle;
+  blocked: string;
 }) {
   const { intent } = join;
+  if (blocked) return <p className="text-sm text-text-muted font-sans">{blocked}</p>;
   if (!intent) {
     return join.err ? (
       <ErrorLine err={join.err} />
@@ -210,6 +214,9 @@ function StatusPanel({ join }: { join: JoinIntentHandle }) {
     return (
       <Box>
         <p>Waiting for the agent… The prompt works once, while this window stays open.</p>
+        <Button variant="outline" onClick={join.reset}>
+          new prompt
+        </Button>
         {join.err && <ErrorLine err={join.err} />}
       </Box>
     );

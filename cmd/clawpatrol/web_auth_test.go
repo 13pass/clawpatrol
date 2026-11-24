@@ -105,6 +105,9 @@ func TestOnboardApproveRequiresDashboardPasswordInWireGuardMode(t *testing.T) {
 	if !strings.Contains(rr.Body.String(), "dashboard session required") {
 		t.Fatalf("body = %q, want dashboard password error", rr.Body.String())
 	}
+	if rr.Header().Get(signInHeader) == "" {
+		t.Errorf("gate 401 lacks %s, so the dashboard would not go to sign in", signInHeader)
+	}
 }
 
 func TestOnboardApproveWithDashboardPasswordReachesHandlerInWireGuardMode(t *testing.T) {

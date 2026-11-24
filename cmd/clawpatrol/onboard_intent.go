@@ -47,8 +47,9 @@ const (
 	// session expired, so the modal can show the final state.
 	joinIntentRetention = 2 * onboardSessionTTL
 	// joinIntentIdle is how long an unused intent outlives the last
-	// status poll from the window that shows its prompt.
-	joinIntentIdle    = 2 * time.Minute
+	// status poll from the window that shows its prompt. Browsers slow
+	// or freeze timers in background tabs, so it allows long gaps.
+	joinIntentIdle    = 10 * time.Minute
 	maxDeviceNameLen  = 63
 	maxJoinIntentBody = 4 << 10
 )
@@ -138,7 +139,7 @@ func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession, agentNa
 		return &errJoinIntent{http.StatusBadRequest, "a join from an agent prompt runs per process; drop --whole-machine"}
 	}
 	in := r.intents[id]
-	if in == nil || time.Since(in.seen) > joinIntentIdle {
+	if in == nil || (in.session == nil && time.Since(in.seen) > joinIntentIdle) {
 		return &errJoinIntent{http.StatusNotFound, "unknown or expired join intent; ask for a new prompt on the dashboard"}
 	}
 	if in.rejected || in.conflict {

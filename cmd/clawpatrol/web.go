@@ -510,6 +510,7 @@ func (w *webMux) dashboardAuthGate(next http.Handler) http.Handler {
 				return
 			}
 			if strings.HasPrefix(path, "/api/") {
+				rw.Header().Set(signInHeader, "required")
 				http.Error(rw, "dashboard not initialized — open the dashboard and set a password, or run `clawpatrol gateway --set-dashboard-password <pw>`", http.StatusUnauthorized)
 				return
 			}
@@ -550,12 +551,17 @@ func (w *webMux) dashboardAuthGate(next http.Handler) http.Handler {
 
 		// API callers see 401; browsers get redirected to the login form.
 		if strings.HasPrefix(path, "/api/") {
+			rw.Header().Set(signInHeader, "required")
 			http.Error(rw, "dashboard session required", http.StatusUnauthorized)
 			return
 		}
 		http.Redirect(rw, r, dashboardLoginPath+"?next="+url.QueryEscape(r.URL.RequestURI()), http.StatusFound)
 	})
 }
+
+// signInHeader marks a 401 from the dashboard gate itself, which the
+// dashboard answers by going to sign in; other 401s are errors to show.
+const signInHeader = "X-Clawpatrol-Sign-In"
 
 // dashboardLoginPath is the unauthenticated login + first-run setup
 // endpoint. Single route to keep the auth surface small.

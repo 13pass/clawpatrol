@@ -1030,14 +1030,12 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 	intentID := r.URL.Query().Get("intent")
 	// Newer clients report the OS hostname apart from the device name,
 	// which --hostname may override; older ones send only the name.
-	osHost, reportsOSHost := r.URL.Query().Get("os_hostname"), r.URL.Query().Has("os_hostname")
-	if !reportsOSHost {
+	osHost := strings.TrimSpace(r.URL.Query().Get("os_hostname"))
+	if !r.URL.Query().Has("os_hostname") {
 		osHost = hn
 	}
-	agentName := ""
-	if reportsOSHost {
-		agentName = hn
-	}
+	// An intent join's --hostname (the agent's name for the device).
+	agentName := strings.TrimSpace(r.URL.Query().Get("device_name"))
 	w.onboard.mu.Lock()
 	if hn != "" {
 		s.hostname = hn
@@ -1586,6 +1584,11 @@ func (w *webMux) apiOnboardPoll(rw http.ResponseWriter, r *http.Request) {
 		"api_token":    s.apiToken,
 		"approved_by":  s.owner,
 		"login_server": s.loginServer, // empty = Tailscale Inc default
+	}
+	// The client registers under this name later (claim, tsnet daemon),
+	// so it must learn the name an intent join settled on.
+	if s.intent != nil {
+		resp["device_name"] = s.hostname
 	}
 	// In Tailscale mode include gateway_host, gateway_ip, and control_url
 	// so the client can write mode marker files for `clawpatrol run`.

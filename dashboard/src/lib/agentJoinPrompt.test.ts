@@ -24,9 +24,21 @@ Deno.test("buildAgentJoinPrompt: join command names the device and pins the CA",
 
 Deno.test("buildAgentJoinPrompt: tells the agent how to name the device", () => {
   const out = buildAgentJoinPrompt(input);
-  for (const part of ["<machine>-<OS account>", "hostname -s", "whoami", "devbox-alice"]) {
+  for (const part of [
+    "<machine>-<OS account>",
+    "`hostname`",
+    "%COMPUTERNAME%",
+    "whoami",
+    "devbox-alice",
+  ]) {
     assert(out.includes(part), `naming rule lacks ${part}`);
   }
+});
+
+Deno.test("buildAgentJoinPrompt: checks an installed client without joining", () => {
+  const out = buildAgentJoinPrompt(input);
+  assert(out.includes("installed now or before"), "version check only covers fresh installs");
+  assert(out.includes("Do not try a join to find out"), "version check may start a join");
 });
 
 Deno.test("buildAgentJoinPrompt: no fingerprint, no pin", () => {

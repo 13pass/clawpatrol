@@ -342,9 +342,9 @@ func TestJoinIntentUsedAfterApprovalKeepsTheApprovedJoin(t *testing.T) {
 // newClientIntentQuery is a start from a client that reports the OS
 // hostname apart from the device name; name is its --hostname.
 func newClientIntentQuery(intent, name, osHost, osUser string) url.Values {
-	q := url.Values{"intent": {intent}, "os_hostname": {osHost}, "os_user": {osUser}, "os": {"linux"}}
+	q := url.Values{"intent": {intent}, "hostname": {osHost}, "os_hostname": {osHost}, "os_user": {osUser}, "os": {"linux"}}
 	if name != "" {
-		q.Set("hostname", name)
+		q.Set("device_name", name)
 	}
 	return q
 }
@@ -437,5 +437,44 @@ func TestJoinIntentLivesWhileTheWindowPolls(t *testing.T) {
 	}
 	if rw := startIntentJoin(env, newClientIntentQuery(lapsed, "", "hz-2025-fsn", "alice")); rw.Code != http.StatusNotFound {
 		t.Errorf("start with a lapsed intent = %d, want 404", rw.Code)
+	}
+}
+
+func TestJoinIntentPollTellsTheClientItsName(t *testing.T) {
+	env := newIntentTestEnv(t)
+	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
+	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "gemma"))))
+	env.w.onboard.mu.Lock()
+	s.approved, s.owner, s.authKey = true, "root", "wireguard-config"
+	deviceCode := s.deviceCode
+	env.w.onboard.mu.Unlock()
+
+	req := httptest.NewRequest(http.MethodPost, "/api/onboard/poll?device_code="+url.QueryEscape(deviceCode), nil)
+	req.Host = "localhost"
+	rw := httptest.NewRecorder()
+	env.h.ServeHTTP(rw, req)
+	var resp map[string]any
+	if err := json.Unmarshal(rw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("poll = %d %s: %v", rw.Code, rw.Body.String(), err)
+	}
+	if resp["device_name"] != "hz-2025-fsn-gemma" {
+		t.Errorf("poll device_name = %v, want hz-2025-fsn-gemma (response %s)", resp["device_name"], rw.Body.String())
+	}
+}
+
+func TestJoinIntentSecondStartStillConflictsAfterTheWindowWentQuiet(t *testing.T) {
+	env := newIntentTestEnv(t)
+	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
+	userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "alice")))
+	in := env.w.onboard.intentByID(id)
+	env.w.onboard.mu.Lock()
+	in.seen = time.Now().Add(-joinIntentIdle - time.Second)
+	env.w.onboard.mu.Unlock()
+
+	if rw := startIntentJoin(env, newClientIntentQuery(id, "", "other-box", "mallory")); rw.Code != http.StatusConflict {
+		t.Errorf("second start = %d %s, want 409", rw.Code, rw.Body.String())
+	}
+	if _, st := intentStatusAs(t, env, env.alice, id); st.State != joinIntentConflict {
+		t.Errorf("state = %q, want conflict", st.State)
 	}
 }

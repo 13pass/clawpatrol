@@ -14,11 +14,16 @@ export function AddDeviceModal({
   const url = whoami?.public_url || window.location.origin;
   // null while loading; the agent prompt waits for the profile.
   const [profiles, setProfiles] = useState<string[] | null>(null);
+  const [profilesErr, setProfilesErr] = useState("");
   const [profile, setProfile] = useState("");
   // "agent": a prompt for an AI agent on the new device, approved in
   // this window (AgentJoinPanel). Closing the window revokes it.
   const [tab, setTab] = useState<"agent" | "commands">("agent");
-  const join = useJoinIntent(profiles === null ? null : profile);
+  // A member can add devices only to a profile of their own; a gateway
+  // without profiles still lets an admin make a prompt.
+  const noProfileOfTheirOwn = whoami?.role === "member" && profiles?.length === 0;
+  const canPrompt = profiles !== null && !profilesErr && !noProfileOfTheirOwn;
+  const join = useJoinIntent(canPrompt ? profile : null);
   // Switching profile replaces the prompt, which would cancel a join
   // that is already waiting for approval.
   const joinInFlight = join.state === "pending" || join.state === "approved";
@@ -31,7 +36,10 @@ export function AddDeviceModal({
         // exists, else the first profile in source order.
         setProfile(p.includes("default") ? "default" : (p[0] ?? ""));
       })
-      .catch(() => setProfiles([]));
+      .catch((e) => {
+        setProfilesErr(String(e));
+        setProfiles([]);
+      });
   }, []);
 
   // An operator authenticated over the tailnet can mint joins that
@@ -72,7 +80,7 @@ export function AddDeviceModal({
             <select
               value={profile}
               onChange={(e) => setProfile(e.target.value)}
-              disabled={tab === "agent" && joinInFlight}
+              disabled={joinInFlight}
               className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
             >
               {profiles.map((p) => (
@@ -92,7 +100,17 @@ export function AddDeviceModal({
             <JoinSteps url={url} profile={profile} login={login} />
           </>
         ) : (
-          <AgentJoinPanel gatewayURL={url} join={join} />
+          <AgentJoinPanel
+            gatewayURL={url}
+            join={join}
+            blocked={
+              profilesErr
+                ? `Could not load your profiles: ${profilesErr}`
+                : noProfileOfTheirOwn
+                  ? "You have no profile yet, so there is nothing to add a device to. Ask an admin to assign you one."
+                  : ""
+            }
+          />
         )}
       </div>
     </Modal>

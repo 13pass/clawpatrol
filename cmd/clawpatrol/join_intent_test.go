@@ -51,12 +51,17 @@ func TestDeviceFlowSendsIntentAndMachineAndStopsOnRejection(t *testing.T) {
 		t.Errorf("start os_hostname = %q, want %q", got, osHost)
 	}
 	// Without --hostname the gateway names an intent join itself.
-	if startQuery.Has("hostname") {
-		t.Errorf("start hostname = %q, want none without --hostname", startQuery.Get("hostname"))
+	if startQuery.Has("device_name") {
+		t.Errorf("start device_name = %q, want none without --hostname", startQuery.Get("device_name"))
 	}
 
+	// hostname stays the OS hostname, which is what an older gateway
+	// names an intent join after.
 	_, _ = onboardViaDeviceFlow(srv.URL, false, "", "devbox-gemma", &setup, true, srv.Client(), false)
-	if got := startQuery.Get("hostname"); got != "devbox-gemma" {
-		t.Errorf("start hostname = %q, want the --hostname devbox-gemma", got)
+	if got := startQuery.Get("device_name"); got != "devbox-gemma" {
+		t.Errorf("start device_name = %q, want the --hostname devbox-gemma", got)
+	}
+	if got := startQuery.Get("hostname"); got != osHost {
+		t.Errorf("start hostname = %q, want the OS hostname %q", got, osHost)
 	}
 }
