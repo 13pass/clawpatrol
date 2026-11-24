@@ -19,7 +19,6 @@ export type SecretSlot = {
   name: string;
   label: string;
   multiline?: boolean;
-  // Not secret (a username): typed in the clear.
   visible?: boolean;
   description?: string;
 };

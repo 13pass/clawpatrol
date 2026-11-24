@@ -32,12 +32,9 @@ type BasicAuth struct {
 	Username string `hcl:"username,optional"`
 }
 
-// basicAuthUsernameSlot is the secret slot holding the username when
-// the config sets none.
 const basicAuthUsernameSlot = "username"
 
-// InjectHTTP is part of the clawpatrol plugin API. Until both the
-// username and the password are known it leaves the request as is.
+// InjectHTTP is part of the clawpatrol plugin API.
 func (b *BasicAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime.Secret) error {
 	username := b.Username
 	if username == "" {
