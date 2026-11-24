@@ -283,6 +283,11 @@ var memberRoutes = map[string]bool{
 	"/api/agents/delete":   true,
 	"/api/agents/profile":  true,
 	"/api/onboard/approve": true,
+	// Join intents: a member creates them for their own profiles and
+	// sees only their own (onboard_intent.go).
+	"/api/onboard/intent":        true,
+	"/api/onboard/intent/status": true,
+	"/api/onboard/intent/reject": true,
 	// Approvals: a member sees and decides only those raised by their
 	// own rules (webMux.decidesPending).
 	"/api/hitl/pending": true,
@@ -401,6 +406,9 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.guardOnboardApprove(w.apiOnboardApprove)},
 		{Method: http.MethodGet, Path: "/api/onboard/lookup", Auth: authTailnetOperator, Handler: w.apiOnboardLookup},
 		{Method: http.MethodPost, Path: "/api/onboard/claim", Auth: authPublic, Handler: w.apiOnboardClaim},
+		{Method: http.MethodPost, Path: "/api/onboard/intent", Auth: authDashboard, Handler: w.apiOnboardIntentCreate},
+		{Method: http.MethodGet, Path: "/api/onboard/intent/status", Auth: authDashboard, Handler: w.apiOnboardIntentStatus},
+		{Method: http.MethodPost, Path: "/api/onboard/intent/reject", Auth: authDashboard, Handler: w.apiOnboardIntentReject},
 		{Method: http.MethodGet, Path: "/api/env-pushdown", Auth: authSelfAuthenticating, Handler: w.apiEnvPushdown},
 		{Method: http.MethodPost, Path: "/api/peer/tsnet/register", Auth: authSelfAuthenticating, Handler: w.apiPeerTsnetRegister},
 		// /__login is the auth point itself — it MUST be reachable

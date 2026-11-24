@@ -296,7 +296,8 @@ func TestMemberRoutesAreReviewed(t *testing.T) {
 		"/api/my/channel", "/api/my/channel/delete", "/api/my/channel/resend", // the caller's own channel
 		"/api/my/channel/set", "/api/my/channel/test", "/api/my/channel/verify",
 		"/api/oauth/device-poll", "/api/oauth/exchange", "/api/oauth/revoke", "/api/oauth/start", // guardCredential
-		"/api/onboard/approve",                                     // guardOnboardApprove
+		"/api/onboard/approve",                                                            // guardOnboardApprove
+		"/api/onboard/intent", "/api/onboard/intent/reject", "/api/onboard/intent/status", // own profiles, own intents
 		"/api/profiles", "/api/rules", "/api/state", "/api/status", // viewer filters
 		"/api/rules/create", "/api/rules/preview",
 		"/api/rule-requests", "/api/rule-requests/withdraw", // the caller's own requests
