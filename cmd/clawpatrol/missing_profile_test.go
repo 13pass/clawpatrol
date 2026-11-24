@@ -1,9 +1,14 @@
 package main
 
 import (
+	"errors"
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
+
+	"tailscale.com/client/local"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/match"
@@ -253,5 +258,173 @@ func TestAgentsListFlagsMissingProfile(t *testing.T) {
 	}
 	if a := got[otherIP]; a == nil || a.ProfileMissing {
 		t.Fatalf("declared-profile row = %+v, want it not flagged", a)
+	}
+}
+
+// peerConn is a connection whose remote end is a given peer address.
+type peerConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c peerConn) RemoteAddr() net.Addr { return c.remote }
+
+// A device whose profile was removed is refused outright, on TCP and
+// UDP alike. Serving it under the empty profile alone would still send
+// its traffic through defaults.unknown_host, which under "passthrough"
+// relays it from the gateway's network position with no rule applied.
+func TestCutOffDeviceConnectionsAreRefused(t *testing.T) {
+	const (
+		orphanIP = "100.1.1.1"
+		otherIP  = "100.1.1.2"
+		blankIP  = "100.1.1.3"
+	)
+	r := newOnboardRegistry()
+	r.AssignProfile(orphanIP, "removed")
+	r.AssignProfile(otherIP, "other")
+	r.knownDeviceIPs[blankIP] = true
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	for ip, want := range map[string]bool{orphanIP: true, otherIP: false, blankIP: false, "100.9.9.9": false} {
+		local, remote := net.Pipe()
+		t.Cleanup(func() { _ = remote.Close() })
+		c := peerConn{Conn: local, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}
+		if got := g.refuseCutOffConn(c); got != want {
+			t.Errorf("refuseCutOffConn(%s) = %v, want %v", ip, got, want)
+		}
+		if want {
+			if _, err := local.Write([]byte("x")); err == nil {
+				t.Errorf("connection from %s left open", ip)
+			}
+		} else {
+			_ = local.Close()
+		}
+	}
+
+	dst := netip.MustParseAddrPort("192.0.2.10:443")
+	if got := g.tsnetUDPDisposition(dst, netip.MustParseAddr(orphanIP)); got != udpDrop {
+		t.Errorf("tsnet UDP from the cut-off device = %v, want udpDrop", got)
+	}
+}
+
+// The device name in the missing-profile line is client-supplied, so it
+// is quoted: a newline in it cannot start a forged log line.
+func TestLogMissingProfileQuotesTheDeviceName(t *testing.T) {
+	const ip = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(ip, "removed")
+	r.hostnameByIP[ip] = "box\n2026/11/24 device 100.64.0.9 approved"
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	logged := captureLog(t)
+	g.profileFor(ip)
+	if n := strings.Count(logged.String(), "\n"); n != 1 {
+		t.Fatalf("logged %d lines, want 1:\n%s", n, logged.String())
+	}
+}
+
+func peerConnFrom(t *testing.T, ip string) (peerConn, net.Conn) {
+	t.Helper()
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	return peerConn{Conn: local, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}, local
+}
+
+func closed(c net.Conn) bool {
+	_, err := c.Write([]byte("x"))
+	return err != nil
+}
+
+// Both peer dispatchers refuse a cut-off device before routing by
+// destination, whichever port it aims at.
+func TestPeerDispatchRefusesCutOffDevice(t *testing.T) {
+	const orphanIP = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(orphanIP, "removed")
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	for _, port := range []uint16{443, 5432, 53, 8080, 22} {
+		c, local := peerConnFrom(t, orphanIP)
+		g.dispatchPeerTCP(c, "192.0.2.10", port, 8080, http.NotFoundHandler())
+		if !closed(local) {
+			t.Errorf("TCP to port %d from the cut-off device left open", port)
+		}
+	}
+	c, local := peerConnFrom(t, orphanIP)
+	if !g.dispatchPeerUDP(c, "192.0.2.10", 123) || !closed(local) {
+		t.Errorf("UDP from the cut-off device not claimed and closed")
+	}
+}
+
+// A handler resolves the profile again when it uses it, so a reload
+// that removes the profile after the entry check still refuses.
+func TestServingProfileRefusesAfterAReload(t *testing.T) {
+	const ip = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(ip, "removed")
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept+missingProfileRemoved)
+	captureLog(t)
+
+	c, _ := peerConnFrom(t, ip)
+	if g.refuseCutOffConn(c) {
+		t.Fatal("refused while the profile is declared")
+	}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	if _, ok := g.servingProfile(c); ok {
+		t.Fatal("servingProfile served a device whose profile was removed after the entry check")
+	}
+}
+
+type failingWhoisTransport struct{}
+
+func (failingWhoisTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("tailscaled unreachable")
+}
+
+// A tailnet address whose owner cannot be established is refused, not
+// served as an unknown peer (the default profile, by default), and a
+// failed lookup is retried by the next connection.
+func TestUnresolvedTailnetAliasIsRefused(t *testing.T) {
+	const (
+		failing  = "fd7a:115c:a1e0::9"
+		inFlight = "fd7a:115c:a1e0::10"
+	)
+	r := newOnboardRegistry()
+	g := &Gateway{onboard: r, tsnetLC: &local.Client{Transport: failingWhoisTransport{}, OmitAuth: true}}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	if !g.peerCutOff(failing) {
+		t.Error("an address whose WhoIs failed was not refused")
+	}
+	if !r.ClaimAliasResolve(failing, aliasResolveInterval) {
+		t.Error("a failed WhoIs kept the throttle; the next connection would be served as an unknown peer")
+	}
+	r.FinishAliasResolve(failing, true)
+
+	if !r.ClaimAliasResolve(inFlight, aliasResolveInterval) {
+		t.Fatal("claim")
+	}
+	if !g.peerCutOff(inFlight) {
+		t.Error("a connection racing an in-flight WhoIs was not refused")
+	}
+	r.FinishAliasResolve(inFlight, false)
+	if g.peerCutOff(inFlight) {
+		t.Error("an address resolved to no device is still refused")
+	}
+}
+
+// A WhoIs that answers with a node owning no device leaves the peer
+// unknown, served as before.
+func TestResolvedStrangerIsNotRefused(t *testing.T) {
+	r := newOnboardRegistry()
+	g := gatewayWithStubbedWhois(t, r, stubWhoisNode("n-stranger", "stranger", "100.99.0.1/32", "fd7a:115c:a1e0::99/128"))
+	if g.peerCutOff("fd7a:115c:a1e0::99") {
+		t.Error("a resolved stranger was refused")
 	}
 }

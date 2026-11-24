@@ -492,3 +492,38 @@ func TestUserProfileAndApproverAssignment(t *testing.T) {
 		t.Fatalf("profiles of a deleted user survive: %v", profiles)
 	}
 }
+
+// The compiled policy holds the gateway's reserved profiles next to the
+// declared ones; none of them can be handed to a member.
+func TestUserAssignmentRefusesReservedProfiles(t *testing.T) {
+	policy := &config.CompiledPolicy{Profiles: map[string]*config.CompiledProfile{
+		config.UnknownPeerEmptyProfile: {Name: config.UnknownPeerEmptyProfile},
+	}}
+	profiles := []string{config.UnknownPeerEmptyProfile}
+	err := validateUserAssignment(policy, &profiles, nil)
+	if err == nil || !strings.Contains(err.Error(), "reserved") {
+		t.Fatalf("assigning the reserved profile = %v, want a reserved-profile error", err)
+	}
+}
+
+// An assignment of a reserved profile written before the users API
+// refused it is removed by migration 0034.
+func TestMigrationDropsReservedMemberProfiles(t *testing.T) {
+	w := newUsersTestMux(t)
+	db := w.g.db
+	for _, q := range []string{
+		`DELETE FROM _schema WHERE version >= 34`,
+		`INSERT INTO dashboard_user_profiles (username, profile) VALUES ('alice', char(0) || 'unknown-peer'), ('alice', 'team-a')`,
+	} {
+		if _, err := db.Exec(q); err != nil {
+			t.Fatalf("%s: %v", q, err)
+		}
+	}
+	if err := migrate(db); err != nil {
+		t.Fatal(err)
+	}
+	profiles, err := listDashboardUserProfiles(db, "alice")
+	if err != nil || strings.Join(profiles, ",") != "team-a" {
+		t.Fatalf("alice's profiles after migration = %q, %v; want only team-a", profiles, err)
+	}
+}

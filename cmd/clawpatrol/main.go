@@ -582,32 +582,125 @@ func (g *Gateway) Policy() *config.CompiledPolicy {
 // A device assigned to a profile the policy no longer declares is not
 // served under that name, nor under the default: see declaredProfile.
 func (g *Gateway) profileFor(peerIP string) string {
-	if g.onboard != nil {
-		if p := g.onboard.ProfileForIP(peerIP); p != "" {
-			return g.declaredProfile(peerIP, p)
-		}
-		// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
-		//
-		//   1. Same Tailscale node, different address family — whole-
-		//      machine tsnet traffic arrives on the peer's IPv6 ULA
-		//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
-		//   2. Same Tailscale node, address moved — the control plane
-		//      reassigned the node's address, so the device row holds
-		//      one the node no longer has. A host that rejoins as a
-		//      *new* node is a new node and is not coalesced; it gets
-		//      its own row.
-		//
-		// ClaimAliasResolve guards against re-running WhoIs per packet
-		// for peers that have no matching device.
-		if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(peerIP, 5*time.Minute) {
-			if canonical := g.resolveTsnetAlias(peerIP); canonical != "" {
-				if p := g.onboard.ProfileForIP(canonical); p != "" {
-					return g.declaredProfile(canonical, p)
-				}
-			}
+	profile, _ := g.peerProfile(peerIP)
+	return profile
+}
+
+const (
+	// aliasResolveInterval is how often a peer address with no device
+	// row is looked up again with tsnet WhoIs.
+	aliasResolveInterval = 5 * time.Minute
+	// aliasWhoIsTimeout bounds one WhoIs. A connection whose lookup
+	// fails is refused (peerProfile), not served as an unknown peer.
+	aliasWhoIsTimeout = 500 * time.Millisecond
+)
+
+// peerProfile is profileFor plus whether a connection from peerIP must
+// be refused: the peer is a device whose profile the policy no longer
+// declares (declaredProfile), or a tailnet address whose owner could
+// not be established because its WhoIs failed or is still in flight.
+// Serving either under the empty or the unknown-peer profile would hand
+// its traffic to defaults.unknown_host, which under "passthrough"
+// relays it from the gateway's network position with no rule applied,
+// or to the default profile's credentials.
+func (g *Gateway) peerProfile(peerIP string) (profile string, refuse bool) {
+	deviceIP, row, unresolved := g.deviceProfileRow(peerIP)
+	if row != "" {
+		return g.declaredProfile(deviceIP, row)
+	}
+	return g.unknownPeerProfile(peerIP), unresolved
+}
+
+// servingProfile resolves the profile a connection is served under, at
+// the point where the handler is about to use it. A refused peer
+// (peerProfile) gets its connection closed and ok=false. Checked here
+// as well as on entry (refuseCutOffConn) because a handler may wait on
+// the client (an SNI or a startup message) while a config reload
+// removes the device's profile.
+func (g *Gateway) servingProfile(c net.Conn) (profile string, ok bool) {
+	profile, refuse := g.peerProfile(peerIP(c))
+	if refuse {
+		_ = c.Close()
+		return "", false
+	}
+	return profile, true
+}
+
+// peerCutOff reports whether connections from peerIP are refused
+// (peerProfile).
+func (g *Gateway) peerCutOff(peerIP string) bool {
+	_, refuse := g.peerProfile(peerIP)
+	return refuse
+}
+
+// refuseCutOffConn closes c and reports true when its peer is refused
+// (peerCutOff). Called first by every dispatcher of peer traffic.
+func (g *Gateway) refuseCutOffConn(c net.Conn) bool {
+	if !g.peerCutOff(peerIP(c)) {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// peerCutOffCached is peerCutOff without alias resolution: it never
+// waits on a tsnet WhoIs, for hooks that run inline in netstack's packet
+// path (tsnet's UDP flow hooks). An alias not yet folded onto its device
+// is not recognised here.
+func (g *Gateway) peerCutOffCached(peerIP string) bool {
+	if g.onboard == nil {
+		return false
+	}
+	row := g.onboard.ProfileForIP(peerIP)
+	if row == "" {
+		return false
+	}
+	_, missing := g.declaredProfile(peerIP, row)
+	return missing
+}
+
+// deviceProfileRow returns the device a peer address belongs to and
+// the profile on its devices row, or "" when the peer has no row or
+// the row names no profile. unresolved reports a tailnet address whose
+// WhoIs failed or is in flight, so whether it belongs to a device is
+// unknown.
+func (g *Gateway) deviceProfileRow(peerIP string) (deviceIP, profile string, unresolved bool) {
+	if g.onboard == nil {
+		return "", "", false
+	}
+	if p := g.onboard.ProfileForIP(peerIP); p != "" {
+		return peerIP, p, false
+	}
+	if g.tsnetLC == nil {
+		return "", "", false
+	}
+	// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
+	//
+	//   1. Same Tailscale node, different address family — whole-
+	//      machine tsnet traffic arrives on the peer's IPv6 ULA
+	//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
+	//   2. Same Tailscale node, address moved — the control plane
+	//      reassigned the node's address, so the device row holds
+	//      one the node no longer has. A host that rejoins as a
+	//      *new* node is a new node and is not coalesced; it gets
+	//      its own row.
+	//
+	// ClaimAliasResolve guards against re-running WhoIs per packet
+	// for peers that have no matching device.
+	if !g.onboard.ClaimAliasResolve(peerIP, aliasResolveInterval) {
+		return "", "", g.onboard.AliasResolving(peerIP)
+	}
+	canonical, err := g.resolveTsnetAliasErr(peerIP)
+	if err != nil {
+		log.Printf("whois %s: %v — refusing the connection", peerIP, err)
+		return "", "", true
+	}
+	if canonical != "" {
+		if p := g.onboard.ProfileForIP(canonical); p != "" {
+			return canonical, p, false
 		}
 	}
-	return g.unknownPeerProfile(peerIP)
+	return "", "", false
 }
 
 // missingProfileLogInterval is how often the gateway repeats the log
@@ -625,7 +718,9 @@ type missingProfileNote struct {
 // declaredProfile maps the profile a device row carries onto the one
 // the device is actually served under. That is the row's profile when
 // the live policy declares it, and the reserved empty profile when it
-// does not.
+// does not; missing reports the latter, so the dispatchers refuse the
+// device's new connections (peerProfile). Connections already open
+// when the profile goes away run until they close.
 //
 // A devices row outlives the profile block it names: deleting
 // `profile "x" {}` from the config leaves every device assigned to x
@@ -646,13 +741,13 @@ type missingProfileNote struct {
 // because there is nothing to validate it against, and the name scopes
 // nothing: such a device is served exactly like one with no profile on
 // its row.
-func (g *Gateway) declaredProfile(deviceIP, profile string) string {
+func (g *Gateway) declaredProfile(deviceIP, profile string) (string, bool) {
 	policy := g.Policy()
 	if !profileMissing(policy, profile) {
-		return profile
+		return profile, false
 	}
 	g.logMissingProfile(deviceIP, profile)
-	return config.UnknownPeerEmptyProfile
+	return config.UnknownPeerEmptyProfile, true
 }
 
 // profileMissing reports whether a device row's profile names something
@@ -695,8 +790,9 @@ func (g *Gateway) logMissingProfile(deviceIP, profile string) {
 			name = fmt.Sprintf("%s (%s)", h, deviceIP)
 		}
 	}
-	log.Printf("device %s is assigned to profile %q, which the config does not declare: "+
-		"serving it no endpoints and no credentials until it is reassigned or the profile is restored",
+	log.Printf("device %q is assigned to profile %q, which the config does not declare: "+
+		"refusing its new connections until it is reassigned or the profile is restored "+
+		"(connections already open run until they close)",
 		name, profile)
 }
 
@@ -760,14 +856,28 @@ func (g *Gateway) hasDeviceRow(peerIP string) bool {
 // holds an address the node no longer has — and requires exactly one
 // devices row bound to the node (see UniqueIPForNodeID).
 func (g *Gateway) resolveTsnetAlias(peerIP string) string {
+	canonical, _ := g.resolveTsnetAliasErr(peerIP)
+	return canonical
+}
+
+// resolveTsnetAliasErr is resolveTsnetAlias that also reports a failed
+// WhoIs, which is not the same as a peer with no device: the caller
+// cannot tell whose the address is. It ends the ClaimAliasResolve
+// lookup either way.
+func (g *Gateway) resolveTsnetAliasErr(peerIP string) (string, error) {
 	if g.tsnetLC == nil || g.onboard == nil || peerIP == "" {
-		return ""
+		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), aliasWhoIsTimeout)
 	defer cancel()
 	w, err := g.tsnetLC.WhoIs(ctx, net.JoinHostPort(peerIP, "0"))
-	if err != nil || w == nil || w.Node == nil {
-		return ""
+	if err != nil {
+		g.onboard.FinishAliasResolve(peerIP, true)
+		return "", err
+	}
+	defer g.onboard.FinishAliasResolve(peerIP, false)
+	if w == nil || w.Node == nil {
+		return "", nil
 	}
 	nodeID := string(w.Node.StableID)
 	for _, addr := range w.Node.Addresses {
@@ -776,10 +886,10 @@ func (g *Gateway) resolveTsnetAlias(peerIP string) string {
 			continue
 		}
 		if g.onboard.FoldAliasOntoDevice(peerIP, ip, nodeID) {
-			return ip
+			return ip, nil
 		}
 	}
-	return g.onboard.FoldAliasOntoNode(peerIP, nodeID)
+	return g.onboard.FoldAliasOntoNode(peerIP, nodeID), nil
 }
 
 // bindUnboundDevicesFromWhoIs binds every devices row that has no node
@@ -995,7 +1105,7 @@ func (g *Gateway) agentIPFor(c net.Conn) string {
 	// Both functions use the same ClaimAliasResolve guard, so the WhoIs
 	// runs at most once per peer per 5-minute window regardless of which
 	// one is called first.
-	if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(ip, 5*time.Minute) {
+	if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(ip, aliasResolveInterval) {
 		g.resolveTsnetAlias(ip)
 	}
 	return g.onboard.AgentIPFor(ip)
@@ -2106,6 +2216,72 @@ func truncate(s string, n int) string {
 	return s
 }
 
+// dispatchPeerTCP routes one TCP connection from a peer to its handler
+// by destination: the WireGuard promiscuous forwarder and the tsnet
+// exit-node fallback handler share it. A refused peer (peerProfile) is
+// closed before anything else.
+func (g *Gateway) dispatchPeerTCP(c net.Conn, dstIP string, dstPort uint16, dashPort int, dashMux http.Handler) {
+	if g.refuseCutOffConn(c) {
+		return
+	}
+	switch {
+	case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
+		g.handle(c, dstIP, dstPort)
+	case dstPort == 5432:
+		g.handlePostgresConn(c, dstIP)
+	case dstPort == 53:
+		g.handleDNSTCPConn(c, dstIP)
+	case g.dnsvip.IsVIP(dstIP):
+		// Any port on a VIP belongs to the SSH endpoint that
+		// hostname maps to. Future RequiresVIP plugins can
+		// branch on ep.Plugin.Type inside handleVIPConn.
+		g.handleVIPConn(c, dstIP, dstPort)
+	case dashPort != 0 && int(dstPort) == dashPort:
+		_ = http.Serve(&oneShotListener{c: c}, dashMux)
+	default:
+		// Direct-IP dispatch via conn-index: catches
+		// clickhouse_native and friends when the operator
+		// binds them to IP-literal hosts (dnsvip skips
+		// those — they don't need DNS interception). Falls
+		// through to transparent relay when no endpoint
+		// claims the dst.
+		if g.tryDirectIPConn(c, dstIP, dstPort) {
+			return
+		}
+		g.wgRelay(c, dstIP, int(dstPort))
+	}
+}
+
+// dispatchPeerUDP claims a UDP flow from a WireGuard peer, or returns
+// false to hand it to the transparent relay. A refused peer
+// (peerProfile) is claimed and closed.
+func (g *Gateway) dispatchPeerUDP(c net.Conn, dstIP string, dstPort uint16) bool {
+	if g.refuseCutOffConn(c) {
+		return true
+	}
+	switch udpPortDisposition(dstPort) {
+	case udpDNS:
+		g.dnsvip.ServeUDP(c, dstIP)
+		return true
+	case udpRelay:
+		// Claim the flow and drop it when the destination is
+		// one the relay may not dial. Returning false here
+		// would hand it to relayUDP, which is the dial.
+		if err := g.relayDestOK(dstIP); err != nil {
+			log.Printf("relay udp %s:%d: %v", dstIP, dstPort, err)
+			_ = c.Close()
+			return true
+		}
+	case udpDrop:
+		// Already refused by refuseUDPPort before an endpoint
+		// existed; kept so the flow is closed rather than
+		// relayed should the two hooks ever disagree.
+		_ = c.Close()
+		return true
+	}
+	return false
+}
+
 func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 	defer func() { _ = raw.Close() }()
 	defer otelTrackConn("https_mitm")()
@@ -2123,8 +2299,10 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 				g.serveInternal(c, dstIP)
 				return
 			}
-			pip := peerIP(c)
-			profile := g.profileFor(pip)
+			profile, ok := g.servingProfile(c)
+			if !ok {
+				return
+			}
 			ep, authority, certHost := g.httpsMITMEndpoint(profile, dstIP, dstPort)
 			if ep != nil && isHTTPSMITMFamily(ep.Family) {
 				log.Printf("sni-fallback: %s → %s", authority, ep.Name)
@@ -2143,8 +2321,10 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 		g.serveInternal(c, internalHostname)
 		return
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	ep, authority, certHost := g.httpsMITMEndpoint(profile, host, dstPort)
 	if ep == nil {
 		policy := g.Policy()
@@ -2268,7 +2448,10 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 	defer func() { _ = c.Close() }()
 	defer otelTrackConn("pg_relay")()
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 
 	policy := g.Policy()
@@ -2393,8 +2576,10 @@ func (g *Gateway) handleVIPConn(c net.Conn, dstIP string, dstPort uint16) {
 		_ = c.Close()
 		return
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	policy := g.Policy()
 	// Profile-filter the hits, then port-match. Port match handles
 	// the case where one hostname is bound to multiple endpoints on
@@ -2442,8 +2627,10 @@ func (g *Gateway) tryDirectIPConn(c net.Conn, dstIP string, dstPort uint16) bool
 	if idx == nil {
 		return false
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return true // refused and closed
+	}
 	policy := g.Policy()
 	candidates := idx.Lookup(dstIP)
 	ep := pickEndpointForProfile(candidates, policy, profile)
@@ -2470,7 +2657,10 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 		return
 	}
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 	policy := g.Policy()
 	mode := ep.Plugin.Type
@@ -2892,9 +3082,11 @@ func (g *Gateway) mitmHTTPS(c net.Conn, host string, ep *config.CompiledEndpoint
 }
 
 func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *config.CompiledEndpoint) {
-	agentAddr := peerIP(c)
-	profile := g.profileFor(agentAddr)
-	agentAddr = g.agentIPFor(c)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
+	agentAddr := g.agentIPFor(c)
 	if certHost == "" {
 		certHost = host
 	}
@@ -4119,61 +4311,14 @@ func runGateway(args []string) {
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
 			log.Printf("wg-fwd: %s:%d", dstIP, dstPort)
-			switch {
-			case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
-				g.handle(c, dstIP, dstPort)
-			case dstPort == 5432:
-				g.handlePostgresConn(c, dstIP)
-			case dstPort == 53:
-				g.handleDNSTCPConn(c, dstIP)
-			case g.dnsvip.IsVIP(dstIP):
-				// Any port on a VIP belongs to the SSH endpoint that
-				// hostname maps to. Future RequiresVIP plugins can
-				// branch on ep.Plugin.Type inside handleVIPConn.
-				g.handleVIPConn(c, dstIP, dstPort)
-			case dashPort != 0 && int(dstPort) == dashPort:
-				_ = http.Serve(&oneShotListener{c: c}, dashMux)
-			default:
-				// Direct-IP dispatch via conn-index: catches
-				// clickhouse_native and friends when the operator
-				// binds them to IP-literal hosts (dnsvip skips
-				// those — they don't need DNS interception). Falls
-				// through to transparent relay when no endpoint
-				// claims the dst.
-				if g.tryDirectIPConn(c, dstIP, dstPort) {
-					return
-				}
-				g.wgRelay(c, dstIP, int(dstPort))
-			}
+			g.dispatchPeerTCP(c, dstIP, dstPort, dashPort, dashMux)
 		}
 		// UDP: the port decision is udpPortDisposition, shared with the
 		// tsnet catch-all. UDP/443 (QUIC) is refused by refuseUDPPort
 		// before an endpoint exists, so the netstack answers ICMP port
 		// unreachable and the client falls back to TCP/443 at once;
 		// UDP/53 is answered by dnsvip; the rest relays.
-		udpDispatch := func(c net.Conn, dstIP string, dstPort uint16) bool {
-			switch udpPortDisposition(dstPort) {
-			case udpDNS:
-				g.dnsvip.ServeUDP(c, dstIP)
-				return true
-			case udpRelay:
-				// Claim the flow and drop it when the destination is
-				// one the relay may not dial. Returning false here
-				// would hand it to relayUDP, which is the dial.
-				if err := g.relayDestOK(dstIP); err != nil {
-					log.Printf("relay udp %s:%d: %v", dstIP, dstPort, err)
-					_ = c.Close()
-					return true
-				}
-			case udpDrop:
-				// Already refused by refuseUDPPort before an endpoint
-				// existed; kept so the flow is closed rather than
-				// relayed should the two hooks ever disagree.
-				_ = c.Close()
-				return true
-			}
-			return false
-		}
+		udpDispatch := g.dispatchPeerUDP
 		if err := wg.EnablePromiscuousForwarder(tcpDispatch, refuseUDPPort, udpDispatch); err != nil {
 			log.Fatalf("wireguard forwarder: %v", err)
 		}
@@ -4340,23 +4485,7 @@ func runGateway(args []string) {
 			dstIP := dst.Addr().String()
 			dstPort := dst.Port()
 			return func(c net.Conn) {
-				switch {
-				case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
-					g.handle(c, dstIP, dstPort)
-				case dstPort == 5432:
-					g.handlePostgresConn(c, dstIP)
-				case dstPort == 53:
-					g.handleDNSTCPConn(c, dstIP)
-				case g.dnsvip.IsVIP(dstIP):
-					g.handleVIPConn(c, dstIP, dstPort)
-				case tsnetDashPort != 0 && int(dstPort) == tsnetDashPort:
-					_ = http.Serve(&oneShotListener{c: c}, tsnetDashMux)
-				default:
-					if g.tryDirectIPConn(c, dstIP, dstPort) {
-						return
-					}
-					g.wgRelay(c, dstIP, int(dstPort))
-				}
+				g.dispatchPeerTCP(c, dstIP, dstPort, tsnetDashPort, tsnetDashMux)
 			}, true
 		})
 	}
@@ -4556,7 +4685,10 @@ func (l *oneShotListener) Addr() net.Addr {
 func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 	defer func() { _ = c.Close() }()
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 	known := g.onboard == nil || g.onboard.HasDevice(pip) || g.onboard.HasDevice(agentPip)
 	host := fmt.Sprintf("%s:%d", dstIP, dstPort)

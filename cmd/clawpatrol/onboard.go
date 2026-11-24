@@ -119,6 +119,11 @@ type onboardRegistry struct {
 	// from any IP that genuinely has no devices-table mapping would
 	// trigger a WhoIs lookup per packet.
 	resolveTriedAt map[string]time.Time
+	// aliasResolving marks the peer IPs whose WhoIs is in flight
+	// (ClaimAliasResolve → FinishAliasResolve), so a concurrent
+	// connection from the same address is refused rather than served
+	// as an unknown peer before the lookup lands.
+	aliasResolving map[string]bool
 	// intents holds the dashboard's join intents (onboard_intent.go).
 	intents map[string]*joinIntent
 	db      *sql.DB
@@ -138,6 +143,7 @@ func newOnboardRegistry() *onboardRegistry {
 		osHostByIP:       map[string]string{},
 		knownDeviceIPs:   map[string]bool{},
 		resolveTriedAt:   map[string]time.Time{},
+		aliasResolving:   map[string]bool{},
 		intents:          map[string]*joinIntent{},
 	}
 }
@@ -729,7 +735,28 @@ func (r *onboardRegistry) ClaimAliasResolve(ip string, within time.Duration) boo
 		return false
 	}
 	r.resolveTriedAt[ip] = time.Now()
+	r.aliasResolving[ip] = true
 	return true
+}
+
+// FinishAliasResolve ends the lookup ClaimAliasResolve granted for ip.
+// A lookup that failed (WhoIs error or timeout) releases the throttle,
+// so the next connection tries again instead of the address being
+// served as an unknown peer for the rest of the window.
+func (r *onboardRegistry) FinishAliasResolve(ip string, failed bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	delete(r.aliasResolving, ip)
+	if failed {
+		delete(r.resolveTriedAt, ip)
+	}
+}
+
+// AliasResolving reports whether a WhoIs for ip is in flight.
+func (r *onboardRegistry) AliasResolving(ip string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.aliasResolving[ip]
 }
 
 func (r *onboardRegistry) ForgetIP(ip string) {

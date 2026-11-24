@@ -384,6 +384,11 @@ func (g *Gateway) installTsnetUDPCatchAll(s *tsnet.Server) {
 //     protocol).
 //   - everything else → tsnet's default handler.
 func (g *Gateway) tsnetUDPDisposition(dst netip.AddrPort, src netip.Addr) udpDisposition {
+	// Runs inline in netstack's UDP accept path: the cached lookup,
+	// never a WhoIs.
+	if g.peerCutOffCached(canonicalPeerIP(src.String())) {
+		return udpDrop
+	}
 	switch udpPortDisposition(dst.Port()) {
 	case udpDNS:
 		if g.dnsvip != nil {

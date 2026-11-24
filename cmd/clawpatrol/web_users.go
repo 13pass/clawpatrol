@@ -119,6 +119,12 @@ func declaredHumanApprovers(policy *config.CompiledPolicy) []string {
 func validateUserAssignment(policy *config.CompiledPolicy, profiles *[]string, approver *string) error {
 	if profiles != nil {
 		for _, p := range *profiles {
+			// The compiled policy also holds the gateway's reserved
+			// profiles (defaults.unknown_peer = "no_profile"), which
+			// serve unknown peers and cut-off devices of every team.
+			if config.IsReservedProfile(p) {
+				return fmt.Errorf("profile %q is reserved and cannot be assigned", p)
+			}
 			if policy == nil || policy.Profiles[p] == nil {
 				return fmt.Errorf("profile %q is not declared in the config", p)
 			}

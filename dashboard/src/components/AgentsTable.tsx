@@ -95,7 +95,7 @@ export function AgentsTable({
                 {a.profile_missing && (
                   <span
                     className="text-danger-500"
-                    title="This profile is not declared in the config. The device gets no endpoints or credentials until it is assigned to a declared profile."
+                    title="This profile is not declared in the config. The gateway refuses the device's new connections until it is assigned to a declared profile; connections already open run until they close."
                   >
                     {" "}
                     (not found)
