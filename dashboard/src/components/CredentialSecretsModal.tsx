@@ -111,7 +111,8 @@ export function CredentialSecretsModal({
               />
             ) : (
               <input
-                type="password"
+                type={s.visible ? "text" : "password"}
+                autoComplete="off"
                 value={values[s.name] ?? ""}
                 onChange={(e) => update(s.name, e.target.value)}
                 placeholder={s.description ?? ""}

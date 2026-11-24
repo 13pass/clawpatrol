@@ -12,6 +12,7 @@ type SecretSlot struct {
 	Name        string `json:"name"`        // "" for single-slot; field name for multi
 	Label       string `json:"label"`       // human label rendered in the modal
 	Multiline   bool   `json:"multiline"`   // true for PEM blobs (textarea, not password input)
+	Visible     bool   `json:"visible"`     // not secret (a username): shown as typed
 	Description string `json:"description"` // optional one-liner under the input
 }
 
@@ -21,8 +22,8 @@ type SecretSlot struct {
 // instead) leave this unimplemented; the dashboard then renders the
 // OAuth connect button rather than a paste-secret modal.
 //
-// Plugin authors return a constant slice — slot definitions don't
-// vary per credential instance.
+// The slots may depend on the credential's config (basic_auth asks for
+// a username only when the config sets none), never on its secrets.
 type SecretSlotsProvider interface {
 	SecretSlots() []SecretSlot
 }

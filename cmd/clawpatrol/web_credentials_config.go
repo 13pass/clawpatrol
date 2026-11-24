@@ -54,6 +54,9 @@ type credentialTypeOption struct {
 var editableCredentialTypes = []credentialTypeOption{
 	{Type: "header_token", Fields: []string{"header", "prefix"}, Families: []string{"http"}},
 	{Type: "bearer_token", Fields: []string{}, Families: []string{"http", "k8s"}},
+	// Declared without a username: the secret form asks for it with the
+	// password, so a person's account stays out of the config.
+	{Type: "basic_auth", Fields: []string{}, Families: []string{"http"}},
 }
 
 func editableCredentialType(typ string) (credentialTypeOption, bool) {

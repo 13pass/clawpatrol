@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/hashicorp/hcl/v2"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 )
@@ -72,6 +73,29 @@ func TestCredentialDeclareWritesDashboardFileAndProfile(t *testing.T) {
 	}
 	if w.g.cfg.Load().Policy.Credentials["gh-pat"] == nil {
 		t.Error("the gateway did not reload with the new credential")
+	}
+}
+
+func TestCredentialDeclareBasicAuthLeavesTheUsernameToTheSecret(t *testing.T) {
+	w := configDirTestMux(t)
+	addGitlabEndpoint(t, w)
+	rw := credentialConfigCall(t, w.apiCredentialDeclare, map[string]any{
+		"type": "basic_auth", "name": "jira-alice", "endpoint": "gitlab", "profiles": []string{"default"},
+	})
+	if rw.Code != http.StatusOK {
+		t.Fatalf("status=%d body=%s", rw.Code, rw.Body.String())
+	}
+	dash := readCfgFile(t, w, dashboardConfigFile)
+	if !strings.Contains(dash, `credential "basic_auth" "jira-alice"`) || strings.Contains(dash, "username") {
+		t.Errorf("%s = %q, want a basic_auth block without a username", dashboardConfigFile, dash)
+	}
+	ent := w.g.cfg.Load().Policy.Credentials["jira-alice"]
+	if ent == nil {
+		t.Fatal("the gateway did not reload with the new credential")
+	}
+	sp, ok := ent.Body.(interface{ SecretSlots() []config.SecretSlot })
+	if !ok || len(sp.SecretSlots()) != 2 {
+		t.Errorf("secret slots = %v, want username and password", ent.Body)
 	}
 }
 

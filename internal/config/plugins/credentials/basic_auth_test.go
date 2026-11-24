@@ -42,7 +42,7 @@ func TestBasicAuthInjectHTTPIgnoresEmptySecret(t *testing.T) {
 }
 
 func TestBasicAuthSecretSlots(t *testing.T) {
-	slots := (&BasicAuth{}).SecretSlots()
+	slots := (&BasicAuth{Username: "agent"}).SecretSlots()
 	if len(slots) != 1 {
 		t.Fatalf("want 1 slot, got %d", len(slots))
 	}
@@ -51,5 +51,46 @@ func TestBasicAuthSecretSlots(t *testing.T) {
 	}
 	if slots[0].Label != "Password" || slots[0].Description == "" {
 		t.Errorf("slot missing label/description: %+v", slots[0])
+	}
+}
+
+func TestBasicAuthWithoutUsernameAsksForIt(t *testing.T) {
+	slots := (&BasicAuth{}).SecretSlots()
+	if len(slots) != 2 || slots[0].Name != basicAuthUsernameSlot || !slots[0].Visible || slots[1].Name != "" {
+		t.Fatalf("slots = %+v, want a visible username slot, then the unnamed password slot", slots)
+	}
+}
+
+func TestBasicAuthInjectHTTPUsesTheStoredUsername(t *testing.T) {
+	plugin := &BasicAuth{}
+	sec := runtime.Secret{Bytes: []byte("api-token"), Extras: map[string]string{basicAuthUsernameSlot: "alice@example.org"}}
+	req, err := http.NewRequest("GET", "https://example.com/api", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	if err := plugin.InjectHTTP(req.Context(), req, sec); err != nil {
+		t.Fatalf("inject: %v", err)
+	}
+	want := "Basic " + base64.StdEncoding.EncodeToString([]byte("alice@example.org:api-token"))
+	if got := req.Header.Get("Authorization"); got != want {
+		t.Fatalf("Authorization = %q, want %q", got, want)
+	}
+}
+
+func TestBasicAuthInjectHTTPWaitsForBothHalves(t *testing.T) {
+	for name, sec := range map[string]runtime.Secret{
+		"no username": {Bytes: []byte("api-token")},
+		"no password": {Extras: map[string]string{basicAuthUsernameSlot: "alice@example.org"}},
+	} {
+		req, err := http.NewRequest("GET", "https://example.com/api", nil)
+		if err != nil {
+			t.Fatalf("new request: %v", err)
+		}
+		if err := (&BasicAuth{}).InjectHTTP(req.Context(), req, sec); err != nil {
+			t.Fatalf("%s: inject: %v", name, err)
+		}
+		if got := req.Header.Get("Authorization"); got != "" {
+			t.Errorf("%s: Authorization = %q, want none", name, got)
+		}
 	}
 }
