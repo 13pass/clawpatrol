@@ -1,11 +1,14 @@
 package main
 
 import (
+	"errors"
 	"net"
 	"net/http"
 	"net/netip"
 	"strings"
 	"testing"
+
+	"tailscale.com/client/local"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/match"
@@ -319,5 +322,109 @@ func TestLogMissingProfileQuotesTheDeviceName(t *testing.T) {
 	g.profileFor(ip)
 	if n := strings.Count(logged.String(), "\n"); n != 1 {
 		t.Fatalf("logged %d lines, want 1:\n%s", n, logged.String())
+	}
+}
+
+func peerConnFrom(t *testing.T, ip string) (peerConn, net.Conn) {
+	t.Helper()
+	local, remote := net.Pipe()
+	t.Cleanup(func() { _ = local.Close(); _ = remote.Close() })
+	return peerConn{Conn: local, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}, local
+}
+
+func closed(c net.Conn) bool {
+	_, err := c.Write([]byte("x"))
+	return err != nil
+}
+
+// Both peer dispatchers refuse a cut-off device before routing by
+// destination, whichever port it aims at.
+func TestPeerDispatchRefusesCutOffDevice(t *testing.T) {
+	const orphanIP = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(orphanIP, "removed")
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	for _, port := range []uint16{443, 5432, 53, 8080, 22} {
+		c, local := peerConnFrom(t, orphanIP)
+		g.dispatchPeerTCP(c, "192.0.2.10", port, 8080, http.NotFoundHandler())
+		if !closed(local) {
+			t.Errorf("TCP to port %d from the cut-off device left open", port)
+		}
+	}
+	c, local := peerConnFrom(t, orphanIP)
+	if !g.dispatchPeerUDP(c, "192.0.2.10", 123) || !closed(local) {
+		t.Errorf("UDP from the cut-off device not claimed and closed")
+	}
+}
+
+// A handler resolves the profile again when it uses it, so a reload
+// that removes the profile after the entry check still refuses.
+func TestServingProfileRefusesAfterAReload(t *testing.T) {
+	const ip = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(ip, "removed")
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept+missingProfileRemoved)
+	captureLog(t)
+
+	c, _ := peerConnFrom(t, ip)
+	if g.refuseCutOffConn(c) {
+		t.Fatal("refused while the profile is declared")
+	}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	if _, ok := g.servingProfile(c); ok {
+		t.Fatal("servingProfile served a device whose profile was removed after the entry check")
+	}
+}
+
+type failingWhoisTransport struct{}
+
+func (failingWhoisTransport) RoundTrip(*http.Request) (*http.Response, error) {
+	return nil, errors.New("tailscaled unreachable")
+}
+
+// A tailnet address whose owner cannot be established is refused, not
+// served as an unknown peer (the default profile, by default), and a
+// failed lookup is retried by the next connection.
+func TestUnresolvedTailnetAliasIsRefused(t *testing.T) {
+	const (
+		failing  = "fd7a:115c:a1e0::9"
+		inFlight = "fd7a:115c:a1e0::10"
+	)
+	r := newOnboardRegistry()
+	g := &Gateway{onboard: r, tsnetLC: &local.Client{Transport: failingWhoisTransport{}, OmitAuth: true}}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	if !g.peerCutOff(failing) {
+		t.Error("an address whose WhoIs failed was not refused")
+	}
+	if !r.ClaimAliasResolve(failing, aliasResolveInterval) {
+		t.Error("a failed WhoIs kept the throttle; the next connection would be served as an unknown peer")
+	}
+	r.FinishAliasResolve(failing, true)
+
+	if !r.ClaimAliasResolve(inFlight, aliasResolveInterval) {
+		t.Fatal("claim")
+	}
+	if !g.peerCutOff(inFlight) {
+		t.Error("a connection racing an in-flight WhoIs was not refused")
+	}
+	r.FinishAliasResolve(inFlight, false)
+	if g.peerCutOff(inFlight) {
+		t.Error("an address resolved to no device is still refused")
+	}
+}
+
+// A WhoIs that answers with a node owning no device leaves the peer
+// unknown, served as before.
+func TestResolvedStrangerIsNotRefused(t *testing.T) {
+	r := newOnboardRegistry()
+	g := gatewayWithStubbedWhois(t, r, stubWhoisNode("n-stranger", "stranger", "100.99.0.1/32", "fd7a:115c:a1e0::99/128"))
+	if g.peerCutOff("fd7a:115c:a1e0::99") {
+		t.Error("a resolved stranger was refused")
 	}
 }
