@@ -18,9 +18,13 @@ package main
 //     that would replace an existing device needs replace=true.
 //
 // Several devices can share one machine (one per OS account, each on
-// its own profile), so an intent join is named <machine>-<account>
-// unless the operator typed a name, and the status reports the other
-// devices named after the same machine.
+// its own profile). The prompt has the agent name the device
+// <machine>-<account> with --hostname; a join without a name gets that
+// from the OS hostname and account the CLI reports. The status lists
+// the other devices that joined from the same machine.
+//
+// An unused intent lives while the Add device window polls it: closing
+// the window cancels it, and a window that stops polling lets it lapse.
 
 import (
 	"encoding/json"
@@ -42,8 +46,11 @@ const (
 	// joinIntentRetention keeps a used intent readable after its
 	// session expired, so the modal can show the final state.
 	joinIntentRetention = 2 * onboardSessionTTL
-	maxDeviceNameLen    = 63
-	maxJoinIntentBody   = 4 << 10
+	// joinIntentIdle is how long an unused intent outlives the last
+	// status poll from the window that shows its prompt.
+	joinIntentIdle    = 2 * time.Minute
+	maxDeviceNameLen  = 63
+	maxJoinIntentBody = 4 << 10
 )
 
 // deviceNamePattern is what an intent accepts for a device name and
@@ -71,8 +78,9 @@ type joinIntent struct {
 	id         string
 	creator    string // dashboard principal that created it
 	profile    string
-	deviceName string // operator-typed; empty = <machine>-<account>
+	deviceName string // operator-typed; empty = the agent's or <machine>-<account>
 	created    time.Time
+	seen       time.Time // last status poll; an unused intent lapses joinIntentIdle after it
 	session    *onboardSession
 	rejected   bool
 	conflict   bool
@@ -89,12 +97,14 @@ func (r *onboardRegistry) createIntent(creator, profile, deviceName string) *joi
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.gcLocked()
+	now := time.Now()
 	in := &joinIntent{
 		id:         randomString(joinIntentIDBytes),
 		creator:    creator,
 		profile:    profile,
 		deviceName: deviceName,
-		created:    time.Now(),
+		created:    now,
+		seen:       now,
 	}
 	r.intents[in.id] = in
 	return in
@@ -107,15 +117,28 @@ func (r *onboardRegistry) intentByID(id string) *joinIntent {
 	return r.intents[id]
 }
 
+// touchIntent records a status poll, which keeps an unused intent
+// alive. A lapsed intent stays lapsed.
+func (r *onboardRegistry) touchIntent(in *joinIntent) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now()
+	if in.stateLocked(now) != joinIntentExpired {
+		in.seen = now
+	}
+}
+
 // bindIntentLocked attaches s to the intent named id and applies the
-// intent's profile and device name to it. A second start cancels the
-// intent and the session it had bound, so neither device joins.
-func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession) *errJoinIntent {
+// intent's profile and a device name to it: the operator's, else
+// agentName (the CLI's --hostname), else <machine>-<account>. A second
+// start cancels the intent and the session it had bound, so neither
+// device joins.
+func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession, agentName string) *errJoinIntent {
 	if s.wholeMachine {
 		return &errJoinIntent{http.StatusBadRequest, "a join from an agent prompt runs per process; drop --whole-machine"}
 	}
 	in := r.intents[id]
-	if in == nil || time.Since(in.created) > onboardSessionTTL {
+	if in == nil || time.Since(in.seen) > joinIntentIdle {
 		return &errJoinIntent{http.StatusNotFound, "unknown or expired join intent; ask for a new prompt on the dashboard"}
 	}
 	if in.rejected || in.conflict {
@@ -133,8 +156,11 @@ func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession) *errJoi
 	}
 	name := in.deviceName
 	if name == "" {
+		name = agentName
+	}
+	if name == "" {
 		if s.osHostname == "" {
-			return &errJoinIntent{http.StatusBadRequest, "this machine's hostname cannot name a device; make a new prompt with a device name"}
+			return &errJoinIntent{http.StatusBadRequest, "this machine's hostname cannot name a device; pass --hostname <machine>-<account>"}
 		}
 		name = s.osHostname
 		if s.osUser != "" {
@@ -142,7 +168,7 @@ func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession) *errJoi
 		}
 	}
 	if !validDeviceName(name) {
-		return &errJoinIntent{http.StatusBadRequest, fmt.Sprintf("device name %q is too long or not valid; make a new prompt with a device name", name)}
+		return &errJoinIntent{http.StatusBadRequest, fmt.Sprintf("device name %q is not valid: letters, digits, '.', '_' and '-' only, at most %d characters", name, maxDeviceNameLen)}
 	}
 	in.session = s
 	s.intent = in
@@ -160,7 +186,7 @@ func (r *onboardRegistry) dropSessionLocked(s *onboardSession) {
 
 func (r *onboardRegistry) gcIntentsLocked(now time.Time) {
 	for id, in := range r.intents {
-		if now.Sub(in.created) > joinIntentRetention {
+		if now.Sub(in.seen) > joinIntentRetention {
 			delete(r.intents, id)
 		}
 	}
@@ -174,7 +200,7 @@ func (in *joinIntent) stateLocked(now time.Time) joinIntentState {
 		return joinIntentRejected
 	case in.conflict:
 		return joinIntentConflict
-	case s == nil && now.Sub(in.created) > onboardSessionTTL:
+	case s == nil && now.Sub(in.seen) > joinIntentIdle:
 		return joinIntentExpired
 	case s == nil:
 		return joinIntentWaiting
@@ -262,7 +288,7 @@ func (w *webMux) joinIntentStatus(in *joinIntent) joinIntentStatus {
 		ID:        in.id,
 		State:     in.stateLocked(now),
 		Profile:   in.profile,
-		ExpiresAt: in.created.Add(onboardSessionTTL).Unix(),
+		ExpiresAt: in.seen.Add(joinIntentIdle).Unix(),
 	}
 	var name, machine, osUser string
 	if s := in.session; s != nil {
@@ -374,12 +400,14 @@ func (w *webMux) apiOnboardIntentCreate(rw http.ResponseWriter, r *http.Request)
 }
 
 // apiOnboardIntentStatus: GET /api/onboard/intent/status?id=… — what
-// the Add device window polls while the agent joins.
+// the Add device window polls while the agent joins. Each poll keeps
+// an unused intent alive.
 func (w *webMux) apiOnboardIntentStatus(rw http.ResponseWriter, r *http.Request) {
 	in := w.intentForCaller(rw, r, r.URL.Query().Get("id"))
 	if in == nil {
 		return
 	}
+	w.onboard.touchIntent(in)
 	writeJSON(rw, w.joinIntentStatus(in))
 }
 

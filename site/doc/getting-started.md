@@ -94,31 +94,37 @@ Network Extension in **System Settings → Privacy & Security**.
 
 ### Let an agent join the device
 
-**Devices → Add device → Agent prompt** writes a prompt for an AI
-agent already running on the new device. Pick the profile, optionally
-a device name, then click **create prompt** and paste the prompt
-into the agent. The agent installs the client if needed and runs
-`clawpatrol join --intent <id>`. It then tells you the code the join
-printed. The Add device window shows the waiting device: its name, OS
-account, profile and code. Approve it there once the codes match.
+**Devices → Add device** opens on **Agent prompt**: a prompt for an
+AI agent already running on the new device. Copy it into the agent.
+If you have several profiles, pick one first; the prompt changes with
+it. The agent installs the client if needed, names the device and runs
+`clawpatrol join --intent <id> --hostname <name>`. It then tells you
+the device name and the code the join printed. The Add device window
+shows the waiting device: its name, OS account, profile and code.
+Approve it there once the codes match.
+
+The agent names the device `<machine>-<OS account>`, for example
+`devbox-alice`: the machine's short hostname and the account it runs
+as. Several accounts on one machine therefore get separate devices.
+When the hostname means nothing to a person (a container ID,
+`localhost`), the agent picks a short name for the machine instead
+and says so. Without `--hostname`, the gateway uses the OS hostname
+and account.
 
 The prompt holds no secret, because it may end up in the agent
-provider's logs. Its join intent is valid for ten minutes and for one
-device only, and it grants nothing until you approve:
+provider's logs. Its join intent works for one device only, and it
+grants nothing until you approve:
 
+- It stays valid while the Add device window is open. Closing the
+  window or picking another profile revokes it.
 - The gateway assigns the profile picked in the window and ignores
   any profile the client asks for.
-- The device is named `<machine>-<OS account>` unless you typed a
-  name. Several accounts on one machine therefore get separate
-  devices.
 - If a second device uses the same prompt, both joins are cancelled.
   The window then says the prompt may have leaked.
 - Joining under the name of an existing device in the same profile
   replaces that device. **Approve** stays disabled until you tick
   **Replace**.
 - Members can create prompts only for their own profiles.
-- **cancel prompt**, **new prompt** and closing the window all revoke
-  a prompt that hasn't joined yet.
 
 The prompt sets up per-process routing (`clawpatrol run`) and passes
 `--no-trust`, so the agent needs no sudo. For `--whole-machine`, use

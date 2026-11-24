@@ -1,4 +1,19 @@
-const api = fetch;
+// api is fetch for the dashboard's own routes. A 401 means the
+// dashboard session ended (expired, or signed out elsewhere), so the
+// browser goes to sign in and comes back here.
+async function api(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const r = await fetch(input, init);
+  if (r.status === 401) redirectToSignIn();
+  return r;
+}
+
+let signingIn = false;
+function redirectToSignIn() {
+  if (signingIn) return;
+  signingIn = true;
+  const here = window.location.pathname + window.location.search + window.location.hash;
+  window.location.assign("/__login?next=" + encodeURIComponent(here));
+}
 
 export type SecretSlot = {
   name: string;
@@ -113,7 +128,7 @@ export async function tailscaleConnect(connectURL: string): Promise<{
   pending_url?: string;
   status: string;
 }> {
-  const r = await fetch(connectURL, { method: "POST" });
+  const r = await api(connectURL, { method: "POST" });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -122,7 +137,7 @@ export async function tailscaleConnect(connectURL: string): Promise<{
 // in-process tsnet node keeps running until gateway restart — the
 // next boot reruns the interactive flow.
 export async function tailscaleDisconnect(disconnectURL: string): Promise<void> {
-  const r = await fetch(disconnectURL, { method: "POST" });
+  const r = await api(disconnectURL, { method: "POST" });
   if (!r.ok) throw new Error(await r.text());
 }
 
@@ -146,7 +161,7 @@ export async function setCredentialSlots(
   id: string,
   slots: Record<string, string>,
 ): Promise<SetCredentialResult> {
-  const r = await fetch("/api/credentials/set", {
+  const r = await api("/api/credentials/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, slots }),
@@ -156,7 +171,7 @@ export async function setCredentialSlots(
 }
 
 export async function clearCredential(id: string): Promise<void> {
-  const r = await fetch("/api/credentials/clear", {
+  const r = await api("/api/credentials/clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
@@ -382,7 +397,7 @@ export async function getPlugins(): Promise<Plugin[]> {
 // lockfile and reloads so a previously-blocked plugin loads. The
 // dashboard equivalent of `clawpatrol plugins approve`.
 export async function approvePlugin(name: string): Promise<void> {
-  const r = await fetch("/api/plugins/approve", {
+  const r = await api("/api/plugins/approve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -993,7 +1008,7 @@ let lastState: StateResp | null = null;
 export async function getState(): Promise<StateResp> {
   const headers: Record<string, string> = {};
   if (lastStateTag) headers["If-None-Match"] = lastStateTag;
-  const r = await fetch("/api/state", { headers, credentials: "same-origin" });
+  const r = await api("/api/state", { headers, credentials: "same-origin" });
   if (r.status === 304 && lastState) return lastState;
   if (!r.ok) throw new Error(await r.text());
   const tag = r.headers.get("ETag");
@@ -1263,8 +1278,8 @@ export type JoinIntentStatus = {
   error?: string;
 };
 
-export function createJoinIntent(profile: string, deviceName: string) {
-  return postJSON<JoinIntent>("/api/onboard/intent", { profile, device_name: deviceName });
+export function createJoinIntent(profile: string) {
+  return postJSON<JoinIntent>("/api/onboard/intent", { profile });
 }
 
 // getJoinIntentStatus returns null once the gateway no longer knows the

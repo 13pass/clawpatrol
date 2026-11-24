@@ -408,7 +408,8 @@ func nullStr(s string) any {
 
 // ClaimIP binds a peer IP to its approver. hostnameOverride wins over
 // the value captured at /api/onboard/start — older CLIs didn't send a
-// hostname at start, so the post-tunnel claim is the reliable hook.
+// hostname at start, so the post-tunnel claim is the reliable hook —
+// except for an intent join, whose name was settled at start.
 func (r *onboardRegistry) ClaimIP(deviceCode, ip, hostnameOverride string) (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -422,7 +423,7 @@ func (r *onboardRegistry) ClaimIP(deviceCode, ip, hostnameOverride string) (stri
 	} else {
 		delete(r.osHostByIP, ip)
 	}
-	if hostnameOverride != "" {
+	if hostnameOverride != "" && s.intent == nil {
 		r.hostnameByIP[ip] = hostnameOverride
 	} else if s.hostname != "" {
 		r.hostnameByIP[ip] = s.hostname
@@ -1027,12 +1028,22 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 		osName = ""
 	}
 	intentID := r.URL.Query().Get("intent")
+	// Newer clients report the OS hostname apart from the device name,
+	// which --hostname may override; older ones send only the name.
+	osHost, reportsOSHost := r.URL.Query().Get("os_hostname"), r.URL.Query().Has("os_hostname")
+	if !reportsOSHost {
+		osHost = hn
+	}
+	agentName := ""
+	if reportsOSHost {
+		agentName = hn
+	}
 	w.onboard.mu.Lock()
 	if hn != "" {
 		s.hostname = hn
-		if validDeviceName(hn) {
-			s.osHostname = hn
-		}
+	}
+	if validDeviceName(osHost) {
+		s.osHostname = osHost
 	}
 	if prof != "" {
 		s.profile = prof
@@ -1041,7 +1052,7 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 	s.osUser = osUser
 	s.os = osName
 	if intentID != "" {
-		if err := w.onboard.bindIntentLocked(intentID, s); err != nil {
+		if err := w.onboard.bindIntentLocked(intentID, s, agentName); err != nil {
 			w.onboard.dropSessionLocked(s)
 			w.onboard.mu.Unlock()
 			http.Error(rw, err.msg, err.status)

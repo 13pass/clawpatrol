@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
 	"runtime"
 	"strings"
 	"testing"
@@ -44,5 +45,18 @@ func TestDeviceFlowSendsIntentAndMachineAndStopsOnRejection(t *testing.T) {
 	}
 	if got := startQuery.Get("os_user"); got != currentOSUser() {
 		t.Errorf("start os_user = %q, want %q", got, currentOSUser())
+	}
+	osHost, _ := os.Hostname()
+	if got := startQuery.Get("os_hostname"); got != osHost {
+		t.Errorf("start os_hostname = %q, want %q", got, osHost)
+	}
+	// Without --hostname the gateway names an intent join itself.
+	if startQuery.Has("hostname") {
+		t.Errorf("start hostname = %q, want none without --hostname", startQuery.Get("hostname"))
+	}
+
+	_, _ = onboardViaDeviceFlow(srv.URL, false, "", "devbox-gemma", &setup, true, srv.Client(), false)
+	if got := startQuery.Get("hostname"); got != "devbox-gemma" {
+		t.Errorf("start hostname = %q, want the --hostname devbox-gemma", got)
 	}
 }
