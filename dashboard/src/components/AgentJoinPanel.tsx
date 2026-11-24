@@ -177,7 +177,7 @@ function PromptBlock({ prompt }: { prompt: string }) {
           {copied ? "copied" : "copy"}
         </Button>
       </div>
-      <pre className="bg-navy rounded px-4 py-4 text-xs font-mono text-canvas overflow-auto max-h-64 whitespace-pre">
+      <pre className="bg-navy rounded px-4 py-4 text-xs font-mono text-canvas overflow-auto max-h-64 whitespace-pre-wrap break-words">
         {prompt}
       </pre>
     </div>

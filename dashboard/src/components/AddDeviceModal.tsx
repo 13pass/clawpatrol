@@ -2,7 +2,26 @@ import { useEffect, useState } from "react";
 import { listProfiles, type Whoami } from "../lib/api";
 import { AgentJoinPanel, useJoinIntent } from "./AgentJoinPanel";
 import { JoinSteps } from "./JoinSteps";
+import { initialProfile } from "../lib/addDeviceProfile";
 import { Modal } from "./Modal";
+
+const LAST_PROFILE_KEY = "clawpatrol.addDevice.profile";
+
+function lastProfile(): string {
+  try {
+    return localStorage.getItem(LAST_PROFILE_KEY) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberProfile(profile: string) {
+  try {
+    localStorage.setItem(LAST_PROFILE_KEY, profile);
+  } catch {
+    // Private windows may refuse storage; the next window asks again.
+  }
+}
 
 export function AddDeviceModal({
   whoami,
@@ -21,8 +40,10 @@ export function AddDeviceModal({
   const [tab, setTab] = useState<"agent" | "commands">("agent");
   // A member can add devices only to a profile of their own; a gateway
   // without profiles still lets an admin make a prompt.
-  const noProfileOfTheirOwn = whoami?.role === "member" && profiles?.length === 0;
-  const canPrompt = profiles !== null && !profilesErr && !noProfileOfTheirOwn;
+  const member = whoami?.role === "member";
+  const noProfileOfTheirOwn = member && profiles?.length === 0;
+  const mustChoose = !!profiles && profiles.length > 1 && !profile;
+  const canPrompt = profiles !== null && !profilesErr && !noProfileOfTheirOwn && !mustChoose;
   const join = useJoinIntent(canPrompt ? profile : null);
   // Switching profile replaces the prompt, which would cancel a join
   // that is already waiting for approval.
@@ -32,15 +53,13 @@ export function AddDeviceModal({
     listProfiles()
       .then((p) => {
         setProfiles(p);
-        // Mirror the gateway's default-profile pick: "default" if it
-        // exists, else the first profile in source order.
-        setProfile(p.includes("default") ? "default" : (p[0] ?? ""));
+        setProfile(initialProfile(p, member, lastProfile()));
       })
       .catch((e) => {
         setProfilesErr(String(e));
         setProfiles([]);
       });
-  }, []);
+  }, [member]);
 
   // An operator authenticated over the tailnet can mint joins that
   // auto-approve: --login joins with their identity and the gateway's
@@ -79,10 +98,18 @@ export function AddDeviceModal({
             <span className="text-xs text-text-muted font-sans">Profile</span>
             <select
               value={profile}
-              onChange={(e) => setProfile(e.target.value)}
+              onChange={(e) => {
+                setProfile(e.target.value);
+                rememberProfile(e.target.value);
+              }}
               disabled={joinInFlight}
               className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
             >
+              {!profile && (
+                <option value="" disabled>
+                  Choose a profile…
+                </option>
+              )}
               {profiles.map((p) => (
                 <option key={p} value={p}>
                   {p}
@@ -108,7 +135,9 @@ export function AddDeviceModal({
                 ? `Could not load your profiles: ${profilesErr}`
                 : noProfileOfTheirOwn
                   ? "You have no profile yet, so there is nothing to add a device to. Ask an admin to assign you one."
-                  : ""
+                  : mustChoose
+                    ? "Choose the profile the new device joins."
+                    : ""
             }
           />
         )}
