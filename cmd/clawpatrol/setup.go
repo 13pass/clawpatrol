@@ -17,7 +17,6 @@ import (
 	neturl "net/url"
 	"os"
 	"os/exec"
-	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -107,7 +106,7 @@ func runJoin(args []string) {
 	wholeMachine := fs.Bool("whole-machine", false, "bring up wg-quick to route ALL host traffic through the gateway (default: persist conf only, use `clawpatrol run` for per-process routing)")
 	profile := fs.String("profile", "", "profile to assign at approval time (defaults to the gateway's default profile if the approver doesn't pick one)")
 	hostname := fs.String("hostname", "", "device name to register with the gateway (defaults to os.Hostname)")
-	intent := fs.String("intent", "", "join intent from the dashboard's Add device → Agent prompt: the gateway names the device <machine>-<account>, assigns the profile chosen there, and the operator approves it in that window")
+	intent := fs.String("intent", "", "join intent from the dashboard's Add device → Agent prompt; requires --hostname <machine>-<account>. The gateway assigns the profile chosen there, and the operator approves the device in that window")
 	loginFlag := fs.Bool("login", false, "interactively log in to the gateway's tailnet first (use when the gateway has no public URL). The temporary tailnet credentials are discarded once the gateway-minted device identity lands.")
 	_ = fs.Parse(reorderJoinArgsForFlagParse(args))
 	rest := fs.Args()
@@ -122,12 +121,14 @@ func runJoin(args []string) {
 		for flagName, set := range map[string]bool{
 			"--whole-machine": *wholeMachine,
 			"--profile":       *profile != "",
-			"--hostname":      *hostname != "",
 			"--login":         *loginFlag,
 		} {
 			if set {
-				fail("--intent cannot be combined with %s: the dashboard chose the device's name, profile and mode", flagName)
+				fail("--intent cannot be combined with %s: the dashboard chose the device's profile and mode", flagName)
 			}
+		}
+		if !validDeviceName(*hostname) {
+			fail("--intent requires --hostname <machine>-<account>: letters, digits, '.', '_' and '-' only, at most %d characters", maxDeviceNameLen)
 		}
 	}
 	// Normalize the pin up front: a malformed --ca-fingerprint is an operator
@@ -1353,6 +1354,10 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		cli = newJoinHTTPClient(gateway, 30*time.Second)
 	}
 
+	intent := ""
+	if setup != nil {
+		intent = setup.intent
+	}
 	hn := hostname
 	if hn == "" {
 		hn, _ = os.Hostname()
@@ -1369,17 +1374,6 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 	}
 	if wholeMachine {
 		q.Set("whole_machine", "1")
-	}
-	// Shown to the approver, and the gateway names an intent join
-	// <machine>-<account> so devices of several accounts on one machine
-	// stay apart.
-	if u := currentOSUser(); u != "" {
-		q.Set("os_user", u)
-	}
-	q.Set("os", runtime.GOOS)
-	intent := ""
-	if setup != nil {
-		intent = setup.intent
 	}
 	if intent != "" {
 		q.Set("intent", intent)
@@ -1551,6 +1545,11 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		_ = pr.Body.Close()
 		if k, ok := pv["auth_key"]; ok && k != "" {
 			authKey = k
+			// The name the gateway gave an intent join; the claim and
+			// the daemon's registration must not undo it.
+			if n := pv["device_name"]; validDeviceName(n) {
+				hn = n
+			}
 			loginServer = pv["login_server"]
 			apiToken = pv["api_token"]
 			tailnetGWHost = pv["gateway_host"]
@@ -2402,13 +2401,4 @@ func pingGateway(endpoint string) bool {
 	}
 	_ = c.Close()
 	return true
-}
-
-// currentOSUser names the account running the join, as the gateway
-// shows it and uses in an intent join's device name.
-func currentOSUser() string {
-	if u, err := user.Current(); err == nil && u.Username != "" {
-		return u.Username
-	}
-	return os.Getenv("USER")
 }

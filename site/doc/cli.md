@@ -56,7 +56,7 @@ clawpatrol join <gateway-url> [flags]
 | `--ca-dir DIR` | `~/.clawpatrol` | Where to store the fetched CA |
 | `--ca-fingerprint FP` | unset | SHA-256 fingerprint the gateway's CA must match before it is written or trusted. Read it off the dashboard. Pins a non-interactive join instead of relying on the operator comparing the printed fingerprint by eye. Accepts the digest with or without colons. |
 | `--name NAME` | `clawpatrol` | Exit-node hostname (Tailscale gateway, `--whole-machine` only) |
-| `--intent ID` | unset | Join intent from the dashboard's **Add device → Agent prompt**. The gateway sets the device name (`<machine>-<OS account>` by default) and the profile, and the operator approves in that window. Cannot be combined with `--profile`, `--hostname`, `--whole-machine` or `--login`. |
+| `--intent ID` | unset | Join intent from the dashboard's **Add device → Agent prompt**. Requires `--hostname`, conventionally `<machine>-<OS account>`; the gateway lowercases it. The gateway sets the profile, and the operator approves in that window. Cannot be combined with `--profile`, `--whole-machine` or `--login`. |
 
 A join waiting for approval prints one `CLAWPATROL_USER_CODE=<code>` line for scripts
 and agents to read.

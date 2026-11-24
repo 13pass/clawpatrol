@@ -7,30 +7,13 @@ export type AgentJoinPromptInput = {
   gatewayURL: string;
   caFingerprint: string;
   profile: string;
-  deviceName: string;
   intent: string;
-  expiresAt: number; // unix seconds
 };
 
 const installCmd = "curl -fsSL https://clawpatrol.dev/install.sh | sh";
 
-const MS_PER_SECOND = 1000;
-const ISO_DATE_TIME_CHARS = 19; // yyyy-MM-ddTHH:mm:ss
-
-// formatExpiry gives the agent an absolute UTC time: its clock and
-// time zone are unknown.
-export function formatExpiry(unixSeconds: number): string {
-  return (
-    new Date(unixSeconds * MS_PER_SECOND)
-      .toISOString()
-      .slice(0, ISO_DATE_TIME_CHARS)
-      .replace("T", " ") + " UTC"
-  );
-}
-
 export function buildAgentJoinPrompt(p: AgentJoinPromptInput): string {
   const pin = p.caFingerprint ? ` --ca-fingerprint ${p.caFingerprint}` : "";
-  const name = p.deviceName || "<machine>-<OS account> (set by the gateway)";
   return [
     "Set up this machine as a Claw Patrol device. Claw Patrol is a gateway that holds",
     "API credentials for agents; once joined, commands run with `clawpatrol run --`",
@@ -39,9 +22,9 @@ export function buildAgentJoinPrompt(p: AgentJoinPromptInput): string {
     `Gateway:     ${p.gatewayURL}`,
     ...(p.caFingerprint ? [`CA SHA-256:  ${p.caFingerprint}`] : []),
     `Profile:     ${p.profile} (set by the gateway; you cannot change it)`,
-    `Device name: ${name}`,
     `Join intent: ${p.intent}`,
-    `             single use, expires ${formatExpiry(p.expiresAt)}; not a password, it grants nothing by itself`,
+    "             single use, and only while the Add device window that made it stays",
+    "             open (one hour at most); not a password, it grants nothing by itself",
     "",
     "Run every step as the OS account that will use this device, not as root.",
     "",
@@ -51,15 +34,27 @@ export function buildAgentJoinPrompt(p: AgentJoinPromptInput): string {
     "   HOME or XDG_* elsewhere to get around this.",
     "1. If `command -v clawpatrol` finds nothing, install it:",
     `   ${installCmd}`,
-    "   Then check that `clawpatrol join --help` lists --intent. If it does not, stop:",
-    "   the client is too old for this prompt.",
-    "2. Start the join in the background; it waits up to 10 minutes for approval:",
-    `   clawpatrol join --intent ${p.intent}${pin} --no-trust ${p.gatewayURL}`,
-    "3. When it prints CLAWPATROL_USER_CODE=XXXX-XXXX, tell the user:",
-    '   "Approve the device in the Add device window. The code is XXXX-XXXX."',
+    "   Then, installed now or before, check that the output of `clawpatrol join --help`",
+    '   contains the words "requires --hostname". If not, stop: the client is too old',
+    "   for this prompt. Do not try a join to find out.",
+    "2. Name the device <machine>-<OS account>, in lowercase:",
+    "   - <machine> is the machine's short hostname: the part of `hostname` before",
+    "     the first dot. If `hostname` is missing, use $HOSTNAME or /etc/hostname",
+    "     (on Windows, %COMPUTERNAME%).",
+    "   - <OS account> is `whoami` (on Windows, the part after the backslash).",
+    "   For example, account alice on machine devbox gives devbox-alice. Always keep",
+    "   the account part: other accounts on this machine may have devices of their own.",
+    "   If the hostname means nothing to a person (a container ID, localhost, a random",
+    "   cloud name), use a short word for what the machine is instead, such as",
+    "   ci-runner-alice, and say so in your report.",
+    "   Use only letters, digits, '.', '_' and '-', at most 63 characters.",
+    "3. Start the join in the background; it waits up to 10 minutes for approval:",
+    `   clawpatrol join --intent ${p.intent} --hostname <device name>${pin} --no-trust ${p.gatewayURL}`,
+    "4. When it prints CLAWPATROL_USER_CODE=XXXX-XXXX, tell the user:",
+    '   "Approve <device name> in the Add device window. The code is XXXX-XXXX."',
     "   Then wait for the join to exit.",
-    "4. Check: clawpatrol status",
-    "5. Tell the user to restart you as `clawpatrol run -- <the command that started you>`.",
+    "5. Check: clawpatrol status",
+    "6. Tell the user to restart you as `clawpatrol run -- <the command that started you>`.",
     "   This session does not go through the gateway.",
     "",
     "Rules:",

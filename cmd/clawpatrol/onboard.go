@@ -69,13 +69,6 @@ type onboardSession struct {
 	// per-process tsnet. Determines whether the minted auth key is
 	// ephemeral (per-process) or not (whole-machine).
 	wholeMachine bool
-	// osHostname, osUser and os describe the joining machine as the CLI
-	// reports them (os.Hostname, the OS account, GOOS). Self-asserted:
-	// shown to the approver and used to name intent joins, never to
-	// authorize anything.
-	osHostname string
-	osUser     string
-	os         string
 	// intent is the dashboard join intent this session was started
 	// with (`clawpatrol join --intent`), if any.
 	intent *joinIntent
@@ -109,10 +102,7 @@ type onboardRegistry struct {
 	// reach the gateway claim a privileged device's name and inherit
 	// its profile. A StableID is issued by the control plane and
 	// cannot be asserted by the node.
-	nodeIDByIP map[string]string
-	// osHostByIP is the OS hostname the CLI reported at join, when it
-	// did (see onboardSession.osHostname).
-	osHostByIP     map[string]string
+	nodeIDByIP     map[string]string
 	knownDeviceIPs map[string]bool // all IPs present in devices table
 	// resolveTriedAt caches the last time we asked tsnet WhoIs whether an
 	// unknown peer IP corresponds to a known device. Without it, traffic
@@ -140,7 +130,6 @@ func newOnboardRegistry() *onboardRegistry {
 		extV6ByIP:        map[string]string{},
 		canonicalByAlias: map[string]string{},
 		nodeIDByIP:       map[string]string{},
-		osHostByIP:       map[string]string{},
 		knownDeviceIPs:   map[string]bool{},
 		resolveTriedAt:   map[string]time.Time{},
 		aliasResolving:   map[string]bool{},
@@ -304,7 +293,7 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 	if db == nil {
 		return nil
 	}
-	rows, err := db.Query("SELECT id, name, profile, external_ipv4, external_ipv6, ts_node_id, os_hostname FROM devices")
+	rows, err := db.Query("SELECT id, name, profile, external_ipv4, external_ipv6, ts_node_id FROM devices")
 	if err != nil {
 		return err
 	}
@@ -317,9 +306,8 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 			v4      sql.NullString
 			v6      sql.NullString
 			nodeID  sql.NullString
-			osHost  sql.NullString
 		)
-		if err := rows.Scan(&ip, &name, &profile, &v4, &v6, &nodeID, &osHost); err != nil {
+		if err := rows.Scan(&ip, &name, &profile, &v4, &v6, &nodeID); err != nil {
 			return err
 		}
 		r.knownDeviceIPs[ip] = true
@@ -337,9 +325,6 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 		}
 		if nodeID.Valid {
 			r.nodeIDByIP[ip] = nodeID.String
-		}
-		if osHost.Valid {
-			r.osHostByIP[ip] = osHost.String
 		}
 	}
 	return rows.Err()
@@ -383,19 +368,18 @@ func (r *onboardRegistry) upsertLocked(ip string) {
 	}
 	now := time.Now().UnixNano()
 	_, _ = r.db.Exec(`
-		INSERT INTO devices (id, name, profile, external_ipv4, external_ipv6, ts_node_id, os_hostname, created_ns, last_seen_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO devices (id, name, profile, external_ipv4, external_ipv6, ts_node_id, created_ns, last_seen_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name          = excluded.name,
 			profile       = excluded.profile,
 			external_ipv4 = excluded.external_ipv4,
 			external_ipv6 = excluded.external_ipv6,
 			ts_node_id    = excluded.ts_node_id,
-			os_hostname   = excluded.os_hostname,
 			last_seen_ns  = excluded.last_seen_ns
 	`, ip, nullStr(r.hostnameByIP[ip]), nullStr(r.profileByIP[ip]),
 		nullStr(r.extV4ByIP[ip]), nullStr(r.extV6ByIP[ip]),
-		nullStr(r.nodeIDByIP[ip]), nullStr(r.osHostByIP[ip]), now, now)
+		nullStr(r.nodeIDByIP[ip]), now, now)
 	r.knownDeviceIPs[ip] = true
 }
 
@@ -408,7 +392,8 @@ func nullStr(s string) any {
 
 // ClaimIP binds a peer IP to its approver. hostnameOverride wins over
 // the value captured at /api/onboard/start — older CLIs didn't send a
-// hostname at start, so the post-tunnel claim is the reliable hook.
+// hostname at start, so the post-tunnel claim is the reliable hook —
+// except for an intent join, whose name was settled at start.
 func (r *onboardRegistry) ClaimIP(deviceCode, ip, hostnameOverride string) (string, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -417,12 +402,7 @@ func (r *onboardRegistry) ClaimIP(deviceCode, ip, hostnameOverride string) (stri
 		return "", false
 	}
 	r.ownerByIP[ip] = s.owner
-	if s.osHostname != "" {
-		r.osHostByIP[ip] = s.osHostname
-	} else {
-		delete(r.osHostByIP, ip)
-	}
-	if hostnameOverride != "" {
+	if hostnameOverride != "" && s.intent == nil {
 		r.hostnameByIP[ip] = hostnameOverride
 	} else if s.hostname != "" {
 		r.hostnameByIP[ip] = s.hostname
@@ -768,7 +748,6 @@ func (r *onboardRegistry) ForgetIP(ip string) {
 	delete(r.extV4ByIP, ip)
 	delete(r.extV6ByIP, ip)
 	delete(r.nodeIDByIP, ip)
-	delete(r.osHostByIP, ip)
 	delete(r.knownDeviceIPs, ip)
 	// Drop the IP from the alias graph too — both as an alias and as a
 	// canonical. Otherwise a stale alias outlives the device and, after
@@ -1015,31 +994,15 @@ func (w *webMux) apiOnboardStart(rw http.ResponseWriter, r *http.Request) {
 	// retired node's name from being claimed by another while its
 	// devices row still exists.
 	wm := r.URL.Query().Get("whole_machine") == "1"
-	// The machine as the CLI describes it, for the approver and for
-	// naming an intent join. Values that could not be a host or
-	// account name are dropped rather than shown.
-	osUser := r.URL.Query().Get("os_user")
-	if !validDeviceName(osUser) {
-		osUser = ""
-	}
-	osName := r.URL.Query().Get("os")
-	if !validDeviceName(osName) {
-		osName = ""
-	}
 	intentID := r.URL.Query().Get("intent")
 	w.onboard.mu.Lock()
 	if hn != "" {
 		s.hostname = hn
-		if validDeviceName(hn) {
-			s.osHostname = hn
-		}
 	}
 	if prof != "" {
 		s.profile = prof
 	}
 	s.wholeMachine = wm
-	s.osUser = osUser
-	s.os = osName
 	if intentID != "" {
 		if err := w.onboard.bindIntentLocked(intentID, s); err != nil {
 			w.onboard.dropSessionLocked(s)
@@ -1575,6 +1538,11 @@ func (w *webMux) apiOnboardPoll(rw http.ResponseWriter, r *http.Request) {
 		"api_token":    s.apiToken,
 		"approved_by":  s.owner,
 		"login_server": s.loginServer, // empty = Tailscale Inc default
+	}
+	// The client registers under this name later (claim, tsnet daemon),
+	// so it must learn the name an intent join settled on.
+	if s.intent != nil {
+		resp["device_name"] = s.hostname
 	}
 	// In Tailscale mode include gateway_host, gateway_ip, and control_url
 	// so the client can write mode marker files for `clawpatrol run`.

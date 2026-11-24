@@ -1,4 +1,19 @@
-const api = fetch;
+// api is fetch for the dashboard's own routes. When the gateway's
+// dashboard gate refuses a request (the session expired, or was ended
+// elsewhere), the browser goes to sign in and comes back here.
+async function api(input: RequestInfo | URL, init?: RequestInit): Promise<Response> {
+  const r = await fetch(input, init);
+  if (r.status === 401 && r.headers.has("X-Clawpatrol-Sign-In")) redirectToSignIn();
+  return r;
+}
+
+let signingIn = false;
+function redirectToSignIn() {
+  if (signingIn) return;
+  signingIn = true;
+  const here = window.location.pathname + window.location.search + window.location.hash;
+  window.location.assign("/__login?next=" + encodeURIComponent(here));
+}
 
 export type SecretSlot = {
   name: string;
@@ -113,7 +128,7 @@ export async function tailscaleConnect(connectURL: string): Promise<{
   pending_url?: string;
   status: string;
 }> {
-  const r = await fetch(connectURL, { method: "POST" });
+  const r = await api(connectURL, { method: "POST" });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }
@@ -122,7 +137,7 @@ export async function tailscaleConnect(connectURL: string): Promise<{
 // in-process tsnet node keeps running until gateway restart — the
 // next boot reruns the interactive flow.
 export async function tailscaleDisconnect(disconnectURL: string): Promise<void> {
-  const r = await fetch(disconnectURL, { method: "POST" });
+  const r = await api(disconnectURL, { method: "POST" });
   if (!r.ok) throw new Error(await r.text());
 }
 
@@ -146,7 +161,7 @@ export async function setCredentialSlots(
   id: string,
   slots: Record<string, string>,
 ): Promise<SetCredentialResult> {
-  const r = await fetch("/api/credentials/set", {
+  const r = await api("/api/credentials/set", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id, slots }),
@@ -156,7 +171,7 @@ export async function setCredentialSlots(
 }
 
 export async function clearCredential(id: string): Promise<void> {
-  const r = await fetch("/api/credentials/clear", {
+  const r = await api("/api/credentials/clear", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ id }),
@@ -382,7 +397,7 @@ export async function getPlugins(): Promise<Plugin[]> {
 // lockfile and reloads so a previously-blocked plugin loads. The
 // dashboard equivalent of `clawpatrol plugins approve`.
 export async function approvePlugin(name: string): Promise<void> {
-  const r = await fetch("/api/plugins/approve", {
+  const r = await api("/api/plugins/approve", {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name }),
@@ -993,7 +1008,7 @@ let lastState: StateResp | null = null;
 export async function getState(): Promise<StateResp> {
   const headers: Record<string, string> = {};
   if (lastStateTag) headers["If-None-Match"] = lastStateTag;
-  const r = await fetch("/api/state", { headers, credentials: "same-origin" });
+  const r = await api("/api/state", { headers, credentials: "same-origin" });
   if (r.status === 304 && lastState) return lastState;
   if (!r.ok) throw new Error(await r.text());
   const tag = r.headers.get("ETag");
@@ -1226,7 +1241,6 @@ export async function oauthExchange(
 export type JoinIntent = {
   id: string;
   profile: string;
-  device_name: string;
   expires_at: number;
   ca_fingerprint: string;
 };
@@ -1241,30 +1255,20 @@ export type JoinIntentState =
   | "conflict"
   | "expired";
 
-// by_name: matched by its name only (it predates the recorded OS
-// hostname), so it may be on another machine.
-export type DeviceRef = { name: string; profile: string; by_name?: boolean };
+export type DeviceRef = { name: string; profile: string };
 
 export type JoinIntentStatus = {
   id: string;
   state: JoinIntentState;
   profile: string;
   expires_at: number;
-  device?: {
-    name: string;
-    os_hostname: string;
-    os_user: string;
-    os: string;
-    user_code: string;
-  };
+  device?: { name: string; user_code: string };
   replaces?: DeviceRef;
-  on_machine?: DeviceRef[];
-  warnings?: string[];
   error?: string;
 };
 
-export function createJoinIntent(profile: string, deviceName: string) {
-  return postJSON<JoinIntent>("/api/onboard/intent", { profile, device_name: deviceName });
+export function createJoinIntent(profile: string) {
+  return postJSON<JoinIntent>("/api/onboard/intent", { profile });
 }
 
 // getJoinIntentStatus returns null once the gateway no longer knows the
@@ -1278,6 +1282,19 @@ export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus 
 
 export function rejectJoinIntent(id: string) {
   return postJSON<JoinIntentStatus>("/api/onboard/intent/reject", { id });
+}
+
+// releaseJoinIntent revokes a prompt the window stops showing, unless a
+// device already used it: that join stays for the operator to decide.
+// keepalive lets the request outlive a closing page.
+export function releaseJoinIntent(id: string): void {
+  fetch("/api/onboard/intent/reject", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, if_unused: true }),
+    credentials: "same-origin",
+    keepalive: true,
+  }).catch(() => {});
 }
 
 export function approveJoin(code: string, profile: string, replace: boolean) {

@@ -12,16 +12,21 @@ export function AddDeviceModal({
   onClose: () => void;
 }) {
   const url = whoami?.public_url || window.location.origin;
-  const [profiles, setProfiles] = useState<string[]>([]);
+  // null while loading; the agent prompt waits for the profile.
+  const [profiles, setProfiles] = useState<string[] | null>(null);
+  const [profilesErr, setProfilesErr] = useState("");
   const [profile, setProfile] = useState("");
   // "agent": a prompt for an AI agent on the new device, approved in
-  // this window (AgentJoinPanel).
-  const [tab, setTab] = useState<"commands" | "agent">("commands");
-  const join = useJoinIntent();
-  function close() {
-    join.cancelIfLive();
-    onClose();
-  }
+  // this window (AgentJoinPanel). Closing the window revokes it.
+  const [tab, setTab] = useState<"agent" | "commands">("agent");
+  // A member can add devices only to a profile of their own; a gateway
+  // without profiles still lets an admin make a prompt.
+  const noProfileOfTheirOwn = whoami?.role === "member" && profiles?.length === 0;
+  const canPrompt = profiles !== null && !profilesErr && !noProfileOfTheirOwn;
+  const join = useJoinIntent(canPrompt ? profile : null);
+  // Switching profile replaces the prompt, which would cancel a join
+  // that is already waiting for approval.
+  const joinInFlight = join.state === "pending" || join.state === "approved";
 
   useEffect(() => {
     listProfiles()
@@ -31,7 +36,10 @@ export function AddDeviceModal({
         // exists, else the first profile in source order.
         setProfile(p.includes("default") ? "default" : (p[0] ?? ""));
       })
-      .catch(() => setProfiles([]));
+      .catch((e) => {
+        setProfilesErr(String(e));
+        setProfiles([]);
+      });
   }, []);
 
   // An operator authenticated over the tailnet can mint joins that
@@ -41,13 +49,13 @@ export function AddDeviceModal({
   const login = whoami?.auth_method === "tailscale";
 
   return (
-    <Modal title="Add device" onClose={close}>
+    <Modal title="Add device" onClose={onClose}>
       <div className="p-4 space-y-5">
         <div className="flex text-xs border-1.5 border-navy squircle-sm overflow-hidden w-fit font-mono">
           {(
             [
-              ["commands", "Commands"],
               ["agent", "Agent prompt"],
+              ["commands", "Commands"],
             ] as const
           ).map(([key, label]) => (
             <button
@@ -61,14 +69,18 @@ export function AddDeviceModal({
           ))}
         </div>
 
-        {profiles.length > 1 && (
+        {profiles && profiles.length === 1 && (
+          <p className="text-xs text-text-muted font-sans">
+            Profile: <span className="font-mono text-text">{profile}</span>
+          </p>
+        )}
+        {profiles && profiles.length > 1 && (
           <label className="block space-y-1">
             <span className="text-xs text-text-muted font-sans">Profile</span>
             <select
-              value={join.intent ? join.intent.profile : profile}
+              value={profile}
               onChange={(e) => setProfile(e.target.value)}
-              // The prompt carries its profile; a new prompt picks another.
-              disabled={!!join.intent}
+              disabled={joinInFlight}
               className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
             >
               {profiles.map((p) => (
@@ -90,9 +102,14 @@ export function AddDeviceModal({
         ) : (
           <AgentJoinPanel
             gatewayURL={url}
-            profile={profile}
-            profileRequired={profiles.length > 0}
             join={join}
+            blocked={
+              profilesErr
+                ? `Could not load your profiles: ${profilesErr}`
+                : noProfileOfTheirOwn
+                  ? "You have no profile yet, so there is nothing to add a device to. Ask an admin to assign you one."
+                  : ""
+            }
           />
         )}
       </div>
