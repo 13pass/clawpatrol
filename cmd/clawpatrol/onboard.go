@@ -109,7 +109,10 @@ type onboardRegistry struct {
 	// reach the gateway claim a privileged device's name and inherit
 	// its profile. A StableID is issued by the control plane and
 	// cannot be asserted by the node.
-	nodeIDByIP     map[string]string
+	nodeIDByIP map[string]string
+	// osHostByIP is the OS hostname the CLI reported at join, when it
+	// did (see onboardSession.osHostname).
+	osHostByIP     map[string]string
 	knownDeviceIPs map[string]bool // all IPs present in devices table
 	// resolveTriedAt caches the last time we asked tsnet WhoIs whether an
 	// unknown peer IP corresponds to a known device. Without it, traffic
@@ -132,6 +135,7 @@ func newOnboardRegistry() *onboardRegistry {
 		extV6ByIP:        map[string]string{},
 		canonicalByAlias: map[string]string{},
 		nodeIDByIP:       map[string]string{},
+		osHostByIP:       map[string]string{},
 		knownDeviceIPs:   map[string]bool{},
 		resolveTriedAt:   map[string]time.Time{},
 		intents:          map[string]*joinIntent{},
@@ -294,7 +298,7 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 	if db == nil {
 		return nil
 	}
-	rows, err := db.Query("SELECT id, name, profile, external_ipv4, external_ipv6, ts_node_id FROM devices")
+	rows, err := db.Query("SELECT id, name, profile, external_ipv4, external_ipv6, ts_node_id, os_hostname FROM devices")
 	if err != nil {
 		return err
 	}
@@ -307,8 +311,9 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 			v4      sql.NullString
 			v6      sql.NullString
 			nodeID  sql.NullString
+			osHost  sql.NullString
 		)
-		if err := rows.Scan(&ip, &name, &profile, &v4, &v6, &nodeID); err != nil {
+		if err := rows.Scan(&ip, &name, &profile, &v4, &v6, &nodeID, &osHost); err != nil {
 			return err
 		}
 		r.knownDeviceIPs[ip] = true
@@ -326,6 +331,9 @@ func (r *onboardRegistry) Load(db *sql.DB) error {
 		}
 		if nodeID.Valid {
 			r.nodeIDByIP[ip] = nodeID.String
+		}
+		if osHost.Valid {
+			r.osHostByIP[ip] = osHost.String
 		}
 	}
 	return rows.Err()
@@ -369,18 +377,19 @@ func (r *onboardRegistry) upsertLocked(ip string) {
 	}
 	now := time.Now().UnixNano()
 	_, _ = r.db.Exec(`
-		INSERT INTO devices (id, name, profile, external_ipv4, external_ipv6, ts_node_id, created_ns, last_seen_ns)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+		INSERT INTO devices (id, name, profile, external_ipv4, external_ipv6, ts_node_id, os_hostname, created_ns, last_seen_ns)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
 			name          = excluded.name,
 			profile       = excluded.profile,
 			external_ipv4 = excluded.external_ipv4,
 			external_ipv6 = excluded.external_ipv6,
 			ts_node_id    = excluded.ts_node_id,
+			os_hostname   = excluded.os_hostname,
 			last_seen_ns  = excluded.last_seen_ns
 	`, ip, nullStr(r.hostnameByIP[ip]), nullStr(r.profileByIP[ip]),
 		nullStr(r.extV4ByIP[ip]), nullStr(r.extV6ByIP[ip]),
-		nullStr(r.nodeIDByIP[ip]), now, now)
+		nullStr(r.nodeIDByIP[ip]), nullStr(r.osHostByIP[ip]), now, now)
 	r.knownDeviceIPs[ip] = true
 }
 
@@ -402,6 +411,11 @@ func (r *onboardRegistry) ClaimIP(deviceCode, ip, hostnameOverride string) (stri
 		return "", false
 	}
 	r.ownerByIP[ip] = s.owner
+	if s.osHostname != "" {
+		r.osHostByIP[ip] = s.osHostname
+	} else {
+		delete(r.osHostByIP, ip)
+	}
 	if hostnameOverride != "" {
 		r.hostnameByIP[ip] = hostnameOverride
 	} else if s.hostname != "" {
@@ -469,11 +483,15 @@ func (r *onboardRegistry) HostnameForIP(ip string) string {
 // held in memory only and is gone after a restart; the profile is
 // loaded from the devices table, so it is the check that holds.
 func (r *onboardRegistry) IPForHostname(owner, profile, hostname string) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.ipForHostnameLocked(owner, profile, hostname)
+}
+
+func (r *onboardRegistry) ipForHostnameLocked(owner, profile, hostname string) string {
 	if hostname == "" {
 		return ""
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	for ip, hn := range r.hostnameByIP {
 		if hn != hostname {
 			continue
@@ -723,6 +741,7 @@ func (r *onboardRegistry) ForgetIP(ip string) {
 	delete(r.extV4ByIP, ip)
 	delete(r.extV6ByIP, ip)
 	delete(r.nodeIDByIP, ip)
+	delete(r.osHostByIP, ip)
 	delete(r.knownDeviceIPs, ip)
 	// Drop the IP from the alias graph too — both as an alias and as a
 	// canonical. Otherwise a stale alias outlives the device and, after
@@ -1186,32 +1205,28 @@ func (w *webMux) apiOnboardApprove(rw http.ResponseWriter, r *http.Request) {
 		// failing. With zero profiles this stays the raw suggestion.
 		profile = resolveProfileFromList(profiles, s.profile)
 	}
-	if err := w.checkIntentApproval(s, owner, profile, body.Replace); err != nil {
-		http.Error(rw, err.msg, err.status)
-		return
-	}
 	w.onboard.mu.Lock()
 	if s.approved {
 		w.onboard.mu.Unlock()
 		writeJSON(rw, map[string]any{"already": true, "profile": s.profile})
 		return
 	}
-	if in := s.intent; in != nil && (in.rejected || in.conflict) {
+	// Recycle the wg /32 already bound to (owner, hostname) in this
+	// profile so a rejoin from the same machine doesn't spawn a
+	// duplicate device row. Decided in the same critical section that
+	// approves, so an intent join cannot take over a device its
+	// operator did not confirm.
+	reuseIP := w.onboard.ipForHostnameLocked(owner, profile, s.hostname)
+	if err := checkIntentApprovalLocked(s, profile, reuseIP != "", body.Replace); err != nil {
 		w.onboard.mu.Unlock()
-		http.Error(rw, "this join was cancelled", http.StatusConflict)
+		http.Error(rw, err.msg, err.status)
 		return
 	}
 	s.approved = true
 	s.owner = owner
 	s.profile = profile
-	hostname := s.hostname
 	wholeMachine := s.wholeMachine
 	w.onboard.mu.Unlock()
-
-	// Recycle the wg /32 already bound to (owner, hostname) in this
-	// profile so a rejoin from the same machine doesn't spawn a
-	// duplicate device row.
-	reuseIP := w.onboard.IPForHostname(owner, profile, hostname)
 
 	// Mint key in background so the approve click returns fast.
 	go func() {

@@ -61,7 +61,8 @@ const (
 	joinIntentPending  joinIntentState = "pending"  // a device waits for approval
 	joinIntentApproved joinIntentState = "approved" // approved, device not yet set up
 	joinIntentJoined   joinIntentState = "joined"   // the device received its configuration
-	joinIntentRejected joinIntentState = "rejected" // the operator rejected it
+	joinIntentRejected joinIntentState = "rejected" // the operator rejected or cancelled it
+	joinIntentFailed   joinIntentState = "failed"   // setting the device up failed after approval
 	joinIntentConflict joinIntentState = "conflict" // a second device tried to use it
 	joinIntentExpired  joinIntentState = "expired"
 )
@@ -141,7 +142,7 @@ func (r *onboardRegistry) bindIntentLocked(id string, s *onboardSession) *errJoi
 		}
 	}
 	if !validDeviceName(name) {
-		return &errJoinIntent{http.StatusBadRequest, fmt.Sprintf("device name %q is not valid", name)}
+		return &errJoinIntent{http.StatusBadRequest, fmt.Sprintf("device name %q is too long or not valid; make a new prompt with a device name", name)}
 	}
 	in.session = s
 	s.intent = in
@@ -177,6 +178,8 @@ func (in *joinIntent) stateLocked(now time.Time) joinIntentState {
 		return joinIntentExpired
 	case s == nil:
 		return joinIntentWaiting
+	case s.err != "":
+		return joinIntentFailed
 	case s.delivered:
 		return joinIntentJoined
 	case now.Sub(s.created) > onboardSessionTTL:
@@ -189,13 +192,17 @@ func (in *joinIntent) stateLocked(now time.Time) joinIntentState {
 }
 
 // deviceRef is a registered device as the Add device window lists it.
+// ByName marks a device that predates the recorded OS hostname and is
+// only matched by its name, so it may be on another machine.
 type deviceRef struct {
 	Name    string `json:"name"`
 	Profile string `json:"profile"`
+	ByName  bool   `json:"by_name,omitempty"`
 }
 
-// DevicesOnMachine lists the devices named after machine: the bare
-// hostname, or <machine>-<something> as shared hosts name them.
+// DevicesOnMachine lists the devices that joined from machine: those
+// whose recorded OS hostname is machine and, for devices without one,
+// those named machine or machine-<one label>, as shared hosts name them.
 func (r *onboardRegistry) DevicesOnMachine(machine string) []deviceRef {
 	if machine == "" {
 		return nil
@@ -204,13 +211,26 @@ func (r *onboardRegistry) DevicesOnMachine(machine string) []deviceRef {
 	defer r.mu.Unlock()
 	var out []deviceRef
 	for ip, name := range r.hostnameByIP {
-		if name != machine && !strings.HasPrefix(name, machine+"-") {
+		if host, ok := r.osHostByIP[ip]; ok {
+			if host == machine {
+				out = append(out, deviceRef{Name: name, Profile: r.profileByIP[ip]})
+			}
 			continue
 		}
-		out = append(out, deviceRef{Name: name, Profile: r.profileByIP[ip]})
+		if namedAfterMachine(name, machine) {
+			out = append(out, deviceRef{Name: name, Profile: r.profileByIP[ip], ByName: true})
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 	return out
+}
+
+func namedAfterMachine(name, machine string) bool {
+	if name == machine {
+		return true
+	}
+	rest, ok := strings.CutPrefix(name, machine+"-")
+	return ok && rest != "" && !strings.Contains(rest, "-")
 }
 
 type joinIntentDevice struct {
@@ -266,8 +286,9 @@ func (w *webMux) joinIntentStatus(in *joinIntent) joinIntentStatus {
 		st.OnMachine = append(st.OnMachine, d)
 		// One account per profile is the usual shape of a shared host:
 		// another device of this profile on the machine suggests the
-		// agent runs in the wrong OS account.
-		if d.Profile == in.profile && d.Name != name {
+		// agent runs in the wrong OS account. A match by name alone is
+		// too weak to warn about.
+		if !d.ByName && d.Profile == in.profile && d.Name != name {
 			st.Warnings = append(st.Warnings, fmt.Sprintf(
 				"profile %s already has %s on this machine; this join comes from OS account %q",
 				in.profile, d.Name, osUser))
@@ -326,12 +347,11 @@ func (w *webMux) apiOnboardIntentCreate(rw http.ResponseWriter, r *http.Request)
 		return
 	}
 	profiles := orderedProfileNames(w.g.cfg.Load().Policy)
-	profile := body.Profile
-	if profile == "" {
-		profile = resolveProfileFromList(profiles, "")
-	}
-	if profile == "" || (len(profiles) > 0 && !slices.Contains(profiles, profile)) {
-		http.Error(rw, fmt.Sprintf("unknown profile %q", profile), http.StatusBadRequest)
+	// A policy with no profiles has nothing to choose from; the join
+	// then gets whatever approve assigns, as with the Commands tab.
+	profile := resolveProfileFromList(profiles, body.Profile)
+	if len(profiles) > 0 && body.Profile != "" && !slices.Contains(profiles, body.Profile) {
+		http.Error(rw, fmt.Sprintf("unknown profile %q", body.Profile), http.StatusBadRequest)
 		return
 	}
 	if !v.ownsProfile(profile) {
@@ -389,21 +409,23 @@ func (w *webMux) apiOnboardIntentReject(rw http.ResponseWriter, r *http.Request)
 	writeJSON(rw, w.joinIntentStatus(in))
 }
 
-// checkIntentApproval holds an approval of an intent join to what the
-// operator chose for it: its profile, and no takeover of an existing
-// device without replace. Sessions without an intent pass.
-func (w *webMux) checkIntentApproval(s *onboardSession, owner, profile string, replace bool) *errJoinIntent {
-	w.onboard.mu.Lock()
-	in, name := s.intent, s.hostname
-	w.onboard.mu.Unlock()
+// checkIntentApprovalLocked holds an approval of an intent join to what
+// the operator chose for it: its profile, and no takeover of an existing
+// device without replace. Sessions without an intent pass. Caller holds
+// the registry lock.
+func checkIntentApprovalLocked(s *onboardSession, profile string, replaces, replace bool) *errJoinIntent {
+	in := s.intent
 	if in == nil {
 		return nil
+	}
+	if in.rejected || in.conflict {
+		return &errJoinIntent{http.StatusConflict, "this join was cancelled"}
 	}
 	if profile != in.profile {
 		return &errJoinIntent{http.StatusForbidden, fmt.Sprintf("this device joins profile %q, chosen when the prompt was made", in.profile)}
 	}
-	if !replace && w.onboard.IPForHostname(owner, profile, name) != "" {
-		return &errJoinIntent{http.StatusConflict, fmt.Sprintf("approving would replace the existing device %s; confirm the replacement", name)}
+	if replaces && !replace {
+		return &errJoinIntent{http.StatusConflict, fmt.Sprintf("approving would replace the existing device %s; confirm the replacement", s.hostname)}
 	}
 	return nil
 }

@@ -8,24 +8,30 @@ import {
   type JoinIntentState,
   type JoinIntentStatus,
 } from "../lib/api";
-import { buildAgentJoinPrompt, formatExpiry } from "../lib/agentJoinPrompt";
+import { buildAgentJoinPrompt } from "../lib/agentJoinPrompt";
 import { copyText } from "../lib/clipboard";
+import { fmtTime } from "../lib/format";
 import { Button } from "./Button";
 
 const POLL_INTERVAL_MS = 2000;
 const COPIED_FLASH_MS = 1500;
+const MS_PER_SECOND = 1000;
 const LIVE_STATES: JoinIntentState[] = ["waiting", "pending", "approved"];
 
-// AgentJoinPanel is the Add device window's "Agent prompt" tab: it
-// creates a join intent, shows the prompt to give an agent on the new
-// device, then follows the join so the operator approves it here. The
-// intent carries the profile, so the caller keys this panel by profile.
-export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; profile: string }) {
-  const [deviceName, setDeviceName] = useState("");
+// "gone": the gateway no longer knows the intent (it restarted, or the
+// intent outlived its retention).
+type JoinState = JoinIntentState | "gone";
+
+export type JoinIntentHandle = ReturnType<typeof useJoinIntent>;
+
+// useJoinIntent owns the Add device window's join intent and follows it
+// while it is live. It lives in the window, not the tab, so switching
+// tabs keeps the join; closing the window cancels it (cancelIfLive).
+export function useJoinIntent() {
   const [intent, setIntent] = useState<JoinIntent | null>(null);
   const [status, setStatus] = useState<JoinIntentStatus | null>(null);
+  const [gone, setGone] = useState(false);
   const [err, setErr] = useState("");
-  const [busy, setBusy] = useState(false);
 
   useEffect(() => {
     if (!intent) return;
@@ -35,7 +41,12 @@ export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; pr
       try {
         const s = await getJoinIntentStatus(id);
         if (loop.stopped) return;
+        if (!s) {
+          setGone(true);
+          return;
+        }
         setStatus(s);
+        setErr("");
         if (!LIVE_STATES.includes(s.state)) return;
       } catch (e) {
         if (!loop.stopped) setErr(String(e));
@@ -49,18 +60,59 @@ export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; pr
     };
   }, [intent]);
 
-  async function create() {
-    setBusy(true);
-    setErr("");
-    try {
-      setIntent(await createJoinIntent(profile, deviceName.trim()));
+  const state: JoinState | null = gone ? "gone" : (status?.state ?? (intent ? "waiting" : null));
+  const live = state !== null && (LIVE_STATES as JoinState[]).includes(state);
+
+  return {
+    intent,
+    status,
+    state,
+    live,
+    err,
+    setErr,
+    setStatus,
+    async create(profile: string, deviceName: string) {
+      setErr("");
+      try {
+        setIntent(await createJoinIntent(profile, deviceName));
+        setStatus(null);
+        setGone(false);
+      } catch (e) {
+        setErr(String(e));
+      }
+    },
+    // cancelIfLive rejects the intent unless it already ended, so a
+    // prompt the operator walked away from stops working.
+    cancelIfLive() {
+      if (intent && live) rejectJoinIntent(intent.id).catch(() => {});
+    },
+    reset() {
+      if (intent && live) rejectJoinIntent(intent.id).catch(() => {});
+      setIntent(null);
       setStatus(null);
-    } catch (e) {
-      setErr(String(e));
-    } finally {
-      setBusy(false);
-    }
-  }
+      setGone(false);
+      setErr("");
+    },
+  };
+}
+
+// AgentJoinPanel is the Add device window's "Agent prompt" tab: it
+// creates a join intent, shows the prompt to give an agent on the new
+// device, then follows the join so the operator approves it here.
+export function AgentJoinPanel({
+  gatewayURL,
+  profile,
+  profileRequired,
+  join,
+}: {
+  gatewayURL: string;
+  profile: string;
+  profileRequired: boolean;
+  join: JoinIntentHandle;
+}) {
+  const [deviceName, setDeviceName] = useState("");
+  const [busy, setBusy] = useState(false);
+  const { intent } = join;
 
   if (!intent) {
     return (
@@ -68,6 +120,7 @@ export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; pr
         <p className="text-sm text-text-muted font-sans">
           Creates a single-use prompt for an AI agent on the new device. The agent runs the join;
           you approve it here after checking the code it reports. The prompt contains no secret.
+          Closing this window cancels the prompt.
         </p>
         <label className="block space-y-1">
           <span className="text-xs text-text-muted font-sans">
@@ -80,8 +133,15 @@ export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; pr
             className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
           />
         </label>
-        {err && <p className="text-xs text-danger-500 font-mono break-words">{err}</p>}
-        <Button onClick={create} disabled={busy || !profile}>
+        {join.err && <p className="text-xs text-danger-500 font-mono break-words">{join.err}</p>}
+        <Button
+          onClick={async () => {
+            setBusy(true);
+            await join.create(profile, deviceName.trim());
+            setBusy(false);
+          }}
+          disabled={busy || (profileRequired && !profile)}
+        >
           {busy ? "creating…" : "create prompt"}
         </Button>
       </div>
@@ -100,16 +160,8 @@ export function AgentJoinPanel({ gatewayURL, profile }: { gatewayURL: string; pr
   return (
     <div className="space-y-4">
       <PromptBlock prompt={prompt} />
-      <StatusPanel
-        status={status}
-        onChange={setStatus}
-        onError={setErr}
-        onRestart={() => {
-          setIntent(null);
-          setStatus(null);
-        }}
-      />
-      {err && <p className="text-xs text-danger-500 font-mono break-words">{err}</p>}
+      <StatusPanel join={join} />
+      {join.err && <p className="text-xs text-danger-500 font-mono break-words">{join.err}</p>}
     </div>
   );
 }
@@ -139,54 +191,56 @@ function PromptBlock({ prompt }: { prompt: string }) {
   );
 }
 
-function StatusPanel({
-  status,
-  onChange,
-  onError,
-  onRestart,
-}: {
-  status: JoinIntentStatus | null;
-  onChange: (s: JoinIntentStatus) => void;
-  onError: (e: string) => void;
-  onRestart: () => void;
-}) {
+function StatusPanel({ join }: { join: JoinIntentHandle }) {
   const [replace, setReplace] = useState(false);
   const [busy, setBusy] = useState(false);
-
-  if (!status || status.state === "waiting") {
-    return (
-      <Box>
-        Waiting for the agent to start the join
-        {status ? ` (prompt expires ${formatExpiry(status.expires_at)})` : ""}…
-      </Box>
-    );
-  }
-  const d = status.device;
+  const { intent, status, state } = join;
 
   async function act(fn: () => Promise<unknown>) {
     setBusy(true);
-    onError("");
+    join.setErr("");
     try {
       await fn();
     } catch (e) {
-      onError(String(e));
+      join.setErr(String(e));
     } finally {
       setBusy(false);
     }
   }
+  const reject = () =>
+    act(async () => {
+      if (intent) join.setStatus(await rejectJoinIntent(intent.id));
+    });
 
-  const ended: Partial<Record<JoinIntentState, string>> = {
-    joined: `${d?.name} joined profile ${status.profile}. Ask the agent for its report.`,
-    rejected: "Rejected. Nothing joined.",
+  const ended: Partial<Record<JoinState, string>> = {
+    joined: `${status?.device?.name} joined profile ${status?.profile}. Ask the agent for its report.`,
+    rejected: "Cancelled. Nothing joined.",
     conflict:
       "A second device used this prompt, so both joins were cancelled. The prompt may have leaked; make a new one.",
     expired: "The prompt expired before the join finished.",
+    failed: `Setting the device up failed after approval: ${status?.error ?? "unknown error"}`,
+    gone: "The gateway no longer knows this prompt (it restarted, or the prompt is too old).",
   };
-  const message = ended[status.state];
+  const message = state ? ended[state] : undefined;
+
+  if (state === "waiting") {
+    return (
+      <Box>
+        <p>
+          Waiting for the agent to start the join (prompt expires{" "}
+          {fmtTime((status?.expires_at ?? intent!.expires_at) * MS_PER_SECOND)})…
+        </p>
+        <Button variant="outline" disabled={busy} onClick={reject}>
+          cancel prompt
+        </Button>
+      </Box>
+    );
+  }
+  const d = status?.device;
 
   return (
     <Box>
-      {d && (
+      {d && state !== "gone" && (
         <dl className="grid grid-cols-[auto_1fr] gap-x-4 gap-y-1 text-xs font-mono">
           <dt className="text-text-muted">Device</dt>
           <dd>
@@ -202,7 +256,7 @@ function StatusPanel({
             {d.os_user || "?"}@{d.os_hostname || "?"} · {d.os || "?"}
           </dd>
           <dt className="text-text-muted">Profile</dt>
-          <dd>{status.profile}</dd>
+          <dd>{status.profile || "gateway default"}</dd>
           <dt className="text-text-muted">Code</dt>
           <dd className="font-semibold">{d.user_code}</dd>
           {status.on_machine && status.on_machine.length > 0 && (
@@ -210,22 +264,26 @@ function StatusPanel({
               <dt className="text-text-muted">Same machine</dt>
               <dd>
                 {status.on_machine
-                  .map((x) => `${x.name} (${x.profile || "no profile"})`)
+                  .map(
+                    (x) =>
+                      `${x.name} (${x.profile || "no profile"})${x.by_name ? " [by name only]" : ""}`,
+                  )
                   .join(", ")}
               </dd>
             </>
           )}
         </dl>
       )}
-      {status.warnings?.map((w) => (
-        <p key={w} className="text-xs text-amber-600 font-sans">
-          ⚠ {w}
-        </p>
-      ))}
-      {status.state === "pending" && (
+      {state !== "gone" &&
+        status?.warnings?.map((w) => (
+          <p key={w} className="text-xs text-amber-600 font-sans">
+            ⚠ {w}
+          </p>
+        ))}
+      {state === "pending" && d && (
         <div className="space-y-2">
           <p className="text-xs text-text-muted font-sans">
-            Approve only if the agent reports the code {d?.user_code}.
+            Approve only if the agent reports the code {d.user_code}.
           </p>
           {status.replaces && (
             <label className="flex items-center gap-2 text-xs font-sans">
@@ -240,28 +298,24 @@ function StatusPanel({
           <div className="flex gap-2">
             <Button
               disabled={busy || (!!status.replaces && !replace)}
-              onClick={() => act(() => approveJoin(d!.user_code, status.profile, replace))}
+              onClick={() => act(() => approveJoin(d.user_code, status.profile, replace))}
             >
               approve
             </Button>
-            <Button
-              variant="outline"
-              disabled={busy}
-              onClick={() => act(async () => onChange(await rejectJoinIntent(status.id)))}
-            >
+            <Button variant="outline" disabled={busy} onClick={reject}>
               reject
             </Button>
           </div>
         </div>
       )}
-      {status.state === "approved" && (
+      {state === "approved" && (
         <p className="text-xs font-sans">Approved; the agent is finishing the setup…</p>
       )}
       {message && (
         <div className="space-y-2">
           <p className="text-xs font-sans">{message}</p>
-          {status.state !== "joined" && (
-            <Button variant="outline" onClick={onRestart}>
+          {state !== "joined" && (
+            <Button variant="outline" onClick={join.reset}>
               new prompt
             </Button>
           )}

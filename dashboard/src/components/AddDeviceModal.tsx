@@ -1,6 +1,6 @@
 import { useEffect, useState } from "react";
 import { listProfiles, type Whoami } from "../lib/api";
-import { AgentJoinPanel } from "./AgentJoinPanel";
+import { AgentJoinPanel, useJoinIntent } from "./AgentJoinPanel";
 import { Button } from "./Button";
 import { Modal } from "./Modal";
 import { copyText } from "../lib/clipboard";
@@ -29,6 +29,11 @@ export function AddDeviceModal({
   // "agent": a prompt for an AI agent on the new device, approved in
   // this window (AgentJoinPanel).
   const [tab, setTab] = useState<"commands" | "agent">("commands");
+  const join = useJoinIntent();
+  function close() {
+    join.cancelIfLive();
+    onClose();
+  }
 
   useEffect(() => {
     listProfiles()
@@ -58,7 +63,7 @@ export function AddDeviceModal({
   ].join(" ");
 
   return (
-    <Modal title="Add device" onClose={onClose}>
+    <Modal title="Add device" onClose={close}>
       <div className="p-4 space-y-5">
         <div className="flex text-xs border-1.5 border-navy squircle-sm overflow-hidden w-fit font-mono">
           {(
@@ -83,8 +88,10 @@ export function AddDeviceModal({
             <label className="block space-y-1">
               <span className="text-xs text-text-muted font-sans">Profile</span>
               <select
-                value={profile}
+                value={join.intent ? join.intent.profile : profile}
                 onChange={(e) => setProfile(e.target.value)}
+                // The prompt carries its profile; a new prompt picks another.
+                disabled={!!join.intent}
                 className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
               >
                 {profiles.map((p) => (
@@ -125,7 +132,12 @@ export function AddDeviceModal({
             />
           </>
         ) : (
-          <AgentJoinPanel key={profile} gatewayURL={url} profile={profile} />
+          <AgentJoinPanel
+            gatewayURL={url}
+            profile={profile}
+            profileRequired={profiles.length > 0}
+            join={join}
+          />
         )}
       </div>
     </Modal>

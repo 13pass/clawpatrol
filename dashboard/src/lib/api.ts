@@ -1218,10 +1218,13 @@ export type JoinIntentState =
   | "approved"
   | "joined"
   | "rejected"
+  | "failed"
   | "conflict"
   | "expired";
 
-export type DeviceRef = { name: string; profile: string };
+// by_name: matched by its name only (it predates the recorded OS
+// hostname), so it may be on another machine.
+export type DeviceRef = { name: string; profile: string; by_name?: boolean };
 
 export type JoinIntentStatus = {
   id: string;
@@ -1245,8 +1248,11 @@ export function createJoinIntent(profile: string, deviceName: string) {
   return postJSON<JoinIntent>("/api/onboard/intent", { profile, device_name: deviceName });
 }
 
-export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus> {
+// getJoinIntentStatus returns null once the gateway no longer knows the
+// intent (restarted, or past its retention).
+export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus | null> {
   const r = await api(`/api/onboard/intent/status?id=${encodeURIComponent(id)}`);
+  if (r.status === 404) return null;
   if (!r.ok) throw new Error(await r.text());
   return r.json();
 }

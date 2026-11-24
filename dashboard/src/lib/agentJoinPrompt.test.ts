@@ -22,7 +22,7 @@ Deno.test("buildAgentJoinPrompt: join command pins the CA and carries no name or
   for (const flag of ["--profile", "--hostname", "--whole-machine", "--login"]) {
     assert(!out.includes(flag), `prompt must not use ${flag}`);
   }
-  assert(out.includes("expires 14:32 UTC"), "missing expiry");
+  assert(out.includes("expires 2026-11-24 14:32:00 UTC"), "missing expiry");
   assert(out.includes("<machine>-<OS account>"), "missing default device name");
 });
 
@@ -33,6 +33,7 @@ Deno.test("buildAgentJoinPrompt: no fingerprint, no pin", () => {
   assert(out.includes("Device name: ci-runner"), "missing operator-chosen name");
 });
 
-Deno.test("formatExpiry: UTC hours and minutes", () => {
-  assert(formatExpiry(Date.UTC(2026, 0, 2, 3, 4) / 1000) === "03:04 UTC", "wrong format");
+Deno.test("formatExpiry: absolute UTC date and time", () => {
+  const got = formatExpiry(Date.UTC(2026, 0, 2, 3, 4, 5) / 1000);
+  assert(got === "2026-01-02 03:04:05 UTC", `got ${got}`);
 });

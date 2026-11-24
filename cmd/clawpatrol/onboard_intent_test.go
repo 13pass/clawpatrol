@@ -64,6 +64,17 @@ func intentStatusAs(t *testing.T, env *rulesTestEnv, who *http.Cookie, id string
 	return rw.Code, st
 }
 
+// joinedDevice registers a device as a join from machine would.
+func joinedDevice(reg *onboardRegistry, ip, name, profile, machine string) {
+	reg.AssignProfile(ip, profile)
+	reg.SetHostname(ip, name)
+	if machine != "" {
+		reg.mu.Lock()
+		reg.osHostByIP[ip] = machine
+		reg.mu.Unlock()
+	}
+}
+
 func newIntentTestEnv(t *testing.T) *rulesTestEnv {
 	t.Helper()
 	env := newRulesTestEnv(t, true)
@@ -169,11 +180,8 @@ func TestJoinIntentRefusedStartsLeaveNoSession(t *testing.T) {
 
 func TestJoinIntentApprovalConfirmsReplacementAndKeepsProfile(t *testing.T) {
 	env := newIntentTestEnv(t)
-	reg := env.w.onboard
-	reg.AssignProfile("10.68.0.7", "team-a")
-	reg.SetHostname("10.68.0.7", "hz-2025-fsn-alice")
-	reg.AssignProfile("10.68.0.8", "team-b")
-	reg.SetHostname("10.68.0.8", "hz-2025-fsn-bob")
+	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
+	joinedDevice(env.w.onboard, "10.68.0.8", "hz-2025-fsn-bob", "team-b", "hz-2025-fsn")
 
 	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
 	code := userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
@@ -204,8 +212,11 @@ func TestJoinIntentApprovalConfirmsReplacementAndKeepsProfile(t *testing.T) {
 
 func TestJoinIntentWarnsWhenProfileHasAnotherAccountOnTheMachine(t *testing.T) {
 	env := newIntentTestEnv(t)
-	env.w.onboard.AssignProfile("10.68.0.7", "team-a")
-	env.w.onboard.SetHostname("10.68.0.7", "hz-2025-fsn-alice")
+	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
+	// Without a recorded OS hostname a device matches by name only,
+	// which is listed but too weak to warn about.
+	joinedDevice(env.w.onboard, "10.68.0.9", "hz-2025-fsn-ci", "team-a", "")
+	joinedDevice(env.w.onboard, "10.68.0.10", "hz-2025-fsn-ops", "team-a", "other-machine")
 
 	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
 	userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "gemma")))
@@ -215,6 +226,61 @@ func TestJoinIntentWarnsWhenProfileHasAnotherAccountOnTheMachine(t *testing.T) {
 	}
 	if len(st.Warnings) != 1 || !strings.Contains(st.Warnings[0], "hz-2025-fsn-alice") {
 		t.Errorf("warnings = %v, want one about hz-2025-fsn-alice", st.Warnings)
+	}
+	want := []deviceRef{{Name: "hz-2025-fsn-alice", Profile: "team-a"}, {Name: "hz-2025-fsn-ci", Profile: "team-a", ByName: true}}
+	if len(st.OnMachine) != len(want) || st.OnMachine[0] != want[0] || st.OnMachine[1] != want[1] {
+		t.Errorf("on_machine = %+v, want %+v", st.OnMachine, want)
+	}
+}
+
+func TestNamedAfterMachineNeedsOneLabel(t *testing.T) {
+	for name, want := range map[string]bool{
+		"web":         true,
+		"web-alice":   true,
+		"web-prod-2":  false,
+		"webserver-1": false,
+		"web-":        false,
+	} {
+		if got := namedAfterMachine(name, "web"); got != want {
+			t.Errorf("namedAfterMachine(%q, web) = %v, want %v", name, got, want)
+		}
+	}
+}
+
+func TestJoinIntentReportsAFailedSetup(t *testing.T) {
+	env := newIntentTestEnv(t)
+	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
+	code := userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
+	s := env.w.onboard.byUserCode(code)
+	env.w.onboard.mu.Lock()
+	s.approved, s.err = true, "mint: boom"
+	env.w.onboard.mu.Unlock()
+	if _, st := intentStatusAs(t, env, env.root, id); st.State != joinIntentFailed || st.Error != "mint: boom" {
+		t.Errorf("status = %+v, want failed with the mint error", st)
+	}
+}
+
+func TestJoinIntentApprovingTwiceReportsAlready(t *testing.T) {
+	env := newIntentTestEnv(t)
+	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
+	code := userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
+	body := `{"code":"` + code + `","profile":"team-a"}`
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/approve", body); rw.Code != http.StatusOK {
+		t.Fatalf("first approve = %d %s", rw.Code, rw.Body.String())
+	}
+	// The first approval's claim registers the device under the same name.
+	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
+	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/approve", body)
+	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"already":true`) {
+		t.Errorf("second approve = %d %s, want already", rw.Code, rw.Body.String())
+	}
+}
+
+func TestJoinIntentWithoutProfilesOnAProfilelessGateway(t *testing.T) {
+	env := newIntentTestEnv(t)
+	env.w.g.cfg.Load().Policy = nil
+	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/intent", `{}`); rw.Code != http.StatusOK {
+		t.Errorf("create without profiles = %d %s, want 200", rw.Code, rw.Body.String())
 	}
 }
 

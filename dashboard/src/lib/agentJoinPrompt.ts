@@ -14,8 +14,18 @@ export type AgentJoinPromptInput = {
 
 const installCmd = "curl -fsSL https://clawpatrol.dev/install.sh | sh";
 
+const MS_PER_SECOND = 1000;
+const ISO_DATE_TIME_CHARS = 19; // yyyy-MM-ddTHH:mm:ss
+
+// formatExpiry gives the agent an absolute UTC time: its clock and
+// time zone are unknown.
 export function formatExpiry(unixSeconds: number): string {
-  return new Date(unixSeconds * 1000).toISOString().slice(11, 16) + " UTC";
+  return (
+    new Date(unixSeconds * MS_PER_SECOND)
+      .toISOString()
+      .slice(0, ISO_DATE_TIME_CHARS)
+      .replace("T", " ") + " UTC"
+  );
 }
 
 export function buildAgentJoinPrompt(p: AgentJoinPromptInput): string {

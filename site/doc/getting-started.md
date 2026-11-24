@@ -117,6 +117,8 @@ device only, and it grants nothing until you approve:
   replaces that device. **Approve** stays disabled until you tick
   **Replace**.
 - Members can create prompts only for their own profiles.
+- **cancel prompt**, **new prompt** and closing the window all revoke
+  a prompt that hasn't joined yet.
 
 The prompt sets up per-process routing (`clawpatrol run`) and passes
 `--no-trust`, so the agent needs no sudo. For `--whole-machine`, use
