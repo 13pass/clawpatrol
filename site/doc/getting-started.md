@@ -100,23 +100,25 @@ If you have several profiles, pick one first; the prompt changes with
 it. The agent installs the client if needed, names the device and runs
 `clawpatrol join --intent <id> --hostname <name>`. It then tells you
 the device name and the code the join printed. The Add device window
-shows the waiting device: its name, OS account, profile and code.
-Approve it there once the codes match.
+shows the waiting device: its name, profile and code. Approve it
+there once the codes match.
 
 The agent names the device `<machine>-<OS account>`, for example
 `devbox-alice`: the machine's short hostname and the account it runs
 as. Several accounts on one machine therefore get separate devices.
 When the hostname means nothing to a person (a container ID,
 `localhost`), the agent picks a short name for the machine instead
-and says so. Without `--hostname`, the gateway uses the OS hostname
-and account.
+and says so. The gateway lowercases the name, so the same machine and
+account get the same name on every join.
 
 The prompt holds no secret, because it may end up in the agent
 provider's logs. Its join intent works for one device only, and it
 grants nothing until you approve:
 
-- It stays valid while the Add device window is open. Closing the
-  window or picking another profile revokes it.
+- It stays valid while the Add device window is open, for one hour at
+  most. Closing the window or the tab, or picking another profile,
+  revokes it unless a device already used it; such a join stays
+  pending for its 10 minutes and can still be approved by its code.
 - The gateway assigns the profile picked in the window and ignores
   any profile the client asks for.
 - If a second device uses the same prompt, both joins are cancelled.

@@ -513,6 +513,7 @@ func TestMigrationDropsReservedMemberProfiles(t *testing.T) {
 	db := w.g.db
 	for _, q := range []string{
 		`DELETE FROM _schema WHERE version >= 34`,
+		`ALTER TABLE devices ADD COLUMN os_hostname TEXT`, // as before 0035
 		`INSERT INTO dashboard_user_profiles (username, profile) VALUES ('alice', char(0) || 'unknown-peer'), ('alice', 'team-a')`,
 	} {
 		if _, err := db.Exec(q); err != nil {

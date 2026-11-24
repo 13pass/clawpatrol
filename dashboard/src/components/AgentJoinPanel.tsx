@@ -4,6 +4,7 @@ import {
   createJoinIntent,
   getJoinIntentStatus,
   rejectJoinIntent,
+  releaseJoinIntent,
   type JoinIntent,
   type JoinIntentState,
   type JoinIntentStatus,
@@ -25,8 +26,9 @@ type JoinState = JoinIntentState | "gone";
 export type JoinIntentHandle = ReturnType<typeof useJoinIntent>;
 
 // useJoinIntent makes a join intent for profile as soon as it is known
-// (null while the profiles load) and follows it. A new profile, reset()
-// or closing the window revokes the intent unless it already joined.
+// (null while the profiles load) and follows it. A new profile, reset(),
+// closing the window or leaving the page revokes the intent unless a
+// device already used it.
 export function useJoinIntent(profile: string | null) {
   const [generation, setGeneration] = useState(0);
   const [made, setMade] = useState<{ key: string; intent?: JoinIntent; err?: string } | null>(null);
@@ -44,7 +46,7 @@ export function useJoinIntent(profile: string | null) {
     createJoinIntent(profile).then(
       (intent) => {
         if (run.stopped) {
-          rejectJoinIntent(intent.id).catch(() => {});
+          releaseJoinIntent(intent.id);
           return;
         }
         run.id = intent.id;
@@ -56,8 +58,7 @@ export function useJoinIntent(profile: string | null) {
     );
     return () => {
       run.stopped = true;
-      // Refused once the device is approved; nothing to undo then.
-      if (run.id) rejectJoinIntent(run.id).catch(() => {});
+      if (run.id) releaseJoinIntent(run.id);
     };
   }, [key, profile]);
 
@@ -81,9 +82,13 @@ export function useJoinIntent(profile: string | null) {
       loop.timer = setTimeout(() => poll(intentID), POLL_INTERVAL_MS);
     }
     loop.timer = setTimeout(() => poll(id), 0);
+    // Unmounting does not run on a closed tab or a reload.
+    const leave = () => releaseJoinIntent(id);
+    window.addEventListener("pagehide", leave);
     return () => {
       loop.stopped = true;
       clearTimeout(loop.timer);
+      window.removeEventListener("pagehide", leave);
     };
   }, [id]);
 
@@ -126,7 +131,12 @@ export function AgentJoinPanel({
   if (blocked) return <p className="text-sm text-text-muted font-sans">{blocked}</p>;
   if (!intent) {
     return join.err ? (
-      <ErrorLine err={join.err} />
+      <div className="space-y-2">
+        <ErrorLine err={join.err} />
+        <Button variant="outline" onClick={join.reset}>
+          try again
+        </Button>
+      </div>
     ) : (
       <p className="text-sm text-text-muted font-sans">Preparing the prompt…</p>
     );
@@ -235,35 +245,12 @@ function StatusPanel({ join }: { join: JoinIntentHandle }) {
               <span className="text-success-600">➕ new device</span>
             )}
           </dd>
-          <dt className="text-text-muted">OS account</dt>
-          <dd>
-            {d.os_user || "?"}@{d.os_hostname || "?"} · {d.os || "?"}
-          </dd>
           <dt className="text-text-muted">Profile</dt>
           <dd>{status.profile || "gateway default"}</dd>
           <dt className="text-text-muted">Code</dt>
           <dd className="font-semibold">{d.user_code}</dd>
-          {status.on_machine && status.on_machine.length > 0 && (
-            <>
-              <dt className="text-text-muted">Same machine</dt>
-              <dd>
-                {status.on_machine
-                  .map(
-                    (x) =>
-                      `${x.name} (${x.profile || "no profile"})${x.by_name ? " [by name only]" : ""}`,
-                  )
-                  .join(", ")}
-              </dd>
-            </>
-          )}
         </dl>
       )}
-      {state !== "gone" &&
-        status?.warnings?.map((w) => (
-          <p key={w} className="text-xs text-amber-600 font-sans">
-            ⚠ {w}
-          </p>
-        ))}
       {state === "pending" && d && (
         <div className="space-y-2">
           <p className="text-xs text-text-muted font-sans">

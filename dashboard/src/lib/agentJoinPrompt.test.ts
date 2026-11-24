@@ -39,6 +39,7 @@ Deno.test("buildAgentJoinPrompt: checks an installed client without joining", ()
   const out = buildAgentJoinPrompt(input);
   assert(out.includes("installed now or before"), "version check only covers fresh installs");
   assert(out.includes("Do not try a join to find out"), "version check may start a join");
+  assert(out.includes('"requires --hostname"'), "version check lacks the help phrase to look for");
 });
 
 Deno.test("buildAgentJoinPrompt: no fingerprint, no pin", () => {

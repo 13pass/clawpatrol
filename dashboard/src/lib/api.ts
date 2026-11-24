@@ -1241,7 +1241,6 @@ export async function oauthExchange(
 export type JoinIntent = {
   id: string;
   profile: string;
-  device_name: string;
   expires_at: number;
   ca_fingerprint: string;
 };
@@ -1256,25 +1255,15 @@ export type JoinIntentState =
   | "conflict"
   | "expired";
 
-// by_name: matched by its name only (it predates the recorded OS
-// hostname), so it may be on another machine.
-export type DeviceRef = { name: string; profile: string; by_name?: boolean };
+export type DeviceRef = { name: string; profile: string };
 
 export type JoinIntentStatus = {
   id: string;
   state: JoinIntentState;
   profile: string;
   expires_at: number;
-  device?: {
-    name: string;
-    os_hostname: string;
-    os_user: string;
-    os: string;
-    user_code: string;
-  };
+  device?: { name: string; user_code: string };
   replaces?: DeviceRef;
-  on_machine?: DeviceRef[];
-  warnings?: string[];
   error?: string;
 };
 
@@ -1293,6 +1282,19 @@ export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus 
 
 export function rejectJoinIntent(id: string) {
   return postJSON<JoinIntentStatus>("/api/onboard/intent/reject", { id });
+}
+
+// releaseJoinIntent revokes a prompt the window stops showing, unless a
+// device already used it: that join stays for the operator to decide.
+// keepalive lets the request outlive a closing page.
+export function releaseJoinIntent(id: string): void {
+  fetch("/api/onboard/intent/reject", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ id, if_unused: true }),
+    credentials: "same-origin",
+    keepalive: true,
+  }).catch(() => {});
 }
 
 export function approveJoin(code: string, profile: string, replace: boolean) {

@@ -34,8 +34,10 @@ func startIntentJoin(env *rulesTestEnv, query url.Values) *httptest.ResponseReco
 	return rw
 }
 
-func intentJoinQuery(intent, hostname, osUser string) url.Values {
-	return url.Values{"intent": {intent}, "hostname": {hostname}, "os_user": {osUser}, "os": {"linux"}}
+// intentJoinQuery plays an agent following the prompt on machine as
+// account: --hostname <machine>-<account>.
+func intentJoinQuery(intent, machine, account string) url.Values {
+	return url.Values{"intent": {intent}, "hostname": {machine + "-" + account}}
 }
 
 func userCodeOf(t *testing.T, rw *httptest.ResponseRecorder) string {
@@ -65,15 +67,10 @@ func intentStatusAs(t *testing.T, env *rulesTestEnv, who *http.Cookie, id string
 	return rw.Code, st
 }
 
-// joinedDevice registers a device as a join from machine would.
-func joinedDevice(reg *onboardRegistry, ip, name, profile, machine string) {
+// joinedDevice registers a device as a join would.
+func joinedDevice(reg *onboardRegistry, ip, name, profile string) {
 	reg.AssignProfile(ip, profile)
 	reg.SetHostname(ip, name)
-	if machine != "" {
-		reg.mu.Lock()
-		reg.osHostByIP[ip] = machine
-		reg.mu.Unlock()
-	}
 }
 
 func newIntentTestEnv(t *testing.T) *rulesTestEnv {
@@ -84,14 +81,14 @@ func newIntentTestEnv(t *testing.T) *rulesTestEnv {
 	return env
 }
 
-func TestJoinIntentNamesDeviceAfterMachineAndAccountAndKeepsItsProfile(t *testing.T) {
+func TestJoinIntentNamesTheDeviceInLowercaseAndKeepsItsProfile(t *testing.T) {
 	env := newIntentTestEnv(t)
 	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
 	if _, st := intentStatusAs(t, env, env.alice, id); st.State != joinIntentWaiting {
 		t.Fatalf("fresh intent state = %q, want waiting", st.State)
 	}
 
-	q := intentJoinQuery(id, "hz-2025-fsn", "gemma")
+	q := intentJoinQuery(id, "HZ-2025-fsn", "Gemma")
 	q.Set("profile", "team-b")
 	code := userCodeOf(t, startIntentJoin(env, q))
 
@@ -99,7 +96,7 @@ func TestJoinIntentNamesDeviceAfterMachineAndAccountAndKeepsItsProfile(t *testin
 	if st.State != joinIntentPending || st.Device == nil {
 		t.Fatalf("status after start = %+v, want pending with a device", st)
 	}
-	want := joinIntentDevice{Name: "hz-2025-fsn-gemma", OSHostname: "hz-2025-fsn", OSUser: "gemma", OS: "linux", UserCode: code}
+	want := joinIntentDevice{Name: "hz-2025-fsn-gemma", UserCode: code}
 	if *st.Device != want {
 		t.Errorf("device = %+v, want %+v", *st.Device, want)
 	}
@@ -108,18 +105,6 @@ func TestJoinIntentNamesDeviceAfterMachineAndAccountAndKeepsItsProfile(t *testin
 	}
 	if st.Replaces != nil {
 		t.Errorf("replaces = %+v on an empty gateway", st.Replaces)
-	}
-}
-
-func TestJoinIntentOperatorNameWins(t *testing.T) {
-	env := newIntentTestEnv(t)
-	id := createJoinIntent(t, env, env.root, `{"profile":"team-a","device_name":"ci-runner"}`)
-	userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "gemma")))
-	if _, st := intentStatusAs(t, env, env.root, id); st.Device == nil || st.Device.Name != "ci-runner" {
-		t.Fatalf("device = %+v, want ci-runner", st.Device)
-	}
-	if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/intent", `{"profile":"team-a","device_name":"bad name"}`); rw.Code != http.StatusBadRequest {
-		t.Errorf("invalid device name = %d, want 400", rw.Code)
 	}
 }
 
@@ -163,6 +148,7 @@ func TestJoinIntentRefusedStartsLeaveNoSession(t *testing.T) {
 		"whole machine":  {wm, http.StatusBadRequest},
 		"unknown intent": {intentJoinQuery("nope", "hz-2025-fsn", "alice"), http.StatusNotFound},
 		"unusable host":  {intentJoinQuery(id, "Vincent's Mac", "alice"), http.StatusBadRequest},
+		"no name":        {url.Values{"intent": {id}}, http.StatusBadRequest},
 	} {
 		if rw := startIntentJoin(env, tc.q); rw.Code != tc.want {
 			t.Errorf("%s: start = %d %s, want %d", name, rw.Code, rw.Body.String(), tc.want)
@@ -181,20 +167,14 @@ func TestJoinIntentRefusedStartsLeaveNoSession(t *testing.T) {
 
 func TestJoinIntentApprovalConfirmsReplacementAndKeepsProfile(t *testing.T) {
 	env := newIntentTestEnv(t)
-	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
-	joinedDevice(env.w.onboard, "10.68.0.8", "hz-2025-fsn-bob", "team-b", "hz-2025-fsn")
+	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a")
+	joinedDevice(env.w.onboard, "10.68.0.8", "hz-2025-fsn-bob", "team-b")
 
 	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
 	code := userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
 	_, st := intentStatusAs(t, env, env.root, id)
 	if st.Replaces == nil || st.Replaces.Name != "hz-2025-fsn-alice" {
 		t.Fatalf("replaces = %+v, want hz-2025-fsn-alice", st.Replaces)
-	}
-	if len(st.OnMachine) != 1 || st.OnMachine[0] != (deviceRef{Name: "hz-2025-fsn-bob", Profile: "team-b"}) {
-		t.Errorf("on_machine = %+v, want only bob's device", st.OnMachine)
-	}
-	if len(st.Warnings) != 0 {
-		t.Errorf("warnings = %v, want none for the account's own device", st.Warnings)
 	}
 
 	for _, step := range []struct {
@@ -207,43 +187,6 @@ func TestJoinIntentApprovalConfirmsReplacementAndKeepsProfile(t *testing.T) {
 	} {
 		if rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/approve", step.body); rw.Code != step.want {
 			t.Errorf("%s: approve = %d %s, want %d", step.name, rw.Code, rw.Body.String(), step.want)
-		}
-	}
-}
-
-func TestJoinIntentWarnsWhenProfileHasAnotherAccountOnTheMachine(t *testing.T) {
-	env := newIntentTestEnv(t)
-	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
-	// Without a recorded OS hostname a device matches by name only,
-	// which is listed but too weak to warn about.
-	joinedDevice(env.w.onboard, "10.68.0.9", "hz-2025-fsn-ci", "team-a", "")
-	joinedDevice(env.w.onboard, "10.68.0.10", "hz-2025-fsn-ops", "team-a", "other-machine")
-
-	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
-	userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "gemma")))
-	_, st := intentStatusAs(t, env, env.alice, id)
-	if st.Replaces != nil {
-		t.Errorf("replaces = %+v, want a new device", st.Replaces)
-	}
-	if len(st.Warnings) != 1 || !strings.Contains(st.Warnings[0], "hz-2025-fsn-alice") {
-		t.Errorf("warnings = %v, want one about hz-2025-fsn-alice", st.Warnings)
-	}
-	want := []deviceRef{{Name: "hz-2025-fsn-alice", Profile: "team-a"}, {Name: "hz-2025-fsn-ci", Profile: "team-a", ByName: true}}
-	if len(st.OnMachine) != len(want) || st.OnMachine[0] != want[0] || st.OnMachine[1] != want[1] {
-		t.Errorf("on_machine = %+v, want %+v", st.OnMachine, want)
-	}
-}
-
-func TestNamedAfterMachineNeedsOneLabel(t *testing.T) {
-	for name, want := range map[string]bool{
-		"web":         true,
-		"web-alice":   true,
-		"web-prod-2":  false,
-		"webserver-1": false,
-		"web-":        false,
-	} {
-		if got := namedAfterMachine(name, "web"); got != want {
-			t.Errorf("namedAfterMachine(%q, web) = %v, want %v", name, got, want)
 		}
 	}
 }
@@ -270,7 +213,7 @@ func TestJoinIntentApprovingTwiceReportsAlready(t *testing.T) {
 		t.Fatalf("first approve = %d %s", rw.Code, rw.Body.String())
 	}
 	// The first approval's claim registers the device under the same name.
-	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a", "hz-2025-fsn")
+	joinedDevice(env.w.onboard, "10.68.0.7", "hz-2025-fsn-alice", "team-a")
 	rw := serveAs(t, env.h, env.root, http.MethodPost, "/api/onboard/approve", body)
 	if rw.Code != http.StatusOK || !strings.Contains(rw.Body.String(), `"already":true`) {
 		t.Errorf("second approve = %d %s, want already", rw.Code, rw.Body.String())
@@ -339,62 +282,17 @@ func TestJoinIntentUsedAfterApprovalKeepsTheApprovedJoin(t *testing.T) {
 	}
 }
 
-// newClientIntentQuery is a start from a client that reports the OS
-// hostname apart from the device name; name is its --hostname.
-func newClientIntentQuery(intent, name, osHost, osUser string) url.Values {
-	q := url.Values{"intent": {intent}, "hostname": {osHost}, "os_hostname": {osHost}, "os_user": {osUser}, "os": {"linux"}}
-	if name != "" {
-		q.Set("device_name", name)
-	}
-	return q
-}
-
-func TestJoinIntentNamesTheDevice(t *testing.T) {
-	for _, tc := range []struct {
-		name, agentName, want string
-	}{
-		{"agent's name", "devbox-gemma", "devbox-gemma"},
-		{"machine and account", "", "hz-2025-fsn-gemma"},
-	} {
-		env := newIntentTestEnv(t)
-		id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
-		code := userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, tc.agentName, "hz-2025-fsn", "gemma")))
-		_, st := intentStatusAs(t, env, env.alice, id)
-		want := joinIntentDevice{Name: tc.want, OSHostname: "hz-2025-fsn", OSUser: "gemma", OS: "linux", UserCode: code}
-		if st.Device == nil || *st.Device != want {
-			t.Errorf("%s: device = %+v, want %+v", tc.name, st.Device, want)
-		}
-	}
-
-	env := newIntentTestEnv(t)
-	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
-	if rw := startIntentJoin(env, newClientIntentQuery(id, "Gemma's box", "hz-2025-fsn", "gemma")); rw.Code != http.StatusBadRequest {
-		t.Errorf("invalid agent name: start = %d %s, want 400", rw.Code, rw.Body.String())
-	}
-}
-
-func TestJoinRecordsTheOSHostnameApartFromAHostnameOverride(t *testing.T) {
-	env := newIntentTestEnv(t)
-	q := url.Values{"hostname": {"build-runner"}, "os_hostname": {"hz-2025-fsn"}}
-	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, q)))
-	env.w.onboard.mu.Lock()
-	defer env.w.onboard.mu.Unlock()
-	if s.hostname != "build-runner" || s.osHostname != "hz-2025-fsn" {
-		t.Errorf("session hostname, osHostname = %q, %q; want build-runner, hz-2025-fsn", s.hostname, s.osHostname)
-	}
-}
-
 func TestJoinIntentClaimKeepsTheIntentName(t *testing.T) {
 	env := newIntentTestEnv(t)
 	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
-	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "gemma"))))
+	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "HZ-2025-fsn", "gemma"))))
 	env.w.onboard.mu.Lock()
 	s.owner = "root"
 	deviceCode := s.deviceCode
 	env.w.onboard.mu.Unlock()
 
 	const ip = "10.68.0.9"
-	if _, ok := env.w.onboard.ClaimIP(deviceCode, ip, "hz-2025-fsn"); !ok {
+	if _, ok := env.w.onboard.ClaimIP(deviceCode, ip, "HZ-2025-fsn-gemma"); !ok {
 		t.Fatal("claim refused")
 	}
 	env.w.onboard.mu.Lock()
@@ -424,7 +322,7 @@ func TestJoinIntentLivesWhileTheWindowPolls(t *testing.T) {
 		t.Fatalf("polled intent state = %q, want waiting", st.State)
 	}
 	setSeen(joinIntentIdle / 2)
-	userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "alice")))
+	userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
 
 	lapsed := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
 	in = env.w.onboard.intentByID(lapsed)
@@ -435,7 +333,7 @@ func TestJoinIntentLivesWhileTheWindowPolls(t *testing.T) {
 	if _, st := intentStatusAs(t, env, env.alice, lapsed); st.State != joinIntentExpired {
 		t.Errorf("a poll revived a lapsed intent: state = %q", st.State)
 	}
-	if rw := startIntentJoin(env, newClientIntentQuery(lapsed, "", "hz-2025-fsn", "alice")); rw.Code != http.StatusNotFound {
+	if rw := startIntentJoin(env, intentJoinQuery(lapsed, "hz-2025-fsn", "alice")); rw.Code != http.StatusNotFound {
 		t.Errorf("start with a lapsed intent = %d, want 404", rw.Code)
 	}
 }
@@ -443,7 +341,7 @@ func TestJoinIntentLivesWhileTheWindowPolls(t *testing.T) {
 func TestJoinIntentPollTellsTheClientItsName(t *testing.T) {
 	env := newIntentTestEnv(t)
 	id := createJoinIntent(t, env, env.root, `{"profile":"team-a"}`)
-	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "gemma"))))
+	s := env.w.onboard.byUserCode(userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "gemma"))))
 	env.w.onboard.mu.Lock()
 	s.approved, s.owner, s.authKey = true, "root", "wireguard-config"
 	deviceCode := s.deviceCode
@@ -465,16 +363,48 @@ func TestJoinIntentPollTellsTheClientItsName(t *testing.T) {
 func TestJoinIntentSecondStartStillConflictsAfterTheWindowWentQuiet(t *testing.T) {
 	env := newIntentTestEnv(t)
 	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
-	userCodeOf(t, startIntentJoin(env, newClientIntentQuery(id, "", "hz-2025-fsn", "alice")))
+	userCodeOf(t, startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")))
 	in := env.w.onboard.intentByID(id)
 	env.w.onboard.mu.Lock()
 	in.seen = time.Now().Add(-joinIntentIdle - time.Second)
 	env.w.onboard.mu.Unlock()
 
-	if rw := startIntentJoin(env, newClientIntentQuery(id, "", "other-box", "mallory")); rw.Code != http.StatusConflict {
+	if rw := startIntentJoin(env, intentJoinQuery(id, "other-box", "mallory")); rw.Code != http.StatusConflict {
 		t.Errorf("second start = %d %s, want 409", rw.Code, rw.Body.String())
 	}
 	if _, st := intentStatusAs(t, env, env.alice, id); st.State != joinIntentConflict {
 		t.Errorf("state = %q, want conflict", st.State)
+	}
+}
+
+func TestJoinIntentLapsesAfterAnHourEvenWhilePolled(t *testing.T) {
+	env := newIntentTestEnv(t)
+	id := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
+	in := env.w.onboard.intentByID(id)
+	env.w.onboard.mu.Lock()
+	in.created = time.Now().Add(-joinIntentMaxAge - time.Second)
+	env.w.onboard.mu.Unlock()
+	if _, st := intentStatusAs(t, env, env.alice, id); st.State != joinIntentExpired {
+		t.Errorf("state = %q, want expired past joinIntentMaxAge", st.State)
+	}
+	if rw := startIntentJoin(env, intentJoinQuery(id, "hz-2025-fsn", "alice")); rw.Code != http.StatusNotFound {
+		t.Errorf("start = %d, want 404", rw.Code)
+	}
+}
+
+func TestJoinIntentRejectIfUnusedSparesAStartedJoin(t *testing.T) {
+	env := newIntentTestEnv(t)
+	unused := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/onboard/intent/reject", `{"id":"`+unused+`","if_unused":true}`); rw.Code != http.StatusOK {
+		t.Errorf("reject unused = %d %s, want 200", rw.Code, rw.Body.String())
+	}
+
+	used := createJoinIntent(t, env, env.alice, `{"profile":"team-a"}`)
+	userCodeOf(t, startIntentJoin(env, intentJoinQuery(used, "hz-2025-fsn", "alice")))
+	if rw := serveAs(t, env.h, env.alice, http.MethodPost, "/api/onboard/intent/reject", `{"id":"`+used+`","if_unused":true}`); rw.Code != http.StatusConflict {
+		t.Errorf("reject if unused after a start = %d %s, want 409", rw.Code, rw.Body.String())
+	}
+	if _, st := intentStatusAs(t, env, env.alice, used); st.State != joinIntentPending {
+		t.Errorf("state = %q, want the started join still pending", st.State)
 	}
 }
