@@ -18,12 +18,11 @@ import (
 // BasicAuth injects `Authorization: Basic <base64(username:password)>`.
 //
 // The credential secret is the raw password. `username` is set in
-// config, or, when it is left out, entered on the dashboard next to the
-// password, which keeps a per-person account (an email) out of the
-// config files; from the environment it is
-// CLAWPATROL_SECRET_<NAME>_USERNAME. Common credential binding fields
-// apply: use `endpoint`
-// or `endpoints` to bind the credential to upstreams.
+// config or, when it is left out, entered on the dashboard next to the
+// password (from the environment: CLAWPATROL_SECRET_<NAME>_USERNAME),
+// which keeps a per-person account such as an email out of the config
+// files. Common credential binding fields apply: use `endpoint` or
+// `endpoints` to bind the credential to upstreams.
 //
 // When a profile has multiple Basic Auth credentials for the same HTTPS
 // endpoint, use the `placeholder` disambiguator on the profile entry or
