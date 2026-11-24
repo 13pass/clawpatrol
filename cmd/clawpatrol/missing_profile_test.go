@@ -1,7 +1,9 @@
 package main
 
 import (
+	"net"
 	"net/http"
+	"net/netip"
 	"strings"
 	"testing"
 
@@ -253,5 +255,69 @@ func TestAgentsListFlagsMissingProfile(t *testing.T) {
 	}
 	if a := got[otherIP]; a == nil || a.ProfileMissing {
 		t.Fatalf("declared-profile row = %+v, want it not flagged", a)
+	}
+}
+
+// peerConn is a connection whose remote end is a given peer address.
+type peerConn struct {
+	net.Conn
+	remote net.Addr
+}
+
+func (c peerConn) RemoteAddr() net.Addr { return c.remote }
+
+// A device whose profile was removed is refused outright, on TCP and
+// UDP alike. Serving it under the empty profile alone would still send
+// its traffic through defaults.unknown_host, which under "passthrough"
+// relays it from the gateway's network position with no rule applied.
+func TestCutOffDeviceConnectionsAreRefused(t *testing.T) {
+	const (
+		orphanIP = "100.1.1.1"
+		otherIP  = "100.1.1.2"
+		blankIP  = "100.1.1.3"
+	)
+	r := newOnboardRegistry()
+	r.AssignProfile(orphanIP, "removed")
+	r.AssignProfile(otherIP, "other")
+	r.knownDeviceIPs[blankIP] = true
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	captureLog(t)
+
+	for ip, want := range map[string]bool{orphanIP: true, otherIP: false, blankIP: false, "100.9.9.9": false} {
+		local, remote := net.Pipe()
+		t.Cleanup(func() { _ = remote.Close() })
+		c := peerConn{Conn: local, remote: &net.TCPAddr{IP: net.ParseIP(ip), Port: 40000}}
+		if got := g.refuseCutOffConn(c); got != want {
+			t.Errorf("refuseCutOffConn(%s) = %v, want %v", ip, got, want)
+		}
+		if want {
+			if _, err := local.Write([]byte("x")); err == nil {
+				t.Errorf("connection from %s left open", ip)
+			}
+		} else {
+			_ = local.Close()
+		}
+	}
+
+	dst := netip.MustParseAddrPort("192.0.2.10:443")
+	if got := g.tsnetUDPDisposition(dst, netip.MustParseAddr(orphanIP)); got != udpDrop {
+		t.Errorf("tsnet UDP from the cut-off device = %v, want udpDrop", got)
+	}
+}
+
+// The device name in the missing-profile line is client-supplied, so it
+// is quoted: a newline in it cannot start a forged log line.
+func TestLogMissingProfileQuotesTheDeviceName(t *testing.T) {
+	const ip = "100.1.1.1"
+	r := newOnboardRegistry()
+	r.AssignProfile(ip, "removed")
+	r.hostnameByIP[ip] = "box\n2026/11/24 device 100.64.0.9 approved"
+	g := &Gateway{onboard: r}
+	loadMissingProfilePolicy(t, g, missingProfileKept)
+	logged := captureLog(t)
+	g.profileFor(ip)
+	if n := strings.Count(logged.String(), "\n"); n != 1 {
+		t.Fatalf("logged %d lines, want 1:\n%s", n, logged.String())
 	}
 }

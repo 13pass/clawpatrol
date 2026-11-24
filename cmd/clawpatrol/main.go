@@ -582,32 +582,70 @@ func (g *Gateway) Policy() *config.CompiledPolicy {
 // A device assigned to a profile the policy no longer declares is not
 // served under that name, nor under the default: see declaredProfile.
 func (g *Gateway) profileFor(peerIP string) string {
-	if g.onboard != nil {
-		if p := g.onboard.ProfileForIP(peerIP); p != "" {
-			return g.declaredProfile(peerIP, p)
-		}
-		// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
-		//
-		//   1. Same Tailscale node, different address family — whole-
-		//      machine tsnet traffic arrives on the peer's IPv6 ULA
-		//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
-		//   2. Same Tailscale node, address moved — the control plane
-		//      reassigned the node's address, so the device row holds
-		//      one the node no longer has. A host that rejoins as a
-		//      *new* node is a new node and is not coalesced; it gets
-		//      its own row.
-		//
-		// ClaimAliasResolve guards against re-running WhoIs per packet
-		// for peers that have no matching device.
-		if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(peerIP, 5*time.Minute) {
-			if canonical := g.resolveTsnetAlias(peerIP); canonical != "" {
-				if p := g.onboard.ProfileForIP(canonical); p != "" {
-					return g.declaredProfile(canonical, p)
-				}
+	deviceIP, row := g.deviceProfileRow(peerIP)
+	if row == "" {
+		return g.unknownPeerProfile(peerIP)
+	}
+	profile, _ := g.declaredProfile(deviceIP, row)
+	return profile
+}
+
+// peerCutOff reports whether peerIP is a device whose assigned profile
+// the policy no longer declares. Every connection from such a device
+// is refused (refuseCutOffConn): serving it under the empty profile
+// alone would still hand its traffic to defaults.unknown_host, which
+// under "passthrough" relays it from the gateway's network position
+// with no rule applied.
+func (g *Gateway) peerCutOff(peerIP string) bool {
+	deviceIP, row := g.deviceProfileRow(peerIP)
+	if row == "" {
+		return false
+	}
+	_, missing := g.declaredProfile(deviceIP, row)
+	return missing
+}
+
+// refuseCutOffConn closes c and reports true when its peer is cut off
+// (peerCutOff). Called first by every dispatcher of peer traffic.
+func (g *Gateway) refuseCutOffConn(c net.Conn) bool {
+	if !g.peerCutOff(peerIP(c)) {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// deviceProfileRow returns the device a peer address belongs to and
+// the profile on its devices row, or "" when the peer has no row or
+// the row names no profile.
+func (g *Gateway) deviceProfileRow(peerIP string) (deviceIP, profile string) {
+	if g.onboard == nil {
+		return "", ""
+	}
+	if p := g.onboard.ProfileForIP(peerIP); p != "" {
+		return peerIP, p
+	}
+	// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
+	//
+	//   1. Same Tailscale node, different address family — whole-
+	//      machine tsnet traffic arrives on the peer's IPv6 ULA
+	//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
+	//   2. Same Tailscale node, address moved — the control plane
+	//      reassigned the node's address, so the device row holds
+	//      one the node no longer has. A host that rejoins as a
+	//      *new* node is a new node and is not coalesced; it gets
+	//      its own row.
+	//
+	// ClaimAliasResolve guards against re-running WhoIs per packet
+	// for peers that have no matching device.
+	if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(peerIP, 5*time.Minute) {
+		if canonical := g.resolveTsnetAlias(peerIP); canonical != "" {
+			if p := g.onboard.ProfileForIP(canonical); p != "" {
+				return canonical, p
 			}
 		}
 	}
-	return g.unknownPeerProfile(peerIP)
+	return "", ""
 }
 
 // missingProfileLogInterval is how often the gateway repeats the log
@@ -625,7 +663,8 @@ type missingProfileNote struct {
 // declaredProfile maps the profile a device row carries onto the one
 // the device is actually served under. That is the row's profile when
 // the live policy declares it, and the reserved empty profile when it
-// does not.
+// does not; missing reports the latter, so the dispatchers refuse the
+// device's connections (peerCutOff).
 //
 // A devices row outlives the profile block it names: deleting
 // `profile "x" {}` from the config leaves every device assigned to x
@@ -646,13 +685,13 @@ type missingProfileNote struct {
 // because there is nothing to validate it against, and the name scopes
 // nothing: such a device is served exactly like one with no profile on
 // its row.
-func (g *Gateway) declaredProfile(deviceIP, profile string) string {
+func (g *Gateway) declaredProfile(deviceIP, profile string) (string, bool) {
 	policy := g.Policy()
 	if !profileMissing(policy, profile) {
-		return profile
+		return profile, false
 	}
 	g.logMissingProfile(deviceIP, profile)
-	return config.UnknownPeerEmptyProfile
+	return config.UnknownPeerEmptyProfile, true
 }
 
 // profileMissing reports whether a device row's profile names something
@@ -695,8 +734,8 @@ func (g *Gateway) logMissingProfile(deviceIP, profile string) {
 			name = fmt.Sprintf("%s (%s)", h, deviceIP)
 		}
 	}
-	log.Printf("device %s is assigned to profile %q, which the config does not declare: "+
-		"serving it no endpoints and no credentials until it is reassigned or the profile is restored",
+	log.Printf("device %q is assigned to profile %q, which the config does not declare: "+
+		"refusing all of its connections until it is reassigned or the profile is restored",
 		name, profile)
 }
 
@@ -4119,6 +4158,9 @@ func runGateway(args []string) {
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
 			log.Printf("wg-fwd: %s:%d", dstIP, dstPort)
+			if g.refuseCutOffConn(c) {
+				return
+			}
 			switch {
 			case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
 				g.handle(c, dstIP, dstPort)
@@ -4152,6 +4194,9 @@ func runGateway(args []string) {
 		// unreachable and the client falls back to TCP/443 at once;
 		// UDP/53 is answered by dnsvip; the rest relays.
 		udpDispatch := func(c net.Conn, dstIP string, dstPort uint16) bool {
+			if g.refuseCutOffConn(c) {
+				return true
+			}
 			switch udpPortDisposition(dstPort) {
 			case udpDNS:
 				g.dnsvip.ServeUDP(c, dstIP)
@@ -4340,6 +4385,9 @@ func runGateway(args []string) {
 			dstIP := dst.Addr().String()
 			dstPort := dst.Port()
 			return func(c net.Conn) {
+				if g.refuseCutOffConn(c) {
+					return
+				}
 				switch {
 				case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
 					g.handle(c, dstIP, dstPort)

@@ -384,6 +384,9 @@ func (g *Gateway) installTsnetUDPCatchAll(s *tsnet.Server) {
 //     protocol).
 //   - everything else → tsnet's default handler.
 func (g *Gateway) tsnetUDPDisposition(dst netip.AddrPort, src netip.Addr) udpDisposition {
+	if g.peerCutOff(src.String()) {
+		return udpDrop
+	}
 	switch udpPortDisposition(dst.Port()) {
 	case udpDNS:
 		if g.dnsvip != nil {
