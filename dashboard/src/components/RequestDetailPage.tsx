@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   applyGeneratedRule,
   downloadActionFixture,
@@ -21,6 +21,7 @@ import { Main } from "./Main";
 import { Modal } from "./Modal";
 import { PageTitle, type Crumb } from "./PageTitle";
 import { RuleBuilderModal } from "./RuleBuilder";
+import { parseRuleLink } from "./RuleLinkDialog";
 import { Tag } from "./Tag";
 
 // isDenyAction matches every action label the dispatcher emits for a
@@ -50,10 +51,15 @@ export function RequestDetailPage({
   id,
   agents,
   whoami,
+  ruleLink,
+  onRuleLinkDone,
 }: {
   id: string;
   agents: Agent[];
   whoami: Whoami | null;
+  // ruleLink is the query of a link an agent prepared for this request.
+  ruleLink?: string;
+  onRuleLinkDone: () => void;
 }) {
   const [ev, setEv] = useState<EventRecord | null>(null);
   const [err, setErr] = useState<string | null>(null);
@@ -138,7 +144,12 @@ export function RequestDetailPage({
             {fullUrl}
           </span>
           <span className="ml-auto">
-            <ActionButtons ev={ev} whoami={whoami} />
+            <ActionButtons
+              ev={ev}
+              whoami={whoami}
+              ruleLink={ruleLink}
+              onRuleLinkDone={onRuleLinkDone}
+            />
           </span>
         </div>
         <div className="flex items-center gap-4 text-xs text-text-muted flex-wrap">
@@ -240,11 +251,25 @@ export function RequestDetailPage({
 // ActionButtons: "Create a rule…" builds a deny / pre-approve /
 // require-approval rule server-side, for anyone. Admins also keep the
 // raw-HCL "Block requests like this" editor and the fixture download.
-function ActionButtons({ ev, whoami }: { ev: EventRecord; whoami: Whoami | null }) {
+function ActionButtons({
+  ev,
+  whoami,
+  ruleLink,
+  onRuleLinkDone,
+}: {
+  ev: EventRecord;
+  whoami: Whoami | null;
+  ruleLink?: string;
+  onRuleLinkDone: () => void;
+}) {
   const [ruleOpen, setRuleOpen] = useState(false);
   const [builderOpen, setBuilderOpen] = useState(false);
   const isAdmin = whoami?.role !== "member";
   const canBlock = !!ev.id && ev.action !== "in_flight" && (!!ev.endpoint || ev.mode === "splice");
+  const link = useMemo(
+    () => (ruleLink !== undefined ? parseRuleLink(ruleLink) : undefined),
+    [ruleLink],
+  );
   return (
     <div className="flex items-center gap-2 flex-wrap justify-end">
       {canBlock && <Button onClick={() => setBuilderOpen(true)}>Create a rule…</Button>}
@@ -258,6 +283,24 @@ function ActionButtons({ ev, whoami }: { ev: EventRecord; whoami: Whoami | null 
       {builderOpen && (
         <RuleBuilderModal ev={ev} whoami={whoami} onClose={() => setBuilderOpen(false)} />
       )}
+      {link &&
+        whoami &&
+        (canBlock ? (
+          <RuleBuilderModal
+            key={ruleLink}
+            ev={ev}
+            whoami={whoami}
+            initial={link.prepared ? link : undefined}
+            onClose={onRuleLinkDone}
+          />
+        ) : (
+          <Modal title="Rule link" size="md" onClose={onRuleLinkDone}>
+            <p className="p-5 text-sm text-text">
+              A rule can't be created from this request: it is still in flight, or it reached no
+              endpoint and was not passed through.
+            </p>
+          </Modal>
+        ))}
     </div>
   );
 }

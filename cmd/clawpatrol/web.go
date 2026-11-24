@@ -17,6 +17,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"maps"
 	"net/http"
 	"net/url"
 	"os"
@@ -31,6 +32,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/andybalholm/brotli"
+	"github.com/hashicorp/hcl/v2"
+	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/klauspost/compress/zstd"
 
 	"github.com/denoland/clawpatrol/dashboard"
@@ -280,6 +283,11 @@ var memberRoutes = map[string]bool{
 	"/api/agents/delete":   true,
 	"/api/agents/profile":  true,
 	"/api/onboard/approve": true,
+	// Join intents: a member creates them for their own profiles and
+	// sees only their own (onboard_intent.go).
+	"/api/onboard/intent":        true,
+	"/api/onboard/intent/status": true,
+	"/api/onboard/intent/reject": true,
 	// Approvals: a member sees and decides only those raised by their
 	// own rules (webMux.decidesPending).
 	"/api/hitl/pending": true,
@@ -359,6 +367,11 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/tailscale/disconnect", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiTailscaleDisconnect)},
 		{Method: http.MethodPost, Path: "/api/credentials/set", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsSet)},
 		{Method: http.MethodPost, Path: "/api/credentials/clear", Auth: authDashboard, Handler: w.guardCredential(credentialByID, w.apiCredentialsClear)},
+		// Credential declarations: admin-only (not in memberRoutes).
+		{Method: http.MethodGet, Path: "/api/credentials/options", Auth: authDashboard, Handler: w.apiCredentialOptions},
+		{Method: http.MethodPost, Path: "/api/credentials/declare", Auth: authDashboard, Handler: w.apiCredentialDeclare},
+		{Method: http.MethodPost, Path: "/api/credentials/edit", Auth: authDashboard, Handler: w.apiCredentialEdit},
+		{Method: http.MethodPost, Path: "/api/credentials/remove", Auth: authDashboard, Handler: w.apiCredentialRemove},
 		{Method: http.MethodGet, Path: "/api/events", Auth: authDashboard, Handler: w.apiEventsSSE},
 		{Method: http.MethodPost, Path: "/api/actions/rule-preview", Auth: authDashboard, Handler: w.apiActionRulePreview},
 		{Method: http.MethodGet, Path: "/api/actions/", Auth: authDashboard, Handler: w.apiActionByID},
@@ -384,6 +397,7 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/users/channel/clear", Auth: authDashboard, Handler: w.apiUsersChannelClear},
 		{Method: http.MethodPost, Path: "/api/rules/preview", Auth: authDashboard, Handler: w.apiRulePreview},
 		{Method: http.MethodPost, Path: "/api/rules/create", Auth: authDashboard, Handler: w.apiRuleCreate},
+		{Method: http.MethodPost, Path: "/api/rules/endpoint-defaults", Auth: authDashboard, Handler: w.apiEndpointDefaultRules},
 		{Method: http.MethodGet, Path: "/api/rule-requests", Auth: authDashboard, Handler: w.apiRuleRequests},
 		{Method: http.MethodPost, Path: "/api/rule-requests/withdraw", Auth: authDashboard, Handler: w.apiRuleRequestWithdraw},
 		{Method: http.MethodPost, Path: "/api/rule-requests/decide", Auth: authDashboard, Handler: w.apiRuleRequestDecide},
@@ -392,6 +406,9 @@ func (w *webMux) routes() []webRoute {
 		{Method: http.MethodPost, Path: "/api/onboard/approve", Auth: authDashboardOrTailnetOperator, Handler: w.guardOnboardApprove(w.apiOnboardApprove)},
 		{Method: http.MethodGet, Path: "/api/onboard/lookup", Auth: authTailnetOperator, Handler: w.apiOnboardLookup},
 		{Method: http.MethodPost, Path: "/api/onboard/claim", Auth: authPublic, Handler: w.apiOnboardClaim},
+		{Method: http.MethodPost, Path: "/api/onboard/intent", Auth: authDashboard, Handler: w.apiOnboardIntentCreate},
+		{Method: http.MethodGet, Path: "/api/onboard/intent/status", Auth: authDashboard, Handler: w.apiOnboardIntentStatus},
+		{Method: http.MethodPost, Path: "/api/onboard/intent/reject", Auth: authDashboard, Handler: w.apiOnboardIntentReject},
 		{Method: http.MethodGet, Path: "/api/env-pushdown", Auth: authSelfAuthenticating, Handler: w.apiEnvPushdown},
 		{Method: http.MethodPost, Path: "/api/peer/tsnet/register", Auth: authSelfAuthenticating, Handler: w.apiPeerTsnetRegister},
 		// /__login is the auth point itself — it MUST be reachable
@@ -1052,19 +1069,31 @@ func hitlPeerPrincipalID(peerIP string) string {
 	return "peer:" + peerIP
 }
 
-func writeHITLOperationAccepted(rw http.ResponseWriter, op HITLOperation, publicURL string) {
+// writeHITLOperationAccepted answers a request held for approval that
+// went asynchronous. requestID, when set, names the held request and
+// links its rule dialog, as a refusal does.
+func writeHITLOperationAccepted(rw http.ResponseWriter, op HITLOperation, publicURL, requestID string) {
 	statusURL := hitlOperationStatusURL(publicURL, op.ID, op.StatusToken)
 	rw.Header().Set("Location", statusURL)
 	rw.Header().Set("Retry-After", strconv.Itoa(hitlDefaultRetryAfterSeconds))
-	writeHITLOperationResponse(rw, http.StatusAccepted, op, statusURL)
+	var extra map[string]any
+	if requestID != "" {
+		rw.Header().Set(requestIDHeader, requestID)
+		extra = map[string]any{"request_id": requestID}
+		if link := requestRuleLink(publicURL, requestID); link != "" {
+			rw.Header().Set(ruleLinkHeader, link)
+			extra["rule_link"] = link
+		}
+	}
+	writeHITLOperationResponse(rw, http.StatusAccepted, op, statusURL, extra)
 }
 
 func writeHITLOperationStatus(rw http.ResponseWriter, op HITLOperation, publicURL string) {
 	statusURL := hitlOperationStatusURL(publicURL, op.ID, op.StatusToken)
-	writeHITLOperationResponse(rw, http.StatusOK, op, statusURL)
+	writeHITLOperationResponse(rw, http.StatusOK, op, statusURL, nil)
 }
 
-func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOperation, statusURL string) {
+func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOperation, statusURL string, extra map[string]any) {
 	upstreamCalled := hitlOperationUpstreamCalled(op)
 	rw.Header().Set("Content-Type", "application/json")
 	rw.Header().Set("Cache-Control", "no-store")
@@ -1075,6 +1104,7 @@ func writeHITLOperationResponse(rw http.ResponseWriter, status int, op HITLOpera
 		rw.Header().Set("Retry-After", strconv.Itoa(hitlDefaultRetryAfterSeconds))
 	}
 	body := hitlOperationStatusBody(op, statusURL, upstreamCalled)
+	maps.Copy(body, extra)
 	rw.WriteHeader(status)
 	_ = json.NewEncoder(rw).Encode(body)
 }
@@ -1877,80 +1907,74 @@ func mergeGeneratedProfileCredentials(current, snippet []byte) ([]byte, []byte, 
 
 var generatedProfileCredentialsBlockRE = regexp.MustCompile(`(?ms)\n*profile\s+"([^"]+)"\s*\{\s*credentials\s*=\s*\[([^\]]*)\]\s*\}\s*`)
 
+// mergeProfileCredentialRefs adds refs to profile's credentials list in
+// current, leaving the rest of the text as written: the list is found by
+// parsing, edited like the credential form edits it, and spliced back.
+// It reports false when current declares no such profile, or one whose
+// list it cannot edit; the caller then appends the block as generated.
 func mergeProfileCredentialRefs(current, profile string, addRefs []string) (string, bool) {
-	profileName := regexp.QuoteMeta(profile)
-	oneLineRE := regexp.MustCompile(`(?m)^(\s*profile\s+"` + profileName + `"\s*\{\s*)([^{}\n]*?)(\s*\}\s*)$`)
-	if loc := oneLineRE.FindStringSubmatchIndex(current); loc != nil {
-		body := strings.TrimSpace(current[loc[4]:loc[5]])
-		existing := credentialRefsFromProfileBody(body)
-		refs := mergeRefLists(existing, addRefs)
-		var replacement strings.Builder
-		replacement.WriteString(`profile "` + profile + `" {` + "\n")
-		if body != "" && !profileCredentialsLineRE.MatchString(body) {
-			replacement.WriteString("  " + body + "\n")
-		}
-		replacement.WriteString("  credentials = [" + strings.Join(refs, ", ") + "]\n")
-		replacement.WriteString("}")
-		return current[:loc[0]] + replacement.String() + current[loc[1]:], true
-	}
-
-	blockRE := regexp.MustCompile(`(?ms)(profile\s+"` + profileName + `"\s*\{\n)(.*?)(\n\})`)
-	loc := blockRE.FindStringSubmatchIndex(current)
-	if loc == nil {
+	file, diags := hclsyntax.ParseConfig([]byte(current), "", hcl.InitialPos)
+	if diags.HasErrors() {
 		return current, false
 	}
-	body := current[loc[4]:loc[5]]
-	// Bail out if the body contains anything we can't reason about
-	// with the simple credentials-list regex: nested braces (inline
-	// disambiguator entries), multi-line credentials lists with `,`
-	// on continuation lines, or any non-credentials attribute that
-	// could swallow our edit. The caller falls back to a plain
-	// append, which surfaces a clean "duplicate profile" diagnostic
-	// from the loader.
-	if strings.ContainsAny(body, "{}") || !profileBodyMergeSafe(body) {
+	body, ok := file.Body.(*hclsyntax.Body)
+	if !ok {
 		return current, false
 	}
-	existing := credentialRefsFromProfileBody(body)
-	refs := mergeRefLists(existing, addRefs)
-	if profileCredentialsLineRE.MatchString(body) {
-		body = profileCredentialsLineRE.ReplaceAllString(body, "  credentials = ["+strings.Join(refs, ", ")+"]")
-	} else {
-		body = strings.TrimRight(body, "\n") + "\n  credentials = [" + strings.Join(refs, ", ") + "]"
-	}
-	return current[:loc[4]] + body + current[loc[5]:], true
-}
-
-// profileBodyMergeSafe returns true only when every non-blank line in
-// the profile body is either the single `credentials = [...]` line we
-// know how to edit or a comment / whitespace. Anything else (extra
-// attributes, multi-line credentials lists, disambiguator literals
-// the simple regex would mis-tokenise) makes the merge unsafe.
-func profileBodyMergeSafe(body string) bool {
-	credSeen := false
-	for _, line := range strings.Split(body, "\n") {
-		s := strings.TrimSpace(line)
-		if s == "" || strings.HasPrefix(s, "#") || strings.HasPrefix(s, "//") {
+	for _, blk := range body.Blocks {
+		if blk.Type != "profile" || len(blk.Labels) != 1 || blk.Labels[0] != profile {
 			continue
 		}
-		if !profileCredentialsLineRE.MatchString(line) {
-			return false
+		start, end, src := blk.CloseBraceRange.Start.Byte, blk.CloseBraceRange.Start.Byte, "[]"
+		attr, hasList := blk.Body.Attributes["credentials"]
+		if hasList {
+			r := attr.Expr.Range()
+			start, end, src = r.Start.Byte, r.End.Byte, current[r.Start.Byte:r.End.Byte]
 		}
-		if credSeen {
-			return false
+		list, err := parseCredentialList([]byte(src), profile)
+		if err != nil {
+			return current, false
 		}
-		credSeen = true
+		for _, ref := range addRefs {
+			if list.has(ref[strings.LastIndex(ref, ".")+1:]) {
+				continue
+			}
+			if list, err = parseCredentialList(list.with(ref), profile); err != nil {
+				return current, false
+			}
+		}
+		if hasList {
+			return current[:start] + string(list.src) + current[end:], true
+		}
+		newline := "\n"
+		if strings.Contains(current, "\r\n") {
+			newline = "\r\n"
+		}
+		credentials := "credentials = " + string(list.src)
+		blockStart := blk.TypeRange.Start.Byte
+		blockIndent := current[strings.LastIndexByte(current[:blockStart], '\n')+1 : blockStart]
+		if strings.TrimLeft(blockIndent, " \t") != "" {
+			return current, false
+		}
+		if blk.OpenBraceRange.Start.Line == blk.CloseBraceRange.Start.Line {
+			// A one-line block holds a single attribute: it opens up into
+			// one attribute per line.
+			inner := strings.TrimSpace(current[blk.OpenBraceRange.End.Byte:start])
+			lines := "{" + newline
+			if inner != "" {
+				lines += blockIndent + "  " + inner + newline
+			}
+			lines += blockIndent + "  " + credentials + newline + blockIndent + "}"
+			return current[:blk.OpenBraceRange.Start.Byte] + lines + current[blk.CloseBraceRange.End.Byte:], true
+		}
+		lineStart := strings.LastIndexByte(current[:start], '\n') + 1
+		if strings.TrimLeft(current[lineStart:start], " \t") != "" {
+			return current, false
+		}
+		line := blockIndent + "  " + credentials + newline
+		return current[:lineStart] + line + current[lineStart:], true
 	}
-	return true
-}
-
-var profileCredentialsLineRE = regexp.MustCompile(`(?m)^\s*credentials\s*=\s*\[([^\]]*)\]`)
-
-func credentialRefsFromProfileBody(body string) []string {
-	m := profileCredentialsLineRE.FindStringSubmatch(body)
-	if len(m) != 2 {
-		return nil
-	}
-	return credentialRefsFromListText(m[1])
+	return current, false
 }
 
 func credentialRefsFromListText(raw string) []string {
@@ -1960,19 +1984,6 @@ func credentialRefsFromListText(raw string) []string {
 		if ref != "" {
 			out = append(out, ref)
 		}
-	}
-	return out
-}
-
-func mergeRefLists(existing, added []string) []string {
-	seen := map[string]bool{}
-	out := make([]string, 0, len(existing)+len(added))
-	for _, ref := range append(existing, added...) {
-		if ref == "" || seen[ref] {
-			continue
-		}
-		seen[ref] = true
-		out = append(out, ref)
 	}
 	return out
 }

@@ -24,6 +24,7 @@ export function IntegrationsCards({
   showAll,
   onConnect,
   onRefresh,
+  onEdit,
 }: {
   list: Integration[];
   // When true, render every card in the grid (no overflow button,
@@ -32,6 +33,9 @@ export function IntegrationsCards({
   showAll?: boolean;
   onConnect: (id: string) => void;
   onRefresh: () => void;
+  // onEdit, when set, adds an edit button to each card that opens the
+  // credential's declaration (admins with dashboard config writes).
+  onEdit?: (i: Integration) => void;
 }) {
   const [editing, setEditing] = useState<Integration | null>(null);
   const [allOpen, setAllOpen] = useState(false);
@@ -137,6 +141,7 @@ export function IntegrationsCards({
             integration={i}
             onConnect={() => handleConnect(i)}
             onDisconnect={() => disconnect(i)}
+            onEdit={onEdit && (() => onEdit(i))}
           />
         ))}
         {overflow && (
@@ -158,6 +163,13 @@ export function IntegrationsCards({
             handleConnect(i);
           }}
           onDisconnect={disconnect}
+          onEdit={
+            onEdit &&
+            ((i) => {
+              setAllOpen(false);
+              onEdit(i);
+            })
+          }
         />
       )}
 
@@ -265,10 +277,12 @@ function Card({
   integration: i,
   onConnect,
   onDisconnect,
+  onEdit,
 }: {
   integration: Integration;
   onConnect: () => void;
   onDisconnect: () => void;
+  onEdit?: () => void;
 }) {
   const connected = isConnected(i);
   const hasSlots = (i.slots?.length ?? 0) > 0;
@@ -306,7 +320,8 @@ function Card({
   );
   return (
     <button
-      disabled={!clickable && !connected}
+      // A disabled button swallows clicks on its children, edit included.
+      disabled={!clickable && !connected && !onEdit}
       onClick={() => clickable && onConnect()}
       className={
         "group relative flex flex-col items-start gap-2 px-3 py-2.5 bg-canvas border-1.5 border-navy text-left transition-colors " +
@@ -323,6 +338,29 @@ function Card({
           {heading}
         </span>
         <span className="ml-auto flex items-center gap-1.5 shrink-0">
+          {onEdit && (
+            // Always shown (muted) and focusable: the only way to edit or
+            // remove a credential, it must work by touch and keyboard too.
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label={`edit credential ${i.name}`}
+              onClick={(e) => {
+                e.stopPropagation();
+                onEdit();
+              }}
+              onKeyDown={(e) => {
+                if (e.key !== "Enter" && e.key !== " ") return;
+                e.preventDefault();
+                e.stopPropagation();
+                onEdit();
+              }}
+              className="opacity-50 group-hover:opacity-100 focus:opacity-100 text-xs leading-none text-text hover:text-rust-500 transition-opacity cursor-pointer"
+              title="edit declaration"
+            >
+              ✎
+            </span>
+          )}
           {showDisconnect && (
             <span
               onClick={(e) => {
@@ -394,11 +432,13 @@ function AllIntegrationsModal({
   onClose,
   onConnect,
   onDisconnect,
+  onEdit,
 }: {
   list: Integration[];
   onClose: () => void;
   onConnect: (i: Integration) => void;
   onDisconnect: (i: Integration) => void;
+  onEdit?: (i: Integration) => void;
 }) {
   return (
     <Modal size="lg" title={`All integrations (${list.length})`} onClose={onClose}>
@@ -409,6 +449,7 @@ function AllIntegrationsModal({
             integration={i}
             onConnect={() => onConnect(i)}
             onDisconnect={() => onDisconnect(i)}
+            onEdit={onEdit && (() => onEdit(i))}
           />
         ))}
       </div>

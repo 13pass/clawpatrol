@@ -5,6 +5,7 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
@@ -121,6 +122,8 @@ func TestScopedRuleScopes(t *testing.T) {
 		{ruleScopePattern, "POST", "/api/v4/projects/999/issues/1/notes", true},
 		{ruleScopePattern, "POST", "/api/v4/projects/999/issues/1/notes/7", false},
 		{ruleScopePattern, "GET", "/api/v4/projects/999/issues/1/notes", false},
+		{ruleScopeAnyPath, "POST", "/api/v4/projects/999/merge_requests", true},
+		{ruleScopeAnyPath, "GET", "/api/v4/projects/123/issues/45/notes", false},
 	}
 	for _, tc := range cases {
 		rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictAllow, Scope: tc.scope}, &RuleAuthor{Username: "alice"})
@@ -197,11 +200,213 @@ func TestScopedRuleRefusals(t *testing.T) {
 		{"no profile", noProfile, RuleRequest{Verdict: ruleVerdictDeny}},
 		{"allow unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictAllow}},
 		{"pattern unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopePattern}},
+		{"condition unknown host", hostOnly, RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method == 'GET'"}},
+		{"condition does not compile", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.method =="}},
+		{"condition unknown variable", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "k8s.verb == 'get'"}},
+		{"condition too long", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.path == '" + strings.Repeat("a", memberConditionMaxBytes) + "'"}},
+		{"member nested loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "['/a', '/b'].exists(p, ['x', 'y'].all(q, http.path != p + q))"}},
+		{"member chained loops", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "['/a', '/b'].map(p, p + '/').exists(p, http.path == p)"}},
+		{"member sensitive header", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "'Authorization' in http.headers && http.headers['Authorization'][0].startsWith('Bearer a')"}},
+		{"member header by a computed name", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.headers['Author' + 'ization'][0] == 'x'"}},
+		{"member header map walked", notesEvent(), RuleRequest{Verdict: ruleVerdictDeny,
+			Condition: "http.headers.exists(k, k.startsWith('Auth'))"}},
 	}
 	for _, tc := range cases {
 		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, &RuleAuthor{Username: "alice"}); err == nil {
 			t.Errorf("%s: accepted", tc.name)
 		}
+	}
+}
+
+func TestScopedRuleHandWrittenCondition(t *testing.T) {
+	dir, cp := scopedRuleTestDir(t)
+	// The `${` would be a template interpolation inside a heredoc.
+	cond := "http.method in ['POST', 'PUT']\n  && !http.path.contains('${x}')"
+	rule, err := GenerateScopedRule(cp, notesEvent(),
+		RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeExact, Condition: "  " + cond + "\n"},
+		&RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rule.Condition != cond {
+		t.Errorf("condition = %q, want the hand-written one trimmed", rule.Condition)
+	}
+	if !strings.Contains(rule.HCL, "profile    = profile.team-a") {
+		t.Errorf("a hand-written condition dropped the member's profile pin:\n%s", rule.HCL)
+	}
+	ep := installRule(t, dir, rule)
+	cases := []struct {
+		method, path, profile string
+		want                  bool
+	}{
+		{"PUT", "/api/v4/projects/1/anything", "team-a", true},
+		{"POST", "/api/v4/projects/1/${x}", "team-a", false},
+		{"GET", "/api/v4/projects/123/issues/45/notes", "team-a", false},
+		{"PUT", "/api/v4/projects/1/anything", "team-b", false},
+	}
+	for _, tc := range cases {
+		if got := matchedRule(ep, httpReq(tc.method, tc.path, tc.profile, nil)) == rule.RuleName; got != tc.want {
+			t.Errorf("%s %s (%s): matched = %v, want %v\n%s", tc.method, tc.path, tc.profile, got, tc.want, rule.HCL)
+		}
+	}
+
+	generated, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeExact}, &RuleAuthor{Username: "alice"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if generated.RuleName == rule.RuleName {
+		t.Error("a hand-written condition got the generated rule's name")
+	}
+}
+
+func TestScopedRuleUneditedConditionIsTheGeneratedRule(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	author := &RuleAuthor{Username: "alice"}
+	req := RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopePattern, PinHeader: "X-Uninfo-Caller"}
+	generated, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Condition = " " + generated.Condition + "\n"
+	unedited, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if unedited.RuleName != generated.RuleName || unedited.HandWritten || unedited.HCL != generated.HCL {
+		t.Errorf("unedited condition gave %q (hand-written %v), want the generated rule %q", unedited.RuleName, unedited.HandWritten, generated.RuleName)
+	}
+}
+
+func TestScopedRuleHandWrittenConditionSkipsTheGeneratedOne(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	noMethod := notesEvent()
+	noMethod.Method = ""
+	masked := notesEvent()
+	masked.ReqHeaders["X-Uninfo-Caller"] = "a, b"
+	cases := map[string]struct {
+		ev  *Event
+		req RuleRequest
+	}{
+		"any_path without a method": {noMethod, RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeAnyPath}},
+		"unpinnable header":         {masked, RuleRequest{Verdict: ruleVerdictDeny, PinHeader: "X-Uninfo-Caller"}},
+	}
+	for name, tc := range cases {
+		if _, err := GenerateScopedRule(cp, tc.ev, tc.req, nil); err == nil {
+			t.Fatalf("%s: the generated condition was accepted; the case tests nothing", name)
+		}
+		tc.req.Condition = "http.path.startsWith('/api/v4/')"
+		rule, err := GenerateScopedRule(cp, tc.ev, tc.req, nil)
+		if err != nil {
+			t.Errorf("%s: a hand-written condition was refused for the generated one's error: %v", name, err)
+			continue
+		}
+		if !rule.HandWritten || rule.Condition != tc.req.Condition {
+			t.Errorf("%s: rule = %+v", name, rule)
+		}
+	}
+}
+
+func TestScopedRuleKeepsTemplateSequencesAndQuotedAndsLiteral(t *testing.T) {
+	dir, cp := scopedRuleTestDir(t)
+	for _, path := range []string{"/api/v4/projects/${x}/notes", "/api/v4/projects/%{x}/notes", "/api/v4/a && b/notes"} {
+		ev := notesEvent()
+		ev.Path = path
+		rule, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeExact}, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !strings.Contains(rule.HCL, "<<-CEL") {
+			t.Errorf("%s: want the multi-clause heredoc form:\n%s", path, rule.HCL)
+		}
+		ep := installRule(t, dir, rule)
+		if got := matchedRule(ep, httpReq("POST", path, "team-a", nil)); got != rule.RuleName {
+			t.Errorf("%s: matched %q, want %q\n%s", path, got, rule.RuleName, rule.HCL)
+		}
+	}
+}
+
+func TestScopedRuleMemberEditsTheHeaderPin(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	author := &RuleAuthor{Username: "alice"}
+	req := RuleRequest{Verdict: ruleVerdictDeny, Scope: ruleScopeAnyMethod, PinHeader: "X-Uninfo-Caller"}
+	generated, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Condition = generated.Condition + " && http.method != 'GET'"
+	rule, err := GenerateScopedRule(cp, notesEvent(), req, author)
+	if err != nil || !rule.HandWritten {
+		t.Fatalf("editing the generated header pin = %+v, %v", rule, err)
+	}
+}
+
+func TestScopedRuleAdminConditionMayLoop(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	cond := "['/a', '/b'].exists(p, ['x', 'y'].all(q, http.path != p + q)) || 'Authorization' in http.headers"
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: cond}, nil)
+	if err != nil || rule.Condition != cond {
+		t.Fatalf("admin loop condition = %+v, %v", rule, err)
+	}
+}
+
+func TestScopedRuleHandWrittenConditionIsWrittenAsTyped(t *testing.T) {
+	dir, cp := scopedRuleTestDir(t)
+	// Split at the `&&`, the comment would end on the first line and
+	// the second clause would become live.
+	cond := "http.method == 'POST' // only posts && http.path == '/nope'"
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: cond}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ep := installRule(t, dir, rule)
+	if got := matchedRule(ep, httpReq("POST", "/api/v4/projects", "team-a", nil)); got != rule.RuleName {
+		t.Errorf("POST matched %q, want %q\n%s", got, rule.RuleName, rule.HCL)
+	}
+}
+
+func TestScopedRuleWarnsTheReplayHasNoBody(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	rule, err := GenerateScopedRule(cp, notesEvent(), RuleRequest{Verdict: ruleVerdictDeny, Condition: "http.body.contains('x')"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rule.Warnings) != 1 || !strings.Contains(rule.Warnings[0], "without their bodies") {
+		t.Errorf("warnings = %q, want the replay-has-no-body warning", rule.Warnings)
+	}
+}
+
+func TestSplitCELAnd(t *testing.T) {
+	cases := map[string][]string{
+		"a && b":                 {"a", "b"},
+		"a == 'x && y' && b":     {"a == 'x && y'", "b"},
+		`a == "it\"s && y" && b`: {`a == "it\"s && y"`, "b"},
+		"a == r'x && y' && b":    {"a == r'x && y' && b"},
+		"a == '''x && y''' && b": {"a == '''x && y''' && b"},
+		"a == 'open && b":        {"a == 'open && b"},
+		"a // c && b":            {"a // c && b"},
+		"a.`x && y` && b":        {"a.`x && y` && b"},
+	}
+	for in, want := range cases {
+		if got := splitCELAnd(in); !slices.Equal(got, want) {
+			t.Errorf("splitCELAnd(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestHostRuleIgnoresBlankCondition(t *testing.T) {
+	_, cp := scopedRuleTestDir(t)
+	ev := &Event{ID: "h", Host: "example.org", Method: "GET", Path: "/", Profile: "team-a"}
+	rule, err := GenerateScopedRule(cp, ev, RuleRequest{Verdict: ruleVerdictDeny, Condition: "  \n"}, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(rule.HCL, "condition") {
+		t.Errorf("a blank condition was written:\n%s", rule.HCL)
 	}
 }
 

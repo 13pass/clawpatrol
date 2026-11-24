@@ -8,9 +8,11 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"log"
+	"maps"
 	"net"
 	"net/http"
 	"net/netip"
+	"path/filepath"
 	"slices"
 	"sort"
 	"strings"
@@ -45,6 +47,11 @@ type Agent struct {
 	Integrations []string   `json:"integrations"`
 	Sessions     []*Session `json:"sessions,omitempty"`
 	prevTotal    int64
+
+	// ProfileMissing is set when Profile names a profile the policy
+	// does not declare. The gateway serves such a device no endpoints
+	// and no credentials (see Gateway.declaredProfile).
+	ProfileMissing bool `json:"profile_missing,omitempty"`
 }
 
 // Session = one coding-agent conversation on a device. Identified by
@@ -1097,6 +1104,7 @@ func (w *webMux) agentsList() []*Agent {
 		if profile == "" {
 			continue
 		}
+		a.ProfileMissing = profileMissing(policy, profile)
 		allowed := credentialsInProfile(policy, profile)
 		if allowed == nil {
 			// No profile filter — surface every declared credential.
@@ -1266,6 +1274,13 @@ type RuleSummary struct {
 	Verdict    string                `json:"verdict,omitempty"`
 	Reason     string                `json:"reason,omitempty"`
 	Approve    []config.ApproveStage `json:"approve,omitempty"`
+	// File is only set for a member's own rules.
+	File          string `json:"file,omitempty"`
+	PinnedProfile string `json:"pinned_profile,omitempty"`
+	// Owned is false for a member's rule pinned to a profile they lost.
+	Mine        bool     `json:"mine,omitempty"`
+	Owned       bool     `json:"owned,omitempty"`
+	NeedsReview []string `json:"needs_review,omitempty"`
 }
 
 // apiRules returns every compiled rule across every profile, flattened
@@ -1273,9 +1288,8 @@ type RuleSummary struct {
 // emit one row per endpoint so the operator sees each attachment
 // site individually.
 //
-// Read-only. Dashboard edits go through the whole-file gateway.hcl
-// preview/save flow so operators review the formatted diff before the
-// typed-block validator persists changes.
+// Read-only. The viewer's own rules are listed even when no profile of
+// theirs reaches them, so they can still be changed.
 func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case "GET":
@@ -1284,15 +1298,56 @@ func (w *webMux) apiRules(rw http.ResponseWriter, r *http.Request) {
 			http.Error(rw, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		gw := w.g.cfg.Load()
+		_, ownPath, ownErr := w.rulesFile(v)
+		isMine := func(path string) bool {
+			return ownErr == nil && filepath.Clean(path) == filepath.Clean(ownPath)
+		}
+		mark := func(s *RuleSummary) {
+			body, path := declaredRule(gw, s.Name)
+			if body == nil {
+				return
+			}
+			s.PinnedProfile = body.Profile
+			if isMine(path) {
+				s.Mine, s.Owned = true, v.ownsRule(body)
+				if !v.admin {
+					s.NeedsReview = ruleChangesNeedingReview(body)
+				}
+			}
+			if v.admin || s.Mine {
+				s.File = filepath.Base(path)
+			}
+		}
 		out := []RuleSummary{}
+		listed := map[string]bool{}
 		for _, s := range w.collectRuleSummaries("") {
 			if v.ownsProfile(s.Profile) {
+				mark(&s)
 				out = append(out, s)
+				listed[s.Name] = true
+			}
+		}
+		if gw != nil && gw.Policy != nil {
+			for _, name := range slices.Sorted(maps.Keys(gw.Policy.Rules)) {
+				body, path := declaredRule(gw, name)
+				if body == nil || listed[name] || !isMine(path) {
+					continue
+				}
+				for _, ep := range body.Endpoints {
+					s := RuleSummary{
+						Name: name, Family: body.Family, Endpoint: ep, Priority: body.Priority, Disabled: body.Disabled,
+						Condition: body.Condition, Credential: body.Credential, Verdict: body.Verdict, Reason: body.Reason,
+						Approve: body.Approve,
+					}
+					mark(&s)
+					out = append(out, s)
+				}
 			}
 		}
 		writeJSON(rw, out)
 	default:
-		http.Error(rw, "edit rules through the gateway.hcl preview/save flow", http.StatusNotImplemented)
+		http.Error(rw, "rules change through /api/my/rules or in their config file", http.StatusNotImplemented)
 	}
 }
 

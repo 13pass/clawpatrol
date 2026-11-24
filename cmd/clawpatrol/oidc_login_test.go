@@ -765,6 +765,7 @@ func TestOIDCMigrationCopiesTheGitLabLinks(t *testing.T) {
 		`DROP TABLE dashboard_user_oidc`,
 		`DROP TABLE dashboard_user_channels`,
 		`DROP TABLE rule_requests`,
+		`ALTER TABLE devices DROP COLUMN os_hostname`,
 		`DELETE FROM _schema WHERE version >= 30`,
 		`UPDATE dashboard_users SET oidc_username = 'Alice-GL', oidc_subject = 'https://gitlab.com|42' WHERE username = 'alice'`,
 	} {

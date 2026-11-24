@@ -1,31 +1,31 @@
-import { useEffect, useState } from "react";
+import { useId, useMemo, useRef, useState } from "react";
 import {
   createRule,
-  listUsers,
   previewRule,
   type EventRecord,
   type RuleChangeResult,
   type RulePreviewResp,
+  type RuleRequest,
   type RuleScope,
   type RuleVerdict,
   type Whoami,
 } from "../lib/api";
-import { Button } from "./Button";
 import { Modal } from "./Modal";
+import {
+  AgentLinkNotice,
+  RULE_LABEL_CLASS,
+  RULE_SELECT_CLASS,
+  ReviewerSelect,
+  RuleDialogFooter,
+  RulePreviewPane,
+  VerdictPicker,
+  useApprovers,
+  useRulePreview,
+} from "./RuleDialogParts";
+import type { RuleLink } from "./RuleLinkDialog";
 
 // Recorded values the gateway masked; a rule cannot pin them.
 const MASKED_HEADER_VALUE = "***";
-const PREVIEW_DEBOUNCE_MS = 250;
-
-const VERDICTS: { value: RuleVerdict; label: string; help: string }[] = [
-  { value: "deny", label: "Deny", help: "Block matching requests." },
-  { value: "allow", label: "Pre-approve", help: "Let matching requests through without review." },
-  {
-    value: "approve",
-    label: "Require approval",
-    help: "Hold matching requests until a human approves.",
-  },
-];
 
 // scopesFor lists the scopes the server accepts for a request: a host
 // with no endpoint can only be ruled as a whole.
@@ -36,6 +36,7 @@ function scopesFor(ev: EventRecord): { value: RuleScope; label: string }[] {
       return [
         { value: "exact", label: "This method and path" },
         { value: "any_method", label: "This path, any method" },
+        { value: "any_path", label: "This method, any path" },
         { value: "pattern", label: "This method, same path shape (IDs generalized)" },
       ];
     case "k8s":
@@ -48,30 +49,81 @@ function scopesFor(ev: EventRecord): { value: RuleScope; label: string }[] {
   }
 }
 
+// requestLinkProblems lists what a request link asked for and this
+// request's dialog cannot take.
+function requestLinkProblems(
+  link: RuleLink,
+  ev: EventRecord,
+  verdicts: RuleVerdict[],
+  isAdmin: boolean,
+): string[] {
+  const problems = [...link.problems];
+  if (!verdicts.includes(link.verdict)) {
+    problems.push(
+      `This request does not offer the link's verdict "${link.verdict}": "${verdicts[0]}" is selected, check it.`,
+    );
+  }
+  if (link.condition && !ev.endpoint) {
+    problems.push("A host with no endpoint takes no condition: the link's condition is ignored.");
+  }
+  if (link.approver && !isAdmin) {
+    problems.push("Your reviewer is set by an admin: the link's reviewer is ignored.");
+  }
+  if (link.profile) {
+    problems.push(
+      "A rule from a request keeps that request's profile: the link's profile is ignored.",
+    );
+  }
+  if (link.endpoint && link.endpoint !== ev.endpoint) {
+    problems.push(
+      `The link names endpoint "${link.endpoint}", but this request went to ${ev.endpoint || "a host with no endpoint"}: the link's endpoint is ignored.`,
+    );
+  }
+  return problems;
+}
+
 // RuleBuilderModal turns one recorded request into a rule. The server
 // generates the HCL: for a member it is pinned to the request's
 // profile and credential and written to the member's own file.
 export function RuleBuilderModal({
   ev,
   whoami,
+  initial,
   onClose,
 }: {
   ev: EventRecord;
   whoami: Whoami | null;
+  // initial fills the dialog from a link an agent prepared.
+  initial?: RuleLink;
   onClose: () => void;
 }) {
   const isAdmin = whoami?.role !== "member";
+  const newHost = !ev.endpoint;
   const scopes = scopesFor(ev);
-  const [verdict, setVerdict] = useState<RuleVerdict>("deny");
+  // A host no endpoint claimed already passes through, so allowing it
+  // means nothing; only an admin adds one without a rule.
+  const verdicts: RuleVerdict[] = newHost
+    ? isAdmin
+      ? ["none", "deny", "approve"]
+      : ["deny", "approve"]
+    : ["deny", "allow", "approve"];
+  const linkProblems = initial ? requestLinkProblems(initial, ev, verdicts, isAdmin) : [];
+  const [verdict, setVerdict] = useState<RuleVerdict>(
+    initial && verdicts.includes(initial.verdict) ? initial.verdict : verdicts[0],
+  );
   const [scope, setScope] = useState<RuleScope>(scopes[0].value);
   const [pinHeader, setPinHeader] = useState("");
-  const [approver, setApprover] = useState("");
-  const [approvers, setApprovers] = useState<string[]>([]);
-  const [preview, setPreview] = useState<RulePreviewResp | null>(null);
-  const [err, setErr] = useState<string | null>(null);
+  const [approver, setApprover] = useState(isAdmin ? (initial?.approver ?? "") : "");
   const [busy, setBusy] = useState(false);
   const [created, setCreated] = useState<RuleChangeResult | null>(null);
   const [reason, setReason] = useState("");
+  // null while the editor is closed.
+  const [conditionText, setConditionText] = useState<string | null>(
+    initial?.condition && ev.endpoint ? initial.condition : null,
+  );
+  const condition = conditionText?.trim() ? conditionText : undefined;
+  const prefillOnPreview = useRef(false);
+  const conditionId = useId();
 
   const pinnable =
     ev.family === "http" && ev.endpoint
@@ -81,47 +133,51 @@ export function RuleBuilderModal({
           .sort()
       : [];
 
-  useEffect(() => {
-    if (isAdmin) {
-      listUsers()
-        .then((u) => setApprovers(u.human_approvers))
-        .catch(() => setApprovers([]));
-    }
-  }, [isAdmin]);
+  // scope and pin_header go along with a condition: the server ignores
+  // them then, but uses them to tell an unedited condition from one
+  // written by hand.
+  const request = useMemo<RuleRequest>(
+    () => ({
+      verdict,
+      scope,
+      approver: verdict === "approve" ? approver : "",
+      pin_header: pinHeader || undefined,
+      condition,
+    }),
+    [verdict, scope, approver, pinHeader, condition],
+  );
+  const approvers = useApprovers(isAdmin);
+  const { preview, fresh, canCreate, err, setErr } = useRulePreview({
+    inputs: { id: ev.id ?? "", request },
+    enabled: !!ev.id && !created,
+    load: (i) => previewRule(i.id, i.request),
+    onPreview: (p: RulePreviewResp) => {
+      if (prefillOnPreview.current) {
+        prefillOnPreview.current = false;
+        setConditionText((text) => (text === "" ? (p.rule.condition ?? "") : text));
+      }
+    },
+    onError: () => {
+      prefillOnPreview.current = false;
+    },
+  });
 
-  useEffect(() => {
-    if (!ev.id || created) return;
-    let cancelled = false;
-    const t = setTimeout(() => {
-      previewRule(ev.id!, { verdict, scope, approver, pin_header: pinHeader || undefined })
-        .then((p) => {
-          if (cancelled) return;
-          setPreview(p);
-          setErr(null);
-        })
-        .catch((e: Error) => {
-          if (cancelled) return;
-          setPreview(null);
-          setErr(e.message || "preview failed");
-        });
-    }, PREVIEW_DEBOUNCE_MS);
-    return () => {
-      cancelled = true;
-      clearTimeout(t);
-    };
-  }, [ev.id, verdict, scope, pinHeader, approver, created]);
+  // While a preview is on its way, the editor opens empty and that preview fills it.
+  function editCondition() {
+    prefillOnPreview.current = !fresh && !err;
+    setConditionText(fresh ? (preview?.rule.condition ?? "") : "");
+  }
+
+  function closeConditionEditor() {
+    prefillOnPreview.current = false;
+    setConditionText(null);
+  }
 
   async function create() {
-    if (!ev.id) return;
+    if (!ev.id || !fresh) return;
     setBusy(true);
     try {
-      setCreated(
-        await createRule(
-          ev.id,
-          { verdict, scope, approver, pin_header: pinHeader || undefined },
-          preview?.needs_review ? reason : undefined,
-        ),
-      );
+      setCreated(await createRule(ev.id, request, preview?.needs_review ? reason : undefined));
       setErr(null);
     } catch (e) {
       setErr((e as Error).message || "create failed");
@@ -130,12 +186,12 @@ export function RuleBuilderModal({
     }
   }
 
-  const labelClass = "font-mono text-xs uppercase tracking-wider text-text-muted";
-  const selectClass =
-    "border border-canvas-dark rounded px-2 py-1.5 text-xs bg-canvas focus:outline-none focus:border-text";
-
   return (
-    <Modal title="Create a rule from this request" size="lg" onClose={onClose}>
+    <Modal
+      title={newHost && isAdmin ? "Add this host" : "Create a rule from this request"}
+      size="lg"
+      onClose={onClose}
+    >
       <div className="p-4 space-y-4 overflow-auto">
         {created?.pending ? (
           <div className="space-y-2">
@@ -150,6 +206,22 @@ export function RuleBuilderModal({
                 Rules
               </a>{" "}
               page.
+            </p>
+          </div>
+        ) : created?.endpoint_name && isAdmin ? (
+          <div className="space-y-2">
+            <p className="text-sm text-text">
+              Endpoint <code className="font-bold">{created.endpoint_name}</code> for{" "}
+              <code>{ev.host}</code> was written to <code>{created.file}</code> and loaded by the
+              gateway
+              {created.default_rules?.length || created.rule_name
+                ? `, with the rules ${[...(created.default_rules ?? []), created.rule_name].filter(Boolean).join(", ")}`
+                : ", with no rules"}
+              .
+            </p>
+            <p className="text-xs text-text-muted">
+              Next, add its credential on a device's Credentials panel: pick endpoint{" "}
+              <code>{created.endpoint_name}</code>.
             </p>
           </div>
         ) : created ? (
@@ -168,39 +240,17 @@ export function RuleBuilderModal({
           </div>
         ) : (
           <>
-            <fieldset className="space-y-2">
-              <legend className={labelClass}>What should happen</legend>
-              <div className="flex flex-wrap gap-2">
-                {VERDICTS.map((v) => (
-                  <label
-                    key={v.value}
-                    className={
-                      "flex-1 min-w-[10rem] cursor-pointer border-1.5 px-3 py-2 text-xs " +
-                      (verdict === v.value ? "border-navy bg-navy-100" : "border-canvas-dark")
-                    }
-                  >
-                    <input
-                      type="radio"
-                      name="verdict"
-                      value={v.value}
-                      checked={verdict === v.value}
-                      onChange={() => setVerdict(v.value)}
-                      className="mr-2"
-                    />
-                    <span className="font-bold">{v.label}</span>
-                    <span className="block text-text-muted mt-0.5">{v.help}</span>
-                  </label>
-                ))}
-              </div>
-            </fieldset>
+            {initial && <AgentLinkNotice note={initial.note} problems={linkProblems} />}
+            <VerdictPicker verdicts={verdicts} value={verdict} onChange={setVerdict} />
 
             <div className="flex flex-wrap gap-4">
               <label className="flex flex-col gap-1">
-                <span className={labelClass}>Matching</span>
+                <span className={RULE_LABEL_CLASS}>Matching</span>
                 <select
                   value={scope}
+                  disabled={condition !== undefined}
                   onChange={(e) => setScope(e.target.value as RuleScope)}
-                  className={selectClass}
+                  className={RULE_SELECT_CLASS + " disabled:opacity-60"}
                 >
                   {scopes.map((s) => (
                     <option key={s.value} value={s.value}>
@@ -211,11 +261,12 @@ export function RuleBuilderModal({
               </label>
               {pinnable.length > 0 && (
                 <label className="flex flex-col gap-1">
-                  <span className={labelClass}>Only when header</span>
+                  <span className={RULE_LABEL_CLASS}>Only when header</span>
                   <select
                     value={pinHeader}
+                    disabled={condition !== undefined}
                     onChange={(e) => setPinHeader(e.target.value)}
-                    className={selectClass}
+                    className={RULE_SELECT_CLASS + " disabled:opacity-60"}
                   >
                     <option value="">— any request —</option>
                     {pinnable.map((h) => (
@@ -227,25 +278,11 @@ export function RuleBuilderModal({
                 </label>
               )}
               {verdict === "approve" && isAdmin && (
-                <label className="flex flex-col gap-1">
-                  <span className={labelClass}>Reviewed by</span>
-                  <select
-                    value={approver}
-                    onChange={(e) => setApprover(e.target.value)}
-                    className={selectClass}
-                  >
-                    <option value="">the dashboard</option>
-                    {approvers.map((a) => (
-                      <option key={a} value={a}>
-                        {a}
-                      </option>
-                    ))}
-                  </select>
-                </label>
+                <ReviewerSelect approvers={approvers} value={approver} onChange={setApprover} />
               )}
               {verdict === "approve" && !isAdmin && (
                 <div className="flex flex-col gap-1">
-                  <span className={labelClass}>Reviewed by</span>
+                  <span className={RULE_LABEL_CLASS}>Reviewed by</span>
                   <span className="text-xs py-1.5">
                     {whoami?.approver || "the dashboard"}{" "}
                     <span className="text-text-muted">(set by an admin)</span>
@@ -254,36 +291,66 @@ export function RuleBuilderModal({
               )}
             </div>
 
+            {ev.endpoint && conditionText !== null && (
+              <div className="space-y-1">
+                <div className="flex items-baseline justify-between gap-2">
+                  <label htmlFor={conditionId} className={RULE_LABEL_CLASS}>
+                    Condition (CEL)
+                  </label>
+                  <button
+                    type="button"
+                    onClick={closeConditionEditor}
+                    className="text-2xs underline text-text-muted"
+                  >
+                    Use the generated condition
+                  </button>
+                </div>
+                <textarea
+                  id={conditionId}
+                  value={conditionText}
+                  onChange={(e) => {
+                    prefillOnPreview.current = false;
+                    setConditionText(e.target.value);
+                  }}
+                  rows={4}
+                  spellCheck={false}
+                  className="w-full font-mono text-xs text-text bg-canvas border-1.5 border-navy px-2 py-1.5"
+                />
+                <span className="block text-2xs text-text-subtle">
+                  {pinnable.length > 0
+                    ? "Replaces what Matching and Only when header generate; they apply again while it is empty."
+                    : "Replaces what Matching generates; it applies again while this is empty."}{" "}
+                  The rule keeps its endpoint{isAdmin ? "" : ", your profile and its credential"}.
+                  {fresh && condition && !preview?.rule.hand_written
+                    ? " This is the generated condition, so the generated rule is created."
+                    : ""}
+                </span>
+              </div>
+            )}
+            {ev.endpoint && conditionText === null && (
+              <button
+                type="button"
+                onClick={editCondition}
+                className="text-xs underline text-text-muted"
+              >
+                Edit the condition
+              </button>
+            )}
+
             {err && <div className="text-sm text-danger-500 whitespace-pre-wrap">{err}</div>}
             {preview && (
-              <div className="space-y-2">
-                <p className="text-xs text-text">
-                  Would have matched{" "}
-                  <span className="font-bold">
-                    {preview.recent_matches} of the last {preview.recent_sampled}
-                  </span>{" "}
-                  {isAdmin ? "requests" : "requests of your profile"} to this{" "}
-                  {preview.rule.new_endpoint ? "host" : "endpoint"}. Written to{" "}
-                  <code>{preview.file}</code>.
-                </p>
-                {preview.rule.warnings?.map((w) => (
-                  <div key={w} className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
-                    {w}
-                  </div>
-                ))}
-                {!preview.writes_enabled && preview.writes_unavailable && (
-                  <div className="border border-butter-600 bg-butter-100 px-3 py-2 text-xs">
-                    This rule can't be saved from the dashboard: {preview.writes_unavailable}.
-                  </div>
-                )}
-                <pre className="border-1.5 border-navy bg-canvas p-3 font-mono text-xs text-text overflow-auto max-h-[22rem]">
-                  {preview.rule.hcl}
-                </pre>
+              <RulePreviewPane
+                preview={preview}
+                fresh={fresh}
+                matched={`${isAdmin ? "requests" : "requests of your profile"} to this ${preview.rule.new_endpoint ? "host" : "endpoint"}`}
+              >
                 {preview.needs_review && (
                   <div className="space-y-2 border border-navy bg-navy-100 px-3 py-2 text-xs">
                     <p>
-                      This rule could let through requests your profile's other rules stop, so an
-                      admin reviews it first. They may approve it, narrow it or reject it.
+                      {preview.rule.hand_written
+                        ? "A condition written by hand runs on every request, so an admin reviews it first."
+                        : "This rule could let through requests your profile's other rules stop, so an admin reviews it first."}{" "}
+                      They may approve it, narrow it or reject it.
                     </p>
                     <label className="block space-y-1">
                       <span className="text-text-muted">Why do you need it? (optional)</span>
@@ -296,27 +363,25 @@ export function RuleBuilderModal({
                     </label>
                   </div>
                 )}
-              </div>
+              </RulePreviewPane>
             )}
           </>
         )}
       </div>
-      <div className="flex items-center gap-2 justify-end px-4 py-3 border-t border-navy bg-navy-100">
-        {created ? (
-          <Button variant="outline" onClick={onClose}>
-            Close
-          </Button>
-        ) : (
-          <>
-            <Button variant="outline" onClick={onClose}>
-              Cancel
-            </Button>
-            <Button disabled={!preview?.writes_enabled || busy} onClick={create}>
-              {busy ? "Sending…" : preview?.needs_review ? "Send for review" : "Create rule"}
-            </Button>
-          </>
-        )}
-      </div>
+      <RuleDialogFooter
+        done={!!created}
+        canCreate={canCreate}
+        busy={busy}
+        createLabel={
+          preview?.needs_review
+            ? "Send for review"
+            : verdict === "none"
+              ? "Add host"
+              : "Create rule"
+        }
+        onCreate={create}
+        onClose={onClose}
+      />
     </Modal>
   );
 }

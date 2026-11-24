@@ -92,6 +92,38 @@ through it.
 On macOS, the first join prompts you to approve the Claw Patrol
 Network Extension in **System Settings → Privacy & Security**.
 
+### Let an agent join the device
+
+**Devices → Add device → Agent prompt** writes a prompt for an AI
+agent already running on the new device. Pick the profile, optionally
+a device name, then click **create prompt** and paste the prompt
+into the agent. The agent installs the client if needed and runs
+`clawpatrol join --intent <id>`. It then tells you the code the join
+printed. The Add device window shows the waiting device: its name, OS
+account, profile and code. Approve it there once the codes match.
+
+The prompt holds no secret, because it may end up in the agent
+provider's logs. Its join intent is valid for ten minutes and for one
+device only, and it grants nothing until you approve:
+
+- The gateway assigns the profile picked in the window and ignores
+  any profile the client asks for.
+- The device is named `<machine>-<OS account>` unless you typed a
+  name. Several accounts on one machine therefore get separate
+  devices.
+- If a second device uses the same prompt, both joins are cancelled.
+  The window then says the prompt may have leaked.
+- Joining under the name of an existing device in the same profile
+  replaces that device. **Approve** stays disabled until you tick
+  **Replace**.
+- Members can create prompts only for their own profiles.
+- **cancel prompt**, **new prompt** and closing the window all revoke
+  a prompt that hasn't joined yet.
+
+The prompt sets up per-process routing (`clawpatrol run`) and passes
+`--no-trust`, so the agent needs no sudo. For `--whole-machine`, use
+the **Commands** tab.
+
 > **Don't run `clawpatrol join --whole-machine` on the gateway
 > host itself** — the gateway shouldn't route its own traffic
 > through itself; this would create a network loop that would

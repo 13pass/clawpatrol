@@ -17,6 +17,7 @@ import (
 	"net/http"
 	_ "net/http/pprof"
 	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"path/filepath"
@@ -192,6 +193,44 @@ func parseDurationOr(s string, def time.Duration) time.Duration {
 	return d
 }
 
+// requestIDHeader carries a refused or held request's ID, the one the
+// dashboard shows it under (#/request/<id>); ruleLinkHeader carries the
+// link that opens its rule dialog, when the gateway has a public URL.
+const (
+	requestIDHeader = "X-Clawpatrol-Request"
+	ruleLinkHeader  = "X-Clawpatrol-Rule-Link"
+)
+
+// requestRuleLink is the dashboard link that opens a request's rule
+// dialog, or "" without a public URL. An agent may append
+// &verdict=…&condition=…&note=… to fill it in.
+func requestRuleLink(publicURL, requestID string) string {
+	if publicURL == "" || requestID == "" {
+		return ""
+	}
+	return dashboardLink(publicURL, requestLinkPath+url.PathEscape(requestID)+"?rule")
+}
+
+// dashboardLink is a dashboard route under the gateway's public URL.
+func dashboardLink(publicURL, route string) string {
+	return strings.TrimRight(publicURL, "/") + route
+}
+
+// writeDenied answers a request the policy or an approver refused. The
+// rule link and the ID are also in the body, the ID on its last line:
+// agents often see only the body.
+func writeDenied(w io.Writer, reason, publicURL, requestID string) {
+	body := reason + "\n"
+	headers := requestIDHeader + ": " + requestID + "\r\n"
+	if link := requestRuleLink(publicURL, requestID); link != "" {
+		body += "To propose a rule for it, give your human this link (append &verdict=…&condition=…&note=… to fill it in): " + link + "\n"
+		headers += ruleLinkHeader + ": " + link + "\r\n"
+	}
+	body += "Claw Patrol request: " + requestID + "\n"
+	_, _ = fmt.Fprintf(w, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\n%sContent-Length: %d\r\nConnection: close\r\n\r\n%s",
+		headers, len(body), body)
+}
+
 // newReqID returns a UUIDv7 string. Time-ordered + random tail;
 // used both for start/end/frame correlation and as the persistent
 // action key in the DB / detail page URL.
@@ -204,16 +243,30 @@ func newReqID() string {
 // through config's package-global PluginLoader, installed once at
 // process startup via config.SetPluginLoader.
 func loadConfig(path string) (*config.Gateway, *config.CompiledPolicy, error) {
-	gw, diags := config.Load(path)
-	return compileLoadedConfig(gw, diags)
+	return loadConfigOverlay(path, nil)
 }
 
 // loadConfigOverlay is loadConfig for a config directory with some
 // files' contents replaced in memory (nil removes a file). Used to
-// validate a candidate change before writing it.
-func loadConfigOverlay(dir string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
-	gw, diags := config.LoadDirOverlay(dir, overrides)
-	return compileLoadedConfig(gw, diags)
+// validate a candidate change before writing it. The files are read
+// once; defaults.new_endpoint_rule is checked against that copy.
+func loadConfigOverlay(path string, overrides map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	sources, diags := config.ReadSources(path, overrides)
+	if diags.HasErrors() {
+		return nil, nil, fmt.Errorf("%s", diags.Error())
+	}
+	gw, cp, err := compileConfigSources(path, sources)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := checkNewEndpointRules(path, sources, gw); err != nil {
+		return nil, nil, err
+	}
+	return gw, cp, nil
+}
+
+func compileConfigSources(path string, sources map[string][]byte) (*config.Gateway, *config.CompiledPolicy, error) {
+	return compileLoadedConfig(config.LoadSources(path, sources))
 }
 
 func compileLoadedConfig(gw *config.Gateway, diags hcl.Diagnostics) (*config.Gateway, *config.CompiledPolicy, error) {
@@ -411,6 +464,12 @@ type Gateway struct {
 	oidcOnce  sync.Once
 	oidcState *oidcState
 
+	// missingProfileLogged rate-limits the log line for a device whose
+	// assigned profile the policy no longer declares. Keyed by device
+	// IP, so bounded by the number of devices. See declaredProfile.
+	missingProfileMu     sync.Mutex
+	missingProfileLogged map[string]missingProfileNote
+
 	// cfg is the live operational *config.Gateway. Stored as an
 	// atomic pointer because dashboard handlers and the reload loop
 	// read it without holding configMu; configMu only serialises
@@ -519,33 +578,222 @@ func (g *Gateway) Policy() *config.CompiledPolicy {
 // looking up OAuth credentials for a given peer IP. Falls back to the
 // "default" profile when declared, otherwise to the first declared
 // profile (single-tenant default).
+//
+// A device assigned to a profile the policy no longer declares is not
+// served under that name, nor under the default: see declaredProfile.
 func (g *Gateway) profileFor(peerIP string) string {
-	if g.onboard != nil {
-		if p := g.onboard.ProfileForIP(peerIP); p != "" {
-			return p
-		}
-		// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
-		//
-		//   1. Same Tailscale node, different address family — whole-
-		//      machine tsnet traffic arrives on the peer's IPv6 ULA
-		//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
-		//   2. Same Tailscale node, address moved — the control plane
-		//      reassigned the node's address, so the device row holds
-		//      one the node no longer has. A host that rejoins as a
-		//      *new* node is a new node and is not coalesced; it gets
-		//      its own row.
-		//
-		// ClaimAliasResolve guards against re-running WhoIs per packet
-		// for peers that have no matching device.
-		if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(peerIP, 5*time.Minute) {
-			if canonical := g.resolveTsnetAlias(peerIP); canonical != "" {
-				if p := g.onboard.ProfileForIP(canonical); p != "" {
-					return p
-				}
-			}
+	profile, _ := g.peerProfile(peerIP)
+	return profile
+}
+
+const (
+	// aliasResolveInterval is how often a peer address with no device
+	// row is looked up again with tsnet WhoIs.
+	aliasResolveInterval = 5 * time.Minute
+	// aliasWhoIsTimeout bounds one WhoIs. A connection whose lookup
+	// fails is refused (peerProfile), not served as an unknown peer.
+	aliasWhoIsTimeout = 500 * time.Millisecond
+)
+
+// peerProfile is profileFor plus whether a connection from peerIP must
+// be refused: the peer is a device whose profile the policy no longer
+// declares (declaredProfile), or a tailnet address whose owner could
+// not be established because its WhoIs failed or is still in flight.
+// Serving either under the empty or the unknown-peer profile would hand
+// its traffic to defaults.unknown_host, which under "passthrough"
+// relays it from the gateway's network position with no rule applied,
+// or to the default profile's credentials.
+func (g *Gateway) peerProfile(peerIP string) (profile string, refuse bool) {
+	deviceIP, row, unresolved := g.deviceProfileRow(peerIP)
+	if row != "" {
+		return g.declaredProfile(deviceIP, row)
+	}
+	return g.unknownPeerProfile(peerIP), unresolved
+}
+
+// servingProfile resolves the profile a connection is served under, at
+// the point where the handler is about to use it. A refused peer
+// (peerProfile) gets its connection closed and ok=false. Checked here
+// as well as on entry (refuseCutOffConn) because a handler may wait on
+// the client (an SNI or a startup message) while a config reload
+// removes the device's profile.
+func (g *Gateway) servingProfile(c net.Conn) (profile string, ok bool) {
+	profile, refuse := g.peerProfile(peerIP(c))
+	if refuse {
+		_ = c.Close()
+		return "", false
+	}
+	return profile, true
+}
+
+// peerCutOff reports whether connections from peerIP are refused
+// (peerProfile).
+func (g *Gateway) peerCutOff(peerIP string) bool {
+	_, refuse := g.peerProfile(peerIP)
+	return refuse
+}
+
+// refuseCutOffConn closes c and reports true when its peer is refused
+// (peerCutOff). Called first by every dispatcher of peer traffic.
+func (g *Gateway) refuseCutOffConn(c net.Conn) bool {
+	if !g.peerCutOff(peerIP(c)) {
+		return false
+	}
+	_ = c.Close()
+	return true
+}
+
+// peerCutOffCached is peerCutOff without alias resolution: it never
+// waits on a tsnet WhoIs, for hooks that run inline in netstack's packet
+// path (tsnet's UDP flow hooks). An alias not yet folded onto its device
+// is not recognised here.
+func (g *Gateway) peerCutOffCached(peerIP string) bool {
+	if g.onboard == nil {
+		return false
+	}
+	row := g.onboard.ProfileForIP(peerIP)
+	if row == "" {
+		return false
+	}
+	_, missing := g.declaredProfile(peerIP, row)
+	return missing
+}
+
+// deviceProfileRow returns the device a peer address belongs to and
+// the profile on its devices row, or "" when the peer has no row or
+// the row names no profile. unresolved reports a tailnet address whose
+// WhoIs failed or is in flight, so whether it belongs to a device is
+// unknown.
+func (g *Gateway) deviceProfileRow(peerIP string) (deviceIP, profile string, unresolved bool) {
+	if g.onboard == nil {
+		return "", "", false
+	}
+	if p := g.onboard.ProfileForIP(peerIP); p != "" {
+		return peerIP, p, false
+	}
+	if g.tsnetLC == nil {
+		return "", "", false
+	}
+	// Lazy alias resolution via tsnet WhoIs. Two cases this catches:
+	//
+	//   1. Same Tailscale node, different address family — whole-
+	//      machine tsnet traffic arrives on the peer's IPv6 ULA
+	//      (fd7a:115c:a1e0::/48) but only the IPv4 is registered.
+	//   2. Same Tailscale node, address moved — the control plane
+	//      reassigned the node's address, so the device row holds
+	//      one the node no longer has. A host that rejoins as a
+	//      *new* node is a new node and is not coalesced; it gets
+	//      its own row.
+	//
+	// ClaimAliasResolve guards against re-running WhoIs per packet
+	// for peers that have no matching device.
+	if !g.onboard.ClaimAliasResolve(peerIP, aliasResolveInterval) {
+		return "", "", g.onboard.AliasResolving(peerIP)
+	}
+	canonical, err := g.resolveTsnetAliasErr(peerIP)
+	if err != nil {
+		log.Printf("whois %s: %v — refusing the connection", peerIP, err)
+		return "", "", true
+	}
+	if canonical != "" {
+		if p := g.onboard.ProfileForIP(canonical); p != "" {
+			return canonical, p, false
 		}
 	}
-	return g.unknownPeerProfile(peerIP)
+	return "", "", false
+}
+
+// missingProfileLogInterval is how often the gateway repeats the log
+// line for one device stuck on a profile the policy does not declare.
+const missingProfileLogInterval = time.Hour
+
+// missingProfileNote records what declaredProfile last logged for a
+// device, so the line is written once per interval rather than once per
+// connection.
+type missingProfileNote struct {
+	profile string
+	at      time.Time
+}
+
+// declaredProfile maps the profile a device row carries onto the one
+// the device is actually served under. That is the row's profile when
+// the live policy declares it, and the reserved empty profile when it
+// does not; missing reports the latter, so the dispatchers refuse the
+// device's new connections (peerProfile). Connections already open
+// when the profile goes away run until they close.
+//
+// A devices row outlives the profile block it names: deleting
+// `profile "x" {}` from the config leaves every device assigned to x
+// pointing at nothing. Removing a profile has to revoke what it
+// granted, so such a device is served no endpoint and no credential
+// until an operator reassigns it or restores the block. It is not moved
+// to the default profile either — that would hand it a set of
+// credentials nobody assigned to it.
+//
+// The check reads the compiled policy on every call rather than a set
+// captured at boot, so a profile dropped by a config reload stops
+// serving on the next connection, and one that comes back resumes.
+// Before the first policy is loaded there is nothing to check against
+// and nothing to dispatch to, so the row's name is returned as is.
+//
+// A config that declares no profile at all is the exception. It is
+// single-tenant, onboarding stores whatever `join --profile` suggested
+// because there is nothing to validate it against, and the name scopes
+// nothing: such a device is served exactly like one with no profile on
+// its row.
+func (g *Gateway) declaredProfile(deviceIP, profile string) (string, bool) {
+	policy := g.Policy()
+	if !profileMissing(policy, profile) {
+		return profile, false
+	}
+	g.logMissingProfile(deviceIP, profile)
+	return config.UnknownPeerEmptyProfile, true
+}
+
+// profileMissing reports whether a device row's profile names something
+// the policy does not declare, under a policy that declares profiles.
+func profileMissing(policy *config.CompiledPolicy, profile string) bool {
+	if policy == nil || profile == "" {
+		return false
+	}
+	if _, ok := policy.Profiles[profile]; ok {
+		return false
+	}
+	return policy.DeclaresProfiles()
+}
+
+// logMissingProfile tells the operator that a device is assigned to a
+// profile the policy does not declare. It runs on the per-connection
+// path, so it logs once per device and missing profile, and again only
+// after missingProfileLogInterval.
+func (g *Gateway) logMissingProfile(deviceIP, profile string) {
+	// A device reaches the gateway on its alias address too; key on the
+	// device so both addresses share one line.
+	if g.onboard != nil {
+		deviceIP = g.onboard.AgentIPFor(deviceIP)
+	}
+	now := time.Now()
+	g.missingProfileMu.Lock()
+	n, seen := g.missingProfileLogged[deviceIP]
+	if seen && n.profile == profile && now.Sub(n.at) < missingProfileLogInterval {
+		g.missingProfileMu.Unlock()
+		return
+	}
+	if g.missingProfileLogged == nil {
+		g.missingProfileLogged = map[string]missingProfileNote{}
+	}
+	g.missingProfileLogged[deviceIP] = missingProfileNote{profile: profile, at: now}
+	g.missingProfileMu.Unlock()
+	name := deviceIP
+	if g.onboard != nil {
+		if h := g.onboard.HostnameForIP(deviceIP); h != "" {
+			name = fmt.Sprintf("%s (%s)", h, deviceIP)
+		}
+	}
+	log.Printf("device %q is assigned to profile %q, which the config does not declare: "+
+		"refusing its new connections until it is reassigned or the profile is restored "+
+		"(connections already open run until they close)",
+		name, profile)
 }
 
 // unknownPeerProfile is the profile a peer with no devices row and no
@@ -560,12 +808,11 @@ func (g *Gateway) profileFor(peerIP string) string {
 // device reaching the gateway on its other address is still that
 // device.
 //
-// Returning "" here would withhold nothing: an unregistered profile name
-// means "single-tenant, no mapping established" to HostEndpoint and
-// pickEndpointForProfile, which answer it by searching every declared
-// profile — so an empty name reaches strictly more endpoints than the
-// default profile does. The no_profile arm names a registered but empty
-// profile instead, which resolves to no endpoint at all.
+// Returning "" here would not withhold everything: under a config that
+// declares no profile, pickEndpointForProfile and credential dispatch
+// serve any unregistered name the first candidate endpoint and an
+// endpoint's sole credential. The no_profile arm names a registered but
+// empty profile instead, which resolves to no endpoint at all.
 func (g *Gateway) unknownPeerProfile(peerIP string) string {
 	if policy := g.Policy(); policy != nil && policy.UnknownPeer == config.UnknownPeerNoProfile && !g.hasDeviceRow(peerIP) {
 		return config.UnknownPeerEmptyProfile
@@ -609,14 +856,28 @@ func (g *Gateway) hasDeviceRow(peerIP string) bool {
 // holds an address the node no longer has — and requires exactly one
 // devices row bound to the node (see UniqueIPForNodeID).
 func (g *Gateway) resolveTsnetAlias(peerIP string) string {
+	canonical, _ := g.resolveTsnetAliasErr(peerIP)
+	return canonical
+}
+
+// resolveTsnetAliasErr is resolveTsnetAlias that also reports a failed
+// WhoIs, which is not the same as a peer with no device: the caller
+// cannot tell whose the address is. It ends the ClaimAliasResolve
+// lookup either way.
+func (g *Gateway) resolveTsnetAliasErr(peerIP string) (string, error) {
 	if g.tsnetLC == nil || g.onboard == nil || peerIP == "" {
-		return ""
+		return "", nil
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	ctx, cancel := context.WithTimeout(context.Background(), aliasWhoIsTimeout)
 	defer cancel()
 	w, err := g.tsnetLC.WhoIs(ctx, net.JoinHostPort(peerIP, "0"))
-	if err != nil || w == nil || w.Node == nil {
-		return ""
+	if err != nil {
+		g.onboard.FinishAliasResolve(peerIP, true)
+		return "", err
+	}
+	defer g.onboard.FinishAliasResolve(peerIP, false)
+	if w == nil || w.Node == nil {
+		return "", nil
 	}
 	nodeID := string(w.Node.StableID)
 	for _, addr := range w.Node.Addresses {
@@ -625,10 +886,10 @@ func (g *Gateway) resolveTsnetAlias(peerIP string) string {
 			continue
 		}
 		if g.onboard.FoldAliasOntoDevice(peerIP, ip, nodeID) {
-			return ip
+			return ip, nil
 		}
 	}
-	return g.onboard.FoldAliasOntoNode(peerIP, nodeID)
+	return g.onboard.FoldAliasOntoNode(peerIP, nodeID), nil
 }
 
 // bindUnboundDevicesFromWhoIs binds every devices row that has no node
@@ -844,7 +1105,7 @@ func (g *Gateway) agentIPFor(c net.Conn) string {
 	// Both functions use the same ClaimAliasResolve guard, so the WhoIs
 	// runs at most once per peer per 5-minute window regardless of which
 	// one is called first.
-	if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(ip, 5*time.Minute) {
+	if g.tsnetLC != nil && g.onboard.ClaimAliasResolve(ip, aliasResolveInterval) {
 		g.resolveTsnetAlias(ip)
 	}
 	return g.onboard.AgentIPFor(ip)
@@ -1955,6 +2216,72 @@ func truncate(s string, n int) string {
 	return s
 }
 
+// dispatchPeerTCP routes one TCP connection from a peer to its handler
+// by destination: the WireGuard promiscuous forwarder and the tsnet
+// exit-node fallback handler share it. A refused peer (peerProfile) is
+// closed before anything else.
+func (g *Gateway) dispatchPeerTCP(c net.Conn, dstIP string, dstPort uint16, dashPort int, dashMux http.Handler) {
+	if g.refuseCutOffConn(c) {
+		return
+	}
+	switch {
+	case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
+		g.handle(c, dstIP, dstPort)
+	case dstPort == 5432:
+		g.handlePostgresConn(c, dstIP)
+	case dstPort == 53:
+		g.handleDNSTCPConn(c, dstIP)
+	case g.dnsvip.IsVIP(dstIP):
+		// Any port on a VIP belongs to the SSH endpoint that
+		// hostname maps to. Future RequiresVIP plugins can
+		// branch on ep.Plugin.Type inside handleVIPConn.
+		g.handleVIPConn(c, dstIP, dstPort)
+	case dashPort != 0 && int(dstPort) == dashPort:
+		_ = http.Serve(&oneShotListener{c: c}, dashMux)
+	default:
+		// Direct-IP dispatch via conn-index: catches
+		// clickhouse_native and friends when the operator
+		// binds them to IP-literal hosts (dnsvip skips
+		// those — they don't need DNS interception). Falls
+		// through to transparent relay when no endpoint
+		// claims the dst.
+		if g.tryDirectIPConn(c, dstIP, dstPort) {
+			return
+		}
+		g.wgRelay(c, dstIP, int(dstPort))
+	}
+}
+
+// dispatchPeerUDP claims a UDP flow from a WireGuard peer, or returns
+// false to hand it to the transparent relay. A refused peer
+// (peerProfile) is claimed and closed.
+func (g *Gateway) dispatchPeerUDP(c net.Conn, dstIP string, dstPort uint16) bool {
+	if g.refuseCutOffConn(c) {
+		return true
+	}
+	switch udpPortDisposition(dstPort) {
+	case udpDNS:
+		g.dnsvip.ServeUDP(c, dstIP)
+		return true
+	case udpRelay:
+		// Claim the flow and drop it when the destination is
+		// one the relay may not dial. Returning false here
+		// would hand it to relayUDP, which is the dial.
+		if err := g.relayDestOK(dstIP); err != nil {
+			log.Printf("relay udp %s:%d: %v", dstIP, dstPort, err)
+			_ = c.Close()
+			return true
+		}
+	case udpDrop:
+		// Already refused by refuseUDPPort before an endpoint
+		// existed; kept so the flow is closed rather than
+		// relayed should the two hooks ever disagree.
+		_ = c.Close()
+		return true
+	}
+	return false
+}
+
 func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 	defer func() { _ = raw.Close() }()
 	defer otelTrackConn("https_mitm")()
@@ -1972,8 +2299,10 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 				g.serveInternal(c, dstIP)
 				return
 			}
-			pip := peerIP(c)
-			profile := g.profileFor(pip)
+			profile, ok := g.servingProfile(c)
+			if !ok {
+				return
+			}
 			ep, authority, certHost := g.httpsMITMEndpoint(profile, dstIP, dstPort)
 			if ep != nil && isHTTPSMITMFamily(ep.Family) {
 				log.Printf("sni-fallback: %s → %s", authority, ep.Name)
@@ -1992,8 +2321,10 @@ func (g *Gateway) handle(raw net.Conn, dstIP string, dstPort uint16) {
 		g.serveInternal(c, internalHostname)
 		return
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	ep, authority, certHost := g.httpsMITMEndpoint(profile, host, dstPort)
 	if ep == nil {
 		policy := g.Policy()
@@ -2117,7 +2448,10 @@ func (g *Gateway) handlePostgresConn(c net.Conn, dstIP string) {
 	defer func() { _ = c.Close() }()
 	defer otelTrackConn("pg_relay")()
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 
 	policy := g.Policy()
@@ -2242,8 +2576,10 @@ func (g *Gateway) handleVIPConn(c net.Conn, dstIP string, dstPort uint16) {
 		_ = c.Close()
 		return
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	policy := g.Policy()
 	// Profile-filter the hits, then port-match. Port match handles
 	// the case where one hostname is bound to multiple endpoints on
@@ -2254,12 +2590,8 @@ func (g *Gateway) handleVIPConn(c net.Conn, dstIP string, dstPort uint16) {
 		if h.Endpoint == nil {
 			continue
 		}
-		if profile != "" {
-			if prof, ok := policy.Profiles[profile]; ok {
-				if _, in := prof.Endpoints[h.Endpoint.Name]; !in {
-					continue
-				}
-			}
+		if !profileHasEndpoint(policy, profile, h.Endpoint.Name) {
+			continue
 		}
 		if dstPort != 0 && h.Port != 0 && dstPort != h.Port {
 			continue
@@ -2295,8 +2627,10 @@ func (g *Gateway) tryDirectIPConn(c net.Conn, dstIP string, dstPort uint16) bool
 	if idx == nil {
 		return false
 	}
-	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return true // refused and closed
+	}
 	policy := g.Policy()
 	candidates := idx.Lookup(dstIP)
 	ep := pickEndpointForProfile(candidates, policy, profile)
@@ -2323,7 +2657,10 @@ func (g *Gateway) dispatchConnEndpoint(c net.Conn, dstIP string, dstPort uint16,
 		return
 	}
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 	policy := g.Policy()
 	mode := ep.Plugin.Type
@@ -2429,22 +2766,33 @@ func (g *Gateway) handleDNSTCPConn(c net.Conn, dstIP string) {
 // touch. Single-tenant configs (no profile bound) fall through to
 // the first candidate.
 func pickEndpointForProfile(candidates []*config.CompiledEndpoint, policy *config.CompiledPolicy, profile string) *config.CompiledEndpoint {
-	if len(candidates) == 0 {
-		return nil
-	}
-	if policy == nil || profile == "" {
-		return candidates[0]
-	}
-	prof, ok := policy.Profiles[profile]
-	if !ok {
-		return candidates[0]
-	}
 	for _, c := range candidates {
-		if _, in := prof.Endpoints[c.Name]; in {
+		if profileHasEndpoint(policy, profile, c.Name) {
 			return c
 		}
 	}
 	return nil
+}
+
+// profileHasEndpoint reports whether a peer served under profile may be
+// routed to the named endpoint.
+//
+// A declared profile reaches the endpoints it carries. A config that
+// declares no profile is single-tenant: nothing scopes endpoints, so
+// every peer reaches every endpoint whatever name it is served under.
+// Once the config declares any profile, a name it does not declare
+// reaches none: it is a device row that outlived its profile block, not
+// a missing mapping.
+func profileHasEndpoint(policy *config.CompiledPolicy, profile, endpoint string) bool {
+	if policy == nil {
+		return true
+	}
+	prof, ok := policy.Profiles[profile]
+	if !ok {
+		return !policy.DeclaresProfiles()
+	}
+	_, in := prof.Endpoints[endpoint]
+	return in
 }
 
 // splice pipes a TLS connection through to the name in its ClientHello
@@ -2734,9 +3082,11 @@ func (g *Gateway) mitmHTTPS(c net.Conn, host string, ep *config.CompiledEndpoint
 }
 
 func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *config.CompiledEndpoint) {
-	agentAddr := peerIP(c)
-	profile := g.profileFor(agentAddr)
-	agentAddr = g.agentIPFor(c)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
+	agentAddr := g.agentIPFor(c)
 	if certHost == "" {
 		certHost = host
 	}
@@ -2883,7 +3233,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			})
 			if err != nil {
 				status, contentType, body := hitlRetryRelayFailure(err)
-				log.Printf("hitl retry rejected %s %s %s operation %q: %v", host, req.Method, req.URL.Path, retryOperationID, err)
+				log.Printf("hitl retry rejected %q %s %q operation %q: %v", host, req.Method, req.URL.Path, retryOperationID, err)
 				_, _ = fmt.Fprintf(tc, "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", status, http.StatusText(status), contentType, len(body), body)
 				ev.Status = strconv.Itoa(status)
 				ev.Action = "hitl_retry_rejected"
@@ -2898,7 +3248,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 			hitlRetryConsumedOperation = &consumed
 			hitlRetryBypassedApproval = true
 			ev.Action = "hitl_retry_approved"
-			log.Printf("hitl retry approved %s %s %s operation %q by %s", host, req.Method, req.URL.Path, retryOperationID, principalID)
+			log.Printf("hitl retry approved %q %s %q operation %q by %s", host, req.Method, req.URL.Path, retryOperationID, principalID)
 		}
 
 		// Approve chain — dispatch each stage to its approver
@@ -2922,7 +3272,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					Now:         time.Now().UTC(),
 				})
 				if err != nil {
-					log.Printf("hitl async operation start %s %s: %v", host, req.URL.Path, err)
+					log.Printf("hitl async operation start %q %q: %v", host, req.URL.Path, err)
 				} else if started {
 					asyncOp = start.Operation
 					asyncSyncWait = start.SyncWaitTimeout
@@ -2943,7 +3293,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 						asyncOp = updated
 					}
 					_ = tc.SetWriteDeadline(time.Now().Add(10 * time.Second))
-					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.Load().PublicURL()); err != nil {
+					if err := writeHITLOperationAcceptedToConn(tc, asyncOp, g.cfg.Load().PublicURL(), ev.ID); err != nil {
 						log.Printf("hitl async pending response write %s: %v", asyncOp.ID, err)
 					}
 					_ = tc.SetWriteDeadline(time.Time{})
@@ -2968,7 +3318,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 				}
 				log.Printf("denied %s %s %s: %s (by %s/%s/%s)",
 					host, req.Method, req.URL.Path, reason, v.ApproverType, v.ApproverName, v.By)
-				_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
+				writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 				ev.Status = "403"
 				ev.Action = "denied"
 				ev.Approver = v.ApproverName
@@ -3010,7 +3360,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					log.Printf("hitl retry transition %s to %s: %v", hitlRetryConsumedOperation.ID, HITLOperationStateUpstreamFailed, err)
 				}
 			}
-			_, _ = fmt.Fprintf(tc, "HTTP/1.1 403 Forbidden\r\nContent-Type: text/plain\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(reason), reason)
+			writeDenied(tc, reason, g.cfg.Load().PublicURL(), ev.ID)
 			ev.Status = "403"
 			ev.Action = "deny"
 			ev.Reason = reason
@@ -3833,9 +4183,9 @@ func runGateway(args []string) {
 		return g.dialer.Dial(network, addr)
 	})
 	if cfg.DashboardConfigWrites() {
-		log.Printf("config: dashboard writes enabled (generated rules can be appended to gateway.hcl)")
+		log.Printf("config: dashboard writes enabled (the dashboard can add rules and manage credentials in %s)", filepath.Base(cfgPath))
 	} else {
-		log.Printf("config: read-only (the dashboard cannot edit gateway.hcl)")
+		log.Printf("config: read-only (the dashboard cannot edit %s)", filepath.Base(cfgPath))
 	}
 	g.secrets = newGatewaySecretStore(db, oauthReg)
 	g.hitl.asyncGrantResolver = g.resolveAsyncHITLGrant
@@ -3961,61 +4311,14 @@ func runGateway(args []string) {
 		dashPort := portOf(dashListen)
 		tcpDispatch := func(c net.Conn, dstIP string, dstPort uint16) {
 			log.Printf("wg-fwd: %s:%d", dstIP, dstPort)
-			switch {
-			case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
-				g.handle(c, dstIP, dstPort)
-			case dstPort == 5432:
-				g.handlePostgresConn(c, dstIP)
-			case dstPort == 53:
-				g.handleDNSTCPConn(c, dstIP)
-			case g.dnsvip.IsVIP(dstIP):
-				// Any port on a VIP belongs to the SSH endpoint that
-				// hostname maps to. Future RequiresVIP plugins can
-				// branch on ep.Plugin.Type inside handleVIPConn.
-				g.handleVIPConn(c, dstIP, dstPort)
-			case dashPort != 0 && int(dstPort) == dashPort:
-				_ = http.Serve(&oneShotListener{c: c}, dashMux)
-			default:
-				// Direct-IP dispatch via conn-index: catches
-				// clickhouse_native and friends when the operator
-				// binds them to IP-literal hosts (dnsvip skips
-				// those — they don't need DNS interception). Falls
-				// through to transparent relay when no endpoint
-				// claims the dst.
-				if g.tryDirectIPConn(c, dstIP, dstPort) {
-					return
-				}
-				g.wgRelay(c, dstIP, int(dstPort))
-			}
+			g.dispatchPeerTCP(c, dstIP, dstPort, dashPort, dashMux)
 		}
 		// UDP: the port decision is udpPortDisposition, shared with the
 		// tsnet catch-all. UDP/443 (QUIC) is refused by refuseUDPPort
 		// before an endpoint exists, so the netstack answers ICMP port
 		// unreachable and the client falls back to TCP/443 at once;
 		// UDP/53 is answered by dnsvip; the rest relays.
-		udpDispatch := func(c net.Conn, dstIP string, dstPort uint16) bool {
-			switch udpPortDisposition(dstPort) {
-			case udpDNS:
-				g.dnsvip.ServeUDP(c, dstIP)
-				return true
-			case udpRelay:
-				// Claim the flow and drop it when the destination is
-				// one the relay may not dial. Returning false here
-				// would hand it to relayUDP, which is the dial.
-				if err := g.relayDestOK(dstIP); err != nil {
-					log.Printf("relay udp %s:%d: %v", dstIP, dstPort, err)
-					_ = c.Close()
-					return true
-				}
-			case udpDrop:
-				// Already refused by refuseUDPPort before an endpoint
-				// existed; kept so the flow is closed rather than
-				// relayed should the two hooks ever disagree.
-				_ = c.Close()
-				return true
-			}
-			return false
-		}
+		udpDispatch := g.dispatchPeerUDP
 		if err := wg.EnablePromiscuousForwarder(tcpDispatch, refuseUDPPort, udpDispatch); err != nil {
 			log.Fatalf("wireguard forwarder: %v", err)
 		}
@@ -4182,23 +4485,7 @@ func runGateway(args []string) {
 			dstIP := dst.Addr().String()
 			dstPort := dst.Port()
 			return func(c net.Conn) {
-				switch {
-				case g.shouldHandleHTTPSMITM(c, dstIP, dstPort):
-					g.handle(c, dstIP, dstPort)
-				case dstPort == 5432:
-					g.handlePostgresConn(c, dstIP)
-				case dstPort == 53:
-					g.handleDNSTCPConn(c, dstIP)
-				case g.dnsvip.IsVIP(dstIP):
-					g.handleVIPConn(c, dstIP, dstPort)
-				case tsnetDashPort != 0 && int(dstPort) == tsnetDashPort:
-					_ = http.Serve(&oneShotListener{c: c}, tsnetDashMux)
-				default:
-					if g.tryDirectIPConn(c, dstIP, dstPort) {
-						return
-					}
-					g.wgRelay(c, dstIP, int(dstPort))
-				}
+				g.dispatchPeerTCP(c, dstIP, dstPort, tsnetDashPort, tsnetDashMux)
 			}, true
 		})
 	}
@@ -4398,7 +4685,10 @@ func (l *oneShotListener) Addr() net.Addr {
 func (g *Gateway) wgRelay(c net.Conn, dstIP string, dstPort int) {
 	defer func() { _ = c.Close() }()
 	pip := peerIP(c)
-	profile := g.profileFor(pip)
+	profile, ok := g.servingProfile(c)
+	if !ok {
+		return
+	}
 	agentPip := g.agentIPFor(c)
 	known := g.onboard == nil || g.onboard.HasDevice(pip) || g.onboard.HasDevice(agentPip)
 	host := fmt.Sprintf("%s:%d", dstIP, dstPort)

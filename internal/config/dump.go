@@ -153,6 +153,13 @@ func dumpDefaults(d *Defaults) map[string]any {
 	if d.HumanOnTimeout != "" {
 		out["human_on_timeout"] = d.HumanOnTimeout
 	}
+	if len(d.NewEndpointRules) > 0 {
+		names := make([]string, 0, len(d.NewEndpointRules))
+		for _, r := range d.NewEndpointRules {
+			names = append(names, r.Name)
+		}
+		out["new_endpoint_rules"] = names
+	}
 	return out
 }
 

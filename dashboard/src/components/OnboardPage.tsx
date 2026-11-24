@@ -3,8 +3,14 @@ import { Button } from "./Button";
 import { Main } from "./Main";
 import { PageTitle } from "./PageTitle";
 
+const HTTP_CONFLICT = 409;
+
 export function OnboardPage({ code }: { code: string }) {
-  const [status, setStatus] = useState<"idle" | "approving" | "approved" | "error">("idle");
+  // "replace": the gateway refused because approving would replace an
+  // existing device (a join from an agent prompt); the operator confirms.
+  const [status, setStatus] = useState<"idle" | "approving" | "approved" | "error" | "replace">(
+    "idle",
+  );
   const [err, setErr] = useState("");
   const [info, setInfo] = useState<{
     user_code?: string;
@@ -29,17 +35,26 @@ export function OnboardPage({ code }: { code: string }) {
       .catch((e) => setErr(String(e)));
   }, [code]);
 
-  async function approve() {
+  async function approve(replace = false) {
     setStatus("approving");
     try {
       const r = await fetch("/api/onboard/approve", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(profile ? { code, profile } : { code }),
+        body: JSON.stringify({
+          code,
+          ...(profile ? { profile } : {}),
+          ...(replace ? { replace } : {}),
+        }),
       });
       if (!r.ok) {
-        setErr(await r.text());
-        setStatus("error");
+        const text = await r.text();
+        if (r.status === HTTP_CONFLICT && text.includes("confirm the replacement")) {
+          setStatus("replace");
+        } else {
+          setErr(text);
+          setStatus("error");
+        }
         return;
       }
       const d = await r.json().catch(() => ({}));
@@ -113,9 +128,20 @@ export function OnboardPage({ code }: { code: string }) {
               )}
 
               {status === "idle" && !info.approved && (
-                <Button size="md" onClick={approve} className="w-full">
+                <Button size="md" onClick={() => approve()} className="w-full">
                   approve
                 </Button>
+              )}
+              {status === "replace" && (
+                <div className="space-y-2">
+                  <div className="text-xs text-amber-600">
+                    Approving replaces the existing device of the same name; its current key stops
+                    working.
+                  </div>
+                  <Button size="md" onClick={() => approve(true)} className="w-full">
+                    replace and approve
+                  </Button>
+                </div>
               )}
               {status === "approving" && <div className="text-xs text-text-muted">approving…</div>}
               {(status === "approved" || info.approved) && (

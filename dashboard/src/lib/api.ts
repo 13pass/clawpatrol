@@ -164,6 +164,69 @@ export async function clearCredential(id: string): Promise<void> {
   if (!r.ok) throw new Error(await r.text());
 }
 
+// Credential declarations the dashboard may change. The gateway
+// refuses a change to a config file marked read-only (one a deploy
+// script renders), so read_only tells the form what to disable.
+export type CredentialConfigFile = { name: string; file: string; read_only: boolean };
+
+export type CredentialConfigOptions = {
+  writes: boolean;
+  // file new declarations are written to.
+  file: string;
+  types: { type: string; fields: string[]; families: string[] }[];
+  endpoints: { name: string; type: string; family: string; hosts?: string }[];
+  // credentials: the names the profile's list holds.
+  profiles: (CredentialConfigFile & { credentials: string[] })[];
+  credentials: Record<
+    string,
+    CredentialConfigFile & { type: string; endpoint?: string; header?: string; prefix?: string }
+  >;
+};
+
+export type CredentialConfigChange = {
+  type?: string;
+  name: string;
+  header?: string;
+  prefix?: string;
+  endpoint?: string;
+  // profiles: every profile that should list it; omitted on an edit, the
+  // profiles stay as they are.
+  profiles?: string[];
+};
+
+export async function getCredentialConfigOptions(): Promise<CredentialConfigOptions> {
+  const r = await api("/api/credentials/options");
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+// CredentialConfigResult: secret_cleared means the credential's stored
+// secret was dropped (a new credential, or one moved to another endpoint)
+// and has to be pasted again.
+export type CredentialConfigResult = { name: string; files: string[]; secret_cleared: boolean };
+
+async function postCredentialConfig(path: string, body: object): Promise<CredentialConfigResult> {
+  const r = await api(path, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function declareCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/declare", change);
+}
+
+export function editCredential(change: CredentialConfigChange): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/edit", change);
+}
+
+export function removeCredential(name: string): Promise<CredentialConfigResult> {
+  return postCredentialConfig("/api/credentials/remove", { name });
+}
+
 export type Session = {
   id: string;
   title?: string;
@@ -186,6 +249,9 @@ export type Agent = {
   hostname: string;
   user: string;
   profile?: string;
+  // Set when `profile` names a profile the config no longer declares.
+  // The gateway serves such a device nothing until it is reassigned.
+  profile_missing?: boolean;
   os: string;
   ua?: string;
   first_at: string;
@@ -237,6 +303,13 @@ export type RuleSummary = {
   // dispatched against. Empty when the rule doesn't filter on
   // credential.
   credential?: string;
+  // file is only set for a member's own rules.
+  file?: string;
+  pinned_profile?: string;
+  // owned is false for a member's rule pinned to a profile they lost.
+  mine?: boolean;
+  owned?: boolean;
+  needs_review?: RuleChange[];
 };
 
 export async function getRules(): Promise<RuleSummary[]> {
@@ -400,8 +473,9 @@ export type HITLPending = {
   body_sample?: string;
   // body_sample is only part of the body (buffer limit or read error).
   body_truncated?: boolean;
-  // The request has a body the gateway did not buffer (only POST, PUT
-  // and PATCH bodies are), so body_sample is empty.
+  // The request declares a body the gateway did not buffer (it buffers
+  // POST, PUT and PATCH bodies, and those of HITL retries), so
+  // body_sample is empty.
   body_not_captured?: boolean;
   // Request headers as the agent sent them, sensitive values masked
   // server-side as "***".
@@ -619,14 +693,16 @@ export function updateUser(
 }
 
 // A request turned into a rule: what it does and how much it matches.
-export type RuleVerdict = "deny" | "allow" | "approve";
-export type RuleScope = "exact" | "any_method" | "pattern" | "any_name";
+// none adds a host no endpoint claimed with only its default rules.
+export type RuleVerdict = "deny" | "allow" | "approve" | "none";
+export type RuleScope = "exact" | "any_method" | "any_path" | "pattern" | "any_name";
 export type RuleRequest = {
   verdict: RuleVerdict;
   scope: RuleScope;
   // approver applies to admins only; a member's own approver is used.
   approver?: string;
   pin_header?: string;
+  condition?: string;
 };
 
 export type ScopedRule = {
@@ -635,12 +711,14 @@ export type ScopedRule = {
   endpoint_name: string;
   family: string;
   condition?: string;
+  hand_written?: boolean;
   credential?: string;
   profile?: string;
   hcl: string;
   warnings?: string[];
   new_endpoint?: boolean;
   profile_additions?: string[];
+  default_rules?: string[];
 };
 
 export type RulePreviewResp = {
@@ -661,6 +739,8 @@ export type RuleChangeResult = {
   ok: boolean;
   rule_name?: string;
   file?: string;
+  endpoint_name?: string;
+  default_rules?: string[];
   pending?: boolean;
   request_id?: number;
 };
@@ -677,6 +757,27 @@ async function postJSON<T>(path: string, body: object): Promise<T> {
 
 export function previewRule(actionID: string, req: RuleRequest) {
   return postJSON<RulePreviewResp>("/api/rules/preview", { action_id: actionID, ...req });
+}
+
+// profile, when set, limits an endpoint rule to that profile.
+export function previewEndpointRule(endpoint: string, profile: string, req: RuleRequest) {
+  return postJSON<RulePreviewResp>("/api/rules/preview", {
+    endpoint,
+    profile: profile || undefined,
+    ...req,
+  });
+}
+
+export function createEndpointRule(endpoint: string, profile: string, req: RuleRequest) {
+  return postJSON<RuleChangeResult>("/api/rules/create", {
+    endpoint,
+    profile: profile || undefined,
+    ...req,
+  });
+}
+
+export function addEndpointDefaultRules(endpoint: string) {
+  return postJSON<RuleChangeResult>("/api/rules/endpoint-defaults", { endpoint });
 }
 
 export function createRule(actionID: string, req: RuleRequest, reason?: string) {
@@ -731,10 +832,20 @@ export type MyRule = {
 
 export type RuleChange = "disable" | "enable" | "delete";
 
+export type RuleEndpoint = {
+  name: string;
+  family: string;
+  profiles: string[];
+  // missing_defaults: the default rules an https endpoint lacks, by name.
+  missing_defaults: string[];
+};
+
 export async function getMyRules(): Promise<{
   file: string;
   rules: MyRule[];
   unavailable?: string;
+  // endpoints an admin may add a rule to.
+  endpoints?: RuleEndpoint[];
 }> {
   const r = await api("/api/my/rules");
   if (!r.ok) throw new Error(await r.text());
@@ -1109,4 +1220,70 @@ export async function oauthExchange(
   });
   if (!r.ok) throw new Error(await r.text());
   return r.json();
+}
+
+// Join intents: the Add device window's Agent prompt (onboard_intent.go).
+export type JoinIntent = {
+  id: string;
+  profile: string;
+  device_name: string;
+  expires_at: number;
+  ca_fingerprint: string;
+};
+
+export type JoinIntentState =
+  | "waiting"
+  | "pending"
+  | "approved"
+  | "joined"
+  | "rejected"
+  | "failed"
+  | "conflict"
+  | "expired";
+
+// by_name: matched by its name only (it predates the recorded OS
+// hostname), so it may be on another machine.
+export type DeviceRef = { name: string; profile: string; by_name?: boolean };
+
+export type JoinIntentStatus = {
+  id: string;
+  state: JoinIntentState;
+  profile: string;
+  expires_at: number;
+  device?: {
+    name: string;
+    os_hostname: string;
+    os_user: string;
+    os: string;
+    user_code: string;
+  };
+  replaces?: DeviceRef;
+  on_machine?: DeviceRef[];
+  warnings?: string[];
+  error?: string;
+};
+
+export function createJoinIntent(profile: string, deviceName: string) {
+  return postJSON<JoinIntent>("/api/onboard/intent", { profile, device_name: deviceName });
+}
+
+// getJoinIntentStatus returns null once the gateway no longer knows the
+// intent (restarted, or past its retention).
+export async function getJoinIntentStatus(id: string): Promise<JoinIntentStatus | null> {
+  const r = await api(`/api/onboard/intent/status?id=${encodeURIComponent(id)}`);
+  if (r.status === 404) return null;
+  if (!r.ok) throw new Error(await r.text());
+  return r.json();
+}
+
+export function rejectJoinIntent(id: string) {
+  return postJSON<JoinIntentStatus>("/api/onboard/intent/reject", { id });
+}
+
+export function approveJoin(code: string, profile: string, replace: boolean) {
+  return postJSON<{ approved?: boolean; profile: string }>("/api/onboard/approve", {
+    code,
+    profile,
+    replace,
+  });
 }

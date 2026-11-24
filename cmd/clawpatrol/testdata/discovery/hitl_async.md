@@ -43,6 +43,8 @@ Endpoints below that may park a request for human approval: admin, deploy, relea
 
 Some gated endpoints do not hold your connection forever. Each such endpoint has a synchronous wait window (its sync_wait_timeout, listed per endpoint below): if a human has not decided within that window, the gateway stops holding the connection and answers with HTTP 202 Accepted. A 202 is NOT success and NOT failure — it means "parked for human approval, continuing asynchronously." Do not treat it as either; switch to polling.
 
+A request whose body the gateway cannot bind to an approval stays synchronous, with no 202: a body larger than the gateway's body buffer limit, a body over the approver's async size limit, a body whose read failed, or a body on a method other than POST, PUT or PATCH (the gateway does not read those). Both limits are gateway settings. The connection is then held until a human decides or the approval times out.
+
 The 202 body is JSON describing the parked operation. The fields you act on:
 - operation_id: the parked operation's id.
 - status_url: the absolute URL to poll for this operation's status (also returned in the Location header). Poll THIS url; do not build your own — the template is /api/hitl/operations/{operation_id}/status.
@@ -63,6 +65,24 @@ You can also GET status_url at any time without a prior 202 to re-check an opera
 Endpoints that fall back to asynchronous approval, and the synchronous wait window before each returns a 202:
 
 - deploy: returns 202 after 1m30s of waiting; the parked operation then stays pollable for 8m30s.
+
+## Proposing a rule
+
+When a rule would help (a request was blocked or held, or you want a guard), you can propose one instead of describing it: build a link and give it to your human. It opens the dashboard's rule dialog filled in; nothing changes until they check the preview and confirm.
+
+- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 (and the 202 of an approval that went asynchronous) carries it ready-made in its X-Clawpatrol-Rule-Link header and in its body, and the request ID in X-Clawpatrol-Request. Give that link as is to let your human choose, or append &verdict=…&condition=…&note=… to fill the dialog in. Anyone who owns your profile can open it, member or admin; a member's rule may go to an admin for review.
+- Otherwise use the endpoint link, with endpoint set to an endpoint name from this manifest. Only an admin of the dashboard can open it.
+
+- verdict: deny, allow (pre-approve) or approve (hold for a human).
+- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL ones have sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link matches requests like that one (same method and path, or same Kubernetes object; a host with no endpoint as a whole), the endpoint link every request to the endpoint. Keep it as narrow as the need.
+- note: one sentence on why, shown to your human.
+- Optional, endpoint link only: approver=<human approver> for verdict approve, profile=<profile> to limit the rule to one profile.
+
+URL-encode every value (encodeURIComponent).
+
+Request link: `https://gw.example.test/#/request/<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
+
+Endpoint link: `https://gw.example.test/#/rules/new?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>`
 
 ## Endpoints (4)
 

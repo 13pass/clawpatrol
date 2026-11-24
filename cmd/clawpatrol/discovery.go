@@ -314,6 +314,20 @@ type DiscoveryManifest struct {
 	// on a non-empty manifest so an agent learns the mechanism before it
 	// trips a gated rule.
 	HITL *DiscoveryHITL `json:"hitl,omitempty"`
+	// RuleLinks tells the agent how to propose a rule to its human, as a
+	// dashboard link. Present when the gateway has a public URL.
+	RuleLinks *DiscoveryRuleLinks `json:"rule_links,omitempty"`
+}
+
+// DiscoveryRuleLinks is how an agent proposes a rule: it builds a
+// dashboard link that opens the rule dialog filled in, and its human
+// checks the preview and creates the rule. Opening it changes nothing.
+type DiscoveryRuleLinks struct {
+	Explanation string `json:"explanation"`
+	// RequestTemplate starts from a refused request, Template from an
+	// endpoint; each value to fill in is between angle brackets.
+	RequestTemplate string `json:"request_template"`
+	Template        string `json:"template"`
 }
 
 // DiscoveryHITL is the profile-scoped human-in-the-loop summary embedded
@@ -556,8 +570,50 @@ func buildDiscoveryManifest(policy *config.CompiledPolicy, profileName string) *
 	// everything actionable, so the pointer would just be noise there.
 	if m.isEmpty() {
 		m.Dashboard = policy.DashboardURL
+	} else if policy.DashboardURL != "" {
+		m.RuleLinks = buildDiscoveryRuleLinks(policy.DashboardURL)
 	}
 	return m
+}
+
+// ruleLinkPath and requestLinkPath are the dashboard routes that open
+// the rule dialog from a link's query parameters: for an endpoint, or
+// for a recorded request.
+const (
+	ruleLinkPath    = "/#/rules/new"
+	requestLinkPath = "/#/request/"
+)
+
+func buildDiscoveryRuleLinks(dashboard string) *DiscoveryRuleLinks {
+	return &DiscoveryRuleLinks{
+		RequestTemplate: dashboardLink(dashboard, requestLinkPath+"<request id>?rule&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
+		Template:        dashboardLink(dashboard, ruleLinkPath+"?endpoint=<endpoint>&verdict=<deny|allow|approve>&condition=<CEL>&note=<why>"),
+		Explanation: "When a rule would help (a request was blocked or held, or you want a guard), " +
+			"you can propose one instead of describing it: build a link and give it to your human. " +
+			"It opens the dashboard's rule dialog filled in; nothing changes until they check the " +
+			"preview and confirm.\n\n" +
+			"- For an HTTPS or Kubernetes request the gateway refused, use the request link. The 403 " +
+			"(and the 202 of an approval that went asynchronous) carries it ready-made in its " +
+			ruleLinkHeader + " header and in its body, and the request ID in " + requestIDHeader +
+			". Give that link as is to let your human choose, or append &verdict=…&condition=…" +
+			"&note=… to fill the dialog in. Anyone who " +
+			"owns your profile can open it, member or admin; a member's rule may go to an admin for " +
+			"review.\n" +
+			"- Otherwise use the endpoint link, with endpoint set to an endpoint name from this " +
+			"manifest. Only an admin of the dashboard can open it.\n\n" +
+			"- verdict: deny, allow (pre-approve) or approve (hold for a human).\n" +
+			"- condition: a CEL expression on the request, e.g. `http.method == 'DELETE'`. " +
+			"HTTP endpoints have http.method, http.path, http.query, http.headers, http.body_json; " +
+			"Kubernetes ones add k8s.verb, k8s.resource, k8s.namespace, k8s.name, k8s.params; SQL " +
+			"ones have sql.verb, sql.tables, sql.function, sql.statement. Omitted, the request link " +
+			"matches requests like that one (same method and path, or same Kubernetes object; a " +
+			"host with no endpoint as a whole), the endpoint link every request to the endpoint. " +
+			"Keep it as narrow as the need.\n" +
+			"- note: one sentence on why, shown to your human.\n" +
+			"- Optional, endpoint link only: approver=<human approver> for verdict approve, " +
+			"profile=<profile> to limit the rule to one profile.\n\n" +
+			"URL-encode every value (encodeURIComponent).",
+	}
 }
 
 // endpointHasHITL reports whether any enabled rule on ep routes matching
@@ -655,6 +711,9 @@ func buildDiscoveryHITL(policy *config.CompiledPolicy, prof *config.CompiledProf
 // and that approver must declare a positive sync_wait_timeout. An endpoint
 // gated only synchronously — dashboard approver, multi-stage chain, or no
 // sync window — reports false and is documented by the synchronous flow.
+// The live rule also refuses per request a body it cannot bind
+// (hitlAsyncBodySkipReason); the manifest explanation says so, since
+// discovery cannot predict it.
 //
 // When several gated rules qualify, the earliest hand-back wins: the agent
 // is told the soonest a request here could go async (smallest sync wait).
@@ -730,6 +789,12 @@ func hitlAsyncManifestExplanation() string {
 		`not decided within that window, the gateway stops holding the connection and answers with `+
 		`HTTP 202 Accepted. A 202 is NOT success and NOT failure — it means "parked for human `+
 		`approval, continuing asynchronously." Do not treat it as either; switch to polling.
+
+A request whose body the gateway cannot bind to an approval stays synchronous, with no 202: `+
+		`a body larger than the gateway's body buffer limit, a body over the approver's async size `+
+		`limit, a body whose read failed, or a body on a method other than POST, PUT or PATCH (the `+
+		`gateway does not read those). Both limits are gateway settings. The connection is then held `+
+		`until a human decides or the approval times out.
 
 The 202 body is JSON describing the parked operation. The fields you act on:
 - operation_id: the parked operation's id.
@@ -1104,6 +1169,13 @@ func (m *DiscoveryManifest) Markdown() string {
 			}
 			b.WriteString("\n")
 		}
+	}
+
+	if m.RuleLinks != nil {
+		b.WriteString("## Proposing a rule\n\n")
+		b.WriteString(m.RuleLinks.Explanation)
+		b.WriteString("\n\nRequest link: `" + m.RuleLinks.RequestTemplate + "`\n\n")
+		b.WriteString("Endpoint link: `" + m.RuleLinks.Template + "`\n\n")
 	}
 
 	fmt.Fprintf(&b, "## Endpoints (%d)\n\n", len(m.Endpoints))

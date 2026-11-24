@@ -25,12 +25,13 @@ type Route =
   | { name: "device"; ip: string }
   | { name: "analytics"; ip?: string }
   | { name: "onboard"; code: string }
-  | { name: "request"; id: string }
+  | { name: "request"; id: string; query: string }
   | { name: "settings" }
   | { name: "plugins" }
   | { name: "users" }
   | { name: "requests" }
   | { name: "rules" }
+  | { name: "rule-link"; query: string }
   | { name: "account" };
 
 function parseRoute(): Route {
@@ -43,7 +44,12 @@ function parseRoute(): Route {
       code: decodeURIComponent(h.slice("#/onboard/".length)),
     };
   const r = h.match(/^#\/request\/([^/]+)$/);
-  if (r) return { name: "request", id: decodeURIComponent(r[1]) };
+  if (r)
+    return {
+      name: "request",
+      id: decodeURIComponent(r[1]),
+      query: qi < 0 ? "" : raw.slice(qi + 1),
+    };
   if (h === "#/settings") return { name: "settings" };
   if (h === "#/plugins") return { name: "plugins" };
   if (h === "#/devices") return { name: "devices" };
@@ -51,6 +57,7 @@ function parseRoute(): Route {
   if (h === "#/users") return { name: "users" };
   if (h === "#/requests") return { name: "requests" };
   if (h === "#/rules") return { name: "rules" };
+  if (h === "#/rules/new") return { name: "rule-link", query: qi < 0 ? "" : raw.slice(qi + 1) };
   if (h === "#/analytics") return { name: "analytics" };
   const a = h.match(/^#\/analytics\/([^/]+)$/);
   if (a) return { name: "analytics", ip: decodeURIComponent(a[1]) };
@@ -68,6 +75,7 @@ export default function App() {
   const [whoami, setWhoami] = useState<Whoami | null>(null);
   const [update, setUpdate] = useState<UpdateBanner | null>(null);
   const [configFile, setConfigFile] = useState<string>("gateway.hcl");
+  const [configWrites, setConfigWrites] = useState(false);
   const [ruleRequestsPending, setRuleRequestsPending] = useState(0);
   const [connectId, setConnectId] = useState<string | null>(null);
   const [route, setRoute] = useState(parseRoute());
@@ -90,6 +98,7 @@ export default function App() {
       setWhoami(s.whoami);
       setUpdate(s.update ?? null);
       if (s.config_file) setConfigFile(s.config_file);
+      setConfigWrites(!!s.dashboard_config_writes);
       setRuleRequestsPending(s.rule_requests_pending ?? 0);
     } catch {
       /* swallow */
@@ -102,8 +111,10 @@ export default function App() {
     return () => clearInterval(t);
   }, []);
 
-  function navigate(hash: string) {
-    window.location.hash = hash;
+  // replace leaves no history entry, so Back does not return to hash.
+  function navigate(hash: string, replace = false) {
+    if (replace) window.location.replace(hash);
+    else window.location.hash = hash;
     setRoute(parseRoute());
   }
 
@@ -112,7 +123,12 @@ export default function App() {
   // admins; those routes land on the account page.
   const isMember = whoami?.role === "member";
   const adminOnlyRoutes = ["users", "plugins"];
-  const shown = isMember && adminOnlyRoutes.includes(route.name) ? "account" : route.name;
+  const shown =
+    isMember && adminOnlyRoutes.includes(route.name)
+      ? "account"
+      : route.name === "rule-link"
+        ? "rules"
+        : route.name;
 
   return (
     <div className="flex flex-col min-h-screen bg-canvas">
@@ -122,8 +138,14 @@ export default function App() {
         <AccountPage whoami={whoami} />
       ) : route.name === "requests" ? (
         <RequestsPage isMember={isMember} />
-      ) : route.name === "rules" ? (
-        <RulesPage isMember={isMember} />
+      ) : route.name === "rules" || route.name === "rule-link" ? (
+        <RulesPage
+          isMember={isMember}
+          ruleLink={route.name === "rule-link" ? route.query : undefined}
+          roleKnown={whoami !== null}
+          publicURL={whoami?.public_url}
+          onRuleLinkDone={() => navigate("#/rules", true)}
+        />
       ) : route.name === "users" ? (
         <UsersPage whoami={whoami} />
       ) : route.name === "main" ? (
@@ -147,7 +169,14 @@ export default function App() {
       ) : route.name === "analytics" ? (
         <AnalyticsPage ip={route.ip} agents={agents} />
       ) : route.name === "request" ? (
-        <RequestDetailPage id={route.id} agents={agents} whoami={whoami} />
+        <RequestDetailPage
+          key={route.id}
+          id={route.id}
+          agents={agents}
+          whoami={whoami}
+          ruleLink={route.query || undefined}
+          onRuleLinkDone={() => navigate(`#/request/${encodeURIComponent(route.id)}`, true)}
+        />
       ) : route.name === "onboard" ? (
         <OnboardPage code={route.code} />
       ) : route.name === "settings" ? (
@@ -165,6 +194,8 @@ export default function App() {
           agents={agents}
           integrations={integrations}
           configFile={configFile}
+          canEditCredentials={!isMember && configWrites}
+          isMember={isMember}
           onBack={() => navigate("")}
           onConnect={(id) => setConnectId(id)}
           onRefresh={refresh}

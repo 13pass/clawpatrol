@@ -16,11 +16,17 @@ import { Modal } from "./Modal";
 import { Headers, Section } from "./RequestDetailPage";
 
 const POLL_MS = 1000;
+// A poll that has not answered by then is abandoned, so one hung
+// request cannot stop the bar from polling.
+const POLL_TIMEOUT_MS = 5000;
+// After this many failed polls in a row the bar says its list may be
+// out of date, until a poll succeeds.
+const STALE_AFTER_FAILURES = 3;
 // How long a card stays up after its request leaves the pool.
 const FLASH_MS = 2500;
 
 type Outcome = "approved" | "denied" | "gone";
-type Resolved = { item: HITLPending; outcome: Outcome };
+type Resolved = { item: HITLPending; outcome: Outcome; key: number };
 type DecideFn = (item: HITLPending, allow: boolean) => void;
 
 // agentIP, when set, scopes the bar to a single device's pending
@@ -35,6 +41,7 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   const [pending, setPending] = useState<HITLPending[]>([]);
   const [resolved, setResolved] = useState<Resolved[]>([]);
   const [notice, setNotice] = useState("");
+  const [stale, setStale] = useState(false);
   // The request open in the details dialog. It is kept after the
   // request leaves the pool so the dialog can say so instead of
   // vanishing under the reader.
@@ -42,20 +49,28 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   // The poller compares against the last list it showed to spot
   // requests decided elsewhere, timed out or abandoned, and skips the
   // ones decided here so an in-flight poll cannot bring them back.
-  // Polls can overlap, so a response older than one already applied
-  // is dropped.
   const shown = useRef<HITLPending[]>([]);
   const decided = useRef(new Set<string>());
 
   useEffect(() => {
-    const stopped = new AbortController();
-    const polls = { sent: 0, applied: 0 };
+    // Each poll is scheduled when the previous one ends, so polls never
+    // overlap and their responses arrive in order. The poll in flight is
+    // aborted by its own timeout or by unmount.
+    const run: {
+      stopped?: boolean;
+      failures: number;
+      poll?: AbortController;
+      timer?: ReturnType<typeof setTimeout>;
+    } = { failures: 0 };
     async function tick() {
-      const seq = ++polls.sent;
+      const poll = new AbortController();
+      const timeout = setTimeout(() => poll.abort(), POLL_TIMEOUT_MS);
+      run.poll = poll;
       try {
-        const r = await getHITLPending(stopped.signal);
-        if (stopped.signal.aborted || seq < polls.applied) return;
-        polls.applied = seq;
+        const r = await getHITLPending(poll.signal);
+        if (run.stopped) return;
+        run.failures = 0;
+        setStale(false);
         const scoped = (r ?? []).filter((p) => !agentIP || p.agent_ip === agentIP);
         const live = new Set(scoped.map((p) => p.id));
         for (const id of decided.current) if (!live.has(id)) decided.current.delete(id);
@@ -66,14 +81,19 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
         setPending(incoming);
         flash(setResolved, gone, "gone");
       } catch {
-        /* ignore transient */
+        // One failure is transient; a run of them means the list shown
+        // can no longer be trusted.
+        if (!run.stopped && ++run.failures >= STALE_AFTER_FAILURES) setStale(true);
+      } finally {
+        clearTimeout(timeout);
       }
+      if (!run.stopped) run.timer = setTimeout(tick, POLL_MS);
     }
     tick();
-    const t = setInterval(tick, POLL_MS);
     return () => {
-      stopped.abort();
-      clearInterval(t);
+      run.stopped = true;
+      run.poll?.abort();
+      clearTimeout(run.timer);
     };
   }, [agentIP]);
 
@@ -104,19 +124,25 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
     }
   }
 
-  if (pending.length === 0 && resolved.length === 0 && !notice && !details) return null;
+  if (pending.length === 0 && resolved.length === 0 && !notice && !details && !stale) return null;
 
   const liveDetails = details && pending.find((p) => p.id === details.id);
 
   return (
     <div className="space-y-1.5">
+      {stale && (
+        <div className="px-4 py-2 text-xs text-rust-700 bg-canvas border-1.5 border-rust-200">
+          Approval list may be out of date: the gateway has not answered the last few checks.
+          Requests shown here may already be decided, and new ones may be missing.
+        </div>
+      )}
       {notice && (
         <div className="px-4 py-2 text-xs text-rust-700 bg-canvas border-1.5 border-rust-200">
           {notice}
         </div>
       )}
       {resolved.map((r) => (
-        <ResolvedCard key={r.item.id} item={r.item} outcome={r.outcome} />
+        <ResolvedCard key={r.key} item={r.item} outcome={r.outcome} />
       ))}
       {pending.map((p) => (
         <PendingCard key={p.id} item={p} onDecide={decide} onDetails={() => setDetails(p)} />
@@ -133,17 +159,22 @@ function ScopedHITLBar({ agentIP }: { agentIP?: string }) {
   );
 }
 
-// flash shows items as resolved cards for FLASH_MS.
+let flashSeq = 0;
+
+// flash shows items as resolved cards for FLASH_MS, replacing any card
+// already up for the same request. Each card has its own key, so an
+// older card's timer cannot remove a newer one.
 function flash(
   setResolved: Dispatch<SetStateAction<Resolved[]>>,
   items: HITLPending[],
   outcome: Outcome,
 ) {
   if (items.length === 0) return;
+  const added = items.map((item) => ({ item, outcome, key: ++flashSeq }));
   const ids = new Set(items.map((i) => i.id));
-  const others = (r: Resolved[]) => r.filter((x) => !ids.has(x.item.id));
-  setResolved((r) => [...others(r), ...items.map((item) => ({ item, outcome }))]);
-  setTimeout(() => setResolved(others), FLASH_MS);
+  const keys = new Set(added.map((a) => a.key));
+  setResolved((r) => [...r.filter((x) => !ids.has(x.item.id)), ...added]);
+  setTimeout(() => setResolved((r) => r.filter((x) => !keys.has(x.key))), FLASH_MS);
 }
 
 // hitlTarget labels a request the same way on the card, in the dialog
@@ -326,8 +357,8 @@ function HITLDetailsModal({
             )}
             {item.body_not_captured && (
               <DetailsNote>
-                The gateway does not capture {item.method} bodies. This request has one, and it goes
-                upstream without being shown here.
+                The gateway does not capture {item.method} bodies, and this request declares one.
+                Whatever it holds goes upstream without being shown here.
               </DetailsNote>
             )}
             {item.body_sample && <ApprovalBody text={item.body_sample} />}

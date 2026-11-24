@@ -17,6 +17,7 @@ import (
 	neturl "net/url"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -58,7 +59,7 @@ func reorderJoinArgsForFlagParse(args []string) []string {
 		// Every flag that takes a separate value belongs here, or the
 		// value is left behind as a positional and the gateway URL is
 		// consumed as the flag's value instead.
-		case "hostname", "profile", "name", "ca-dir", "ca-fingerprint":
+		case "hostname", "profile", "name", "ca-dir", "ca-fingerprint", "intent":
 			if !hasValue && i+1 < len(args) {
 				i++
 				flags = append(flags, args[i])
@@ -106,6 +107,7 @@ func runJoin(args []string) {
 	wholeMachine := fs.Bool("whole-machine", false, "bring up wg-quick to route ALL host traffic through the gateway (default: persist conf only, use `clawpatrol run` for per-process routing)")
 	profile := fs.String("profile", "", "profile to assign at approval time (defaults to the gateway's default profile if the approver doesn't pick one)")
 	hostname := fs.String("hostname", "", "device name to register with the gateway (defaults to os.Hostname)")
+	intent := fs.String("intent", "", "join intent from the dashboard's Add device → Agent prompt: the gateway names the device <machine>-<account>, assigns the profile chosen there, and the operator approves it in that window")
 	loginFlag := fs.Bool("login", false, "interactively log in to the gateway's tailnet first (use when the gateway has no public URL). The temporary tailnet credentials are discarded once the gateway-minted device identity lands.")
 	_ = fs.Parse(reorderJoinArgsForFlagParse(args))
 	rest := fs.Args()
@@ -115,6 +117,18 @@ func runJoin(args []string) {
 	gatewayURL, err := validateGatewayURL(rest[0])
 	if err != nil {
 		fail("%v", err)
+	}
+	if *intent != "" {
+		for flagName, set := range map[string]bool{
+			"--whole-machine": *wholeMachine,
+			"--profile":       *profile != "",
+			"--hostname":      *hostname != "",
+			"--login":         *loginFlag,
+		} {
+			if set {
+				fail("--intent cannot be combined with %s: the dashboard chose the device's name, profile and mode", flagName)
+			}
+		}
 	}
 	// Normalize the pin up front: a malformed --ca-fingerprint is an operator
 	// error worth reporting now, not a pin that silently cannot match later.
@@ -206,7 +220,10 @@ func runJoin(args []string) {
 	// gateway recognises as a dashboard operator. The standard path
 	// (no bootstrap, just preJoinFetchCA over public Funnel) has no
 	// authenticated identity and must wait for the dashboard click.
-	autoApprove := bootstrap != nil
+	// An intent join is approved in the operator's Add device window,
+	// which also confirms any device it replaces.
+	autoApprove := bootstrap != nil && *intent == ""
+	setup.intent = *intent
 	wgMode, err := onboardViaDeviceFlow(gatewayURL, *wholeMachine, *profile, *hostname, &setup, *skipTrust, joinHTTPCli, autoApprove)
 	if err != nil {
 		fail("join: %v", err)
@@ -317,6 +334,7 @@ type joinSetup struct {
 	caFingerprint string // SHA-256 of the fetched cert (operator-readable)
 	pinnedCAFP    string // --ca-fingerprint: the CA the operator authorised
 	shellRC       bool   // shell rc updated with `eval "$(clawpatrol env)"`
+	intent        string // --intent: the dashboard join intent sent at /api/onboard/start
 }
 
 // caFingerprintHexDigits is the length of a SHA-256 digest written as hex —
@@ -1352,6 +1370,20 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 	if wholeMachine {
 		q.Set("whole_machine", "1")
 	}
+	// Shown to the approver, and the gateway names an intent join
+	// <machine>-<account> so devices of several accounts on one machine
+	// stay apart.
+	if u := currentOSUser(); u != "" {
+		q.Set("os_user", u)
+	}
+	q.Set("os", runtime.GOOS)
+	intent := ""
+	if setup != nil {
+		intent = setup.intent
+	}
+	if intent != "" {
+		q.Set("intent", intent)
+	}
 	startURL := gateway + "/api/onboard/start"
 	if encoded := q.Encode(); encoded != "" {
 		startURL += "?" + encoded
@@ -1467,9 +1499,13 @@ func onboardViaDeviceFlow(gateway string, wholeMachine bool, profile, hostname s
 		// are unreachable from the joining machine until approval lands,
 		// so show a QR to scan from a phone / tailnet device. For a
 		// publicly reachable URL, skip the QR and just open a browser.
+		// One plain line for an agent running the join to read and relay.
+		fmt.Println("CLAWPATROL_USER_CODE=" + start.UserCode)
 		tailnetOnly := isTailnetOnlyURL(start.VerifyURL)
 		detail := linkDetail(start.VerifyURL, tailnetOnly)
-		if !tailnetOnly {
+		// The operator of an intent join already has the Add device
+		// window open; the browser here may not even be theirs.
+		if !tailnetOnly && intent == "" {
 			tryOpen(start.VerifyURL)
 		}
 		// CA fingerprint with the why: the staged CA came from a transport no
@@ -2366,4 +2402,13 @@ func pingGateway(endpoint string) bool {
 	}
 	_ = c.Close()
 	return true
+}
+
+// currentOSUser names the account running the join, as the gateway
+// shows it and uses in an intent join's device name.
+func currentOSUser() string {
+	if u, err := user.Current(); err == nil && u.Username != "" {
+		return u.Username
+	}
+	return os.Getenv("USER")
 }

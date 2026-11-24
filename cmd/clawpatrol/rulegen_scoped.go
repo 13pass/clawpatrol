@@ -7,11 +7,15 @@ import (
 	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 
 	"github.com/denoland/clawpatrol/internal/config"
 	"github.com/denoland/clawpatrol/internal/config/facet"
 	"github.com/denoland/clawpatrol/internal/config/match"
 	"github.com/denoland/clawpatrol/internal/config/runtime"
+	"github.com/google/cel-go/cel"
+	celast "github.com/google/cel-go/common/ast"
+	"github.com/google/cel-go/common/operators"
 	"github.com/hashicorp/hcl/v2/hclsyntax"
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -23,10 +27,14 @@ const (
 	ruleVerdictDeny    = "deny"
 	ruleVerdictAllow   = "allow"
 	ruleVerdictApprove = "approve"
+	// ruleVerdictNone adds a host with only the default rules: an admin's
+	// choice for a request no endpoint claimed.
+	ruleVerdictNone = "none"
 
 	ruleScopeExact     = "exact"      // the request's method and path (or SQL / k8s facets)
 	ruleScopeAnyMethod = "any_method" // HTTP: the path, any method
 	ruleScopePattern   = "pattern"    // HTTP: the method, path with ID segments generalized
+	ruleScopeAnyPath   = "any_path"   // HTTP: the method, any path
 	ruleScopeAnyName   = "any_name"   // k8s: verb, resource and namespace, any object name
 )
 
@@ -42,6 +50,8 @@ const (
 // dashboardApproverRef routes "require approval" to the dashboard when
 // the author has no approver of their own.
 const dashboardApproverRef = "builtin.dashboard"
+
+const memberConditionMaxBytes = 4096
 
 // patternMinHexSegment is the shortest all-hex path segment the
 // pattern scope treats as an ID (commit SHAs, hex tokens).
@@ -64,6 +74,8 @@ type RuleRequest struct {
 	// PinHeader, when set, limits an HTTP rule to requests carrying the
 	// recorded value of this header — e.g. the API service's caller ID.
 	PinHeader string `json:"pin_header,omitempty"`
+	// Condition replaces the one Scope and PinHeader generate.
+	Condition string `json:"condition,omitempty"`
 }
 
 // RuleAuthor scopes a generated rule to a member. A nil author is an
@@ -90,9 +102,22 @@ type ScopedRule struct {
 	// ProfileAdditions.
 	NewEndpoint      bool     `json:"new_endpoint,omitempty"`
 	ProfileAdditions []string `json:"profile_additions,omitempty"`
+	DefaultRules     []string `json:"default_rules,omitempty"`
+	HandWritten      bool     `json:"hand_written,omitempty"`
 
 	// credentialRef is Credential as a typed HCL reference.
 	credentialRef string
+	scope         string
+	matcher       match.Matcher
+}
+
+// newHostConfig is what a rule for a host with no endpoint needs from
+// the config files.
+type newHostConfig struct {
+	// readOnlyProfiles maps a profile to the file declaring it, when the
+	// dashboard may not change that file.
+	readOnlyProfiles map[string]string
+	defaultRules     []*hclwrite.Block
 }
 
 // GenerateScopedRule turns a recorded request into a rule. For a member
@@ -100,6 +125,10 @@ type ScopedRule struct {
 // credential, named under the member's prefix, and held to
 // memberRulePriority.
 func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor) (*ScopedRule, error) {
+	return generateScopedRule(policy, ev, req, author, newHostConfig{})
+}
+
+func generateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor, newHost newHostConfig) (*ScopedRule, error) {
 	if policy == nil {
 		return nil, fmt.Errorf("policy not loaded")
 	}
@@ -108,12 +137,17 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 	}
 	switch req.Verdict {
 	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
+	case ruleVerdictNone:
+		if ev.Endpoint != "" || author != nil {
+			return nil, fmt.Errorf("only an admin adds a host without a rule, from a request no endpoint claimed")
+		}
 	default:
-		return nil, fmt.Errorf("verdict must be deny, allow or approve")
+		return nil, fmt.Errorf("verdict must be deny, allow, approve or none")
 	}
 	if req.Scope == "" {
 		req.Scope = ruleScopeExact
 	}
+	req.Condition = strings.TrimSpace(req.Condition)
 	if author != nil {
 		if ev.Profile == "" {
 			return nil, fmt.Errorf("this request has no recorded profile, so no member rule can be scoped to it")
@@ -121,15 +155,39 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		req.Approver = author.Approver
 	}
 	if ev.Endpoint == "" {
-		return generateScopedHostRule(policy, ev, req, author)
+		return generateScopedHostRule(policy, ev, req, author, newHost)
 	}
 	ep := policy.Endpoints[ev.Endpoint]
 	if ep == nil {
 		return nil, fmt.Errorf("endpoint %q no longer in policy", ev.Endpoint)
 	}
-	condition, warnings, err := scopedRuleCondition(ep.Family, ev, req)
-	if err != nil {
-		return nil, err
+	condition, warnings, genErr := scopedRuleCondition(ep.Family, ev, req)
+	var matcher match.Matcher
+	if req.Condition != "" && genErr == nil && req.Condition == condition {
+		// Edited back to, or never changed from, the generated condition:
+		// it is the generated rule, under the generated rule's name.
+		req.Condition = ""
+	}
+	if req.Condition != "" {
+		m, bodyWarnings, err := handWrittenMatcher(ep.Family, req.Condition)
+		if err != nil {
+			return nil, err
+		}
+		if author != nil {
+			if len(req.Condition) > memberConditionMaxBytes {
+				return nil, fmt.Errorf("the condition is longer than %d bytes", memberConditionMaxBytes)
+			}
+			if err := checkMemberCondition(req.Condition); err != nil {
+				return nil, fmt.Errorf("condition: %w", err)
+			}
+		}
+		matcher = m
+		// The condition replaces what the scope and header pin generate,
+		// so neither is checked nor part of the name.
+		condition, warnings = req.Condition, bodyWarnings
+		req.Scope, req.PinHeader = "", ""
+	} else if genErr != nil {
+		return nil, genErr
 	}
 	rule := &ScopedRule{
 		RuleName:     scopedRuleName(author, req, ev, ep.Name),
@@ -138,6 +196,9 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 		Family:       ep.Family,
 		Condition:    condition,
 		Warnings:     warnings,
+		HandWritten:  req.Condition != "",
+		scope:        req.Scope,
+		matcher:      matcher,
 	}
 	if author != nil {
 		rule.Profile = ev.Profile
@@ -156,15 +217,17 @@ func GenerateScopedRule(policy *config.CompiledPolicy, ev *Event, req RuleReques
 
 // generateScopedHostRule handles a request no endpoint claimed: it
 // declares an endpoint for the host, a passthrough credential that
-// claims it for the author's profile (every profile, for an admin),
-// and the rule. Such a host already passes through, so only deny and
-// approve make sense.
-func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor) (*ScopedRule, error) {
+// claims it for the author's profile (every profile the dashboard may
+// change, for an admin), and the rule. An admin's endpoint also gets
+// the defaults.new_endpoint_rule rules, and may skip the rule
+// (ruleVerdictNone). Such a host already passes through, so allow
+// means nothing.
+func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRequest, author *RuleAuthor, newHost newHostConfig) (*ScopedRule, error) {
 	if req.Verdict == ruleVerdictAllow {
 		return nil, fmt.Errorf("this host matched no endpoint, so it already passes through; only deny or approve apply")
 	}
-	if req.Scope != ruleScopeExact {
-		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact)")
+	if req.Scope != ruleScopeExact || req.Condition != "" {
+		return nil, fmt.Errorf("a host with no endpoint can only be ruled as a whole (scope exact, no condition)")
 	}
 	host := canonicalObservedHost(ev.Host)
 	if host == "" {
@@ -180,18 +243,41 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 		endpointName = uniqueEndpointName(policy, author.Username+"-"+endpointName)
 	}
 	credName := generatedPassthroughCredName(policy, endpointName)
-	rule := &ScopedRule{
-		RuleName:     scopedRuleName(author, req, ev, endpointName),
-		Verdict:      req.Verdict,
-		EndpointName: endpointName,
-		Family:       "http",
-		NewEndpoint:  true,
+	credRef := "passthrough." + credName
+
+	var profiles, warnings []string
+	for _, profile := range hostRuleProfiles(policy, ev, author) {
+		file, readOnly := newHost.readOnlyProfiles[profile]
+		switch {
+		case !readOnly:
+			profiles = append(profiles, profile)
+		case author != nil:
+			return nil, fmt.Errorf("your profile %q is declared in %s, which the dashboard does not change: "+
+				"ask an admin to declare an endpoint for %s in the HCL files and add its credential to the profile there", profile, file, host)
+		default:
+			warnings = append(warnings, fmt.Sprintf("Profile %s is declared in %s, which the dashboard does not change, so it does not get this endpoint "+
+				"and its requests to %s keep passing through. To include it, add %s to its credentials in that file.", profile, file, host, credRef))
+		}
 	}
-	rule.ProfileAdditions = hostRuleProfiles(policy, ev, author)
+	if len(profiles) == 0 {
+		return nil, fmt.Errorf("every profile is declared in a file the dashboard does not change: declare the endpoint for %s in the HCL files", host)
+	}
+
+	rule := &ScopedRule{
+		Verdict:          req.Verdict,
+		EndpointName:     endpointName,
+		Family:           "http",
+		NewEndpoint:      true,
+		ProfileAdditions: profiles,
+		scope:            req.Scope,
+	}
+	if req.Verdict != ruleVerdictNone {
+		rule.RuleName = scopedRuleName(author, req, ev, endpointName)
+	}
 	if author != nil {
 		rule.Profile = ev.Profile
 		rule.Credential = credName
-		rule.credentialRef = "passthrough." + credName
+		rule.credentialRef = credRef
 	}
 
 	f := hclwrite.NewEmptyFile()
@@ -200,15 +286,33 @@ func generateScopedHostRule(policy *config.CompiledPolicy, ev *Event, req RuleRe
 	f.Body().AppendNewline()
 	cb := f.Body().AppendNewBlock("credential", []string{"passthrough", credName}).Body()
 	cb.SetAttributeRaw("endpoint", config.TraversalTokens("https."+endpointName))
-	f.Body().AppendNewline()
-	writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
-	for _, profile := range rule.ProfileAdditions {
+	if author == nil {
+		names, err := appendNewEndpointRules(f, endpointName, newHost.defaultRules)
+		if err != nil {
+			return nil, err
+		}
+		rule.DefaultRules = names
+	}
+	if rule.RuleName != "" {
+		f.Body().AppendNewline()
+		writeScopedRuleBlock(f.Body(), rule, "https."+endpointName, req, author)
+	}
+	for _, profile := range profiles {
 		f.Body().AppendNewline()
 		pb := f.Body().AppendNewBlock("profile", []string{profile}).Body()
-		config.SetIdentList(pb, "credentials", []string{"passthrough." + credName})
+		config.SetIdentList(pb, "credentials", []string{credRef})
 	}
 	rule.HCL = string(f.Bytes())
-	rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
+	if author != nil {
+		rule.Warnings = append(rule.Warnings, "This request matched no endpoint: the rule declares one for "+host+" and a passthrough credential that claims it.")
+	} else {
+		rule.Warnings = append(rule.Warnings, "This request matched no endpoint: saving declares "+endpointName+" for "+host+
+			", claimed by a passthrough credential until you add its credential on a device's Credentials panel.")
+		if len(rule.DefaultRules) == 0 && rule.RuleName == "" {
+			rule.Warnings = append(rule.Warnings, "defaults declares no new_endpoint_rule, so every request to "+host+" is allowed until you add a rule.")
+		}
+	}
+	rule.Warnings = append(rule.Warnings, warnings...)
 	return rule, nil
 }
 
@@ -235,7 +339,11 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 	if rule.Profile != "" {
 		b.SetAttributeRaw("profile", config.TraversalTokens("profile."+rule.Profile))
 	}
-	if rule.Condition != "" {
+	switch {
+	case rule.HandWritten:
+		// Written as typed: re-laying it out could change its meaning.
+		b.SetAttributeValue("condition", cty.StringVal(rule.Condition))
+	case rule.Condition != "":
 		setCELCondition(b, rule.Condition)
 	}
 	by := "an admin"
@@ -263,19 +371,153 @@ func writeScopedRuleBlock(body *hclwrite.Body, rule *ScopedRule, endpoint string
 	}
 }
 
+var parseOnlyCELEnv = sync.OnceValues(func() (*cel.Env, error) { return cel.NewEnv() })
+
+// checkMemberCondition holds a member's condition to what generated ones
+// do: no loop inside a loop, whose cost on every request is the product
+// of the lists, and headers only by a quoted name that is not masked.
+// Text the plain parser cannot read is refused, so facet syntax cannot
+// slip past.
+func checkMemberCondition(condition string) error {
+	env, err := parseOnlyCELEnv()
+	if err != nil {
+		return err
+	}
+	parsed, iss := env.Parse(condition)
+	if iss.Err() != nil {
+		return fmt.Errorf("this condition uses syntax only admins can use: %w", iss.Err())
+	}
+	root := celast.NavigateAST(parsed.NativeRep())
+	for _, loop := range celast.MatchDescendants(root, celast.KindMatcher(celast.ComprehensionKind)) {
+		if len(celast.MatchDescendants(loop, celast.KindMatcher(celast.ComprehensionKind))) > 1 {
+			return fmt.Errorf("a loop (all, exists, exists_one, map, filter) inside another is for admins only, as it runs on every request")
+		}
+	}
+	for _, headers := range celast.MatchDescendants(root, isHTTPHeaders) {
+		name, ok := quotedHeaderName(headers)
+		if !ok {
+			return fmt.Errorf("read a header by its quoted name: 'X-Name' in http.headers && http.headers['X-Name']")
+		}
+		if runtime.IsSensitiveHeader(name) {
+			return fmt.Errorf("header %q may carry a credential and cannot be in a rule", name)
+		}
+	}
+	return nil
+}
+
+func isHTTPHeaders(e celast.NavigableExpr) bool {
+	if e.Kind() != celast.SelectKind || e.AsSelect().FieldName() != "headers" {
+		return false
+	}
+	operand := e.AsSelect().Operand()
+	return operand.Kind() == celast.IdentKind && operand.AsIdent() == "http"
+}
+
+func quotedHeaderName(headers celast.NavigableExpr) (string, bool) {
+	parent, ok := headers.Parent()
+	if !ok || parent.Kind() != celast.CallKind {
+		return "", false
+	}
+	call := parent.AsCall()
+	args := call.Args()
+	var key celast.Expr
+	switch {
+	case call.FunctionName() == operators.Index && len(args) == 2 && args[0].ID() == headers.ID():
+		key = args[1]
+	case call.FunctionName() == operators.In && len(args) == 2 && args[1].ID() == headers.ID():
+		key = args[0]
+	default:
+		return "", false
+	}
+	if key.Kind() != celast.LiteralKind {
+		return "", false
+	}
+	name, ok := key.AsLiteral().Value().(string)
+	return name, ok
+}
+
 func approverListTokens(ref string) hclwrite.Tokens {
 	tokens := hclwrite.Tokens{{Type: hclsyntax.TokenOBrack, Bytes: []byte("[")}}
 	tokens = append(tokens, config.TraversalTokens(ref)...)
 	return append(tokens, &hclwrite.Token{Type: hclsyntax.TokenCBrack, Bytes: []byte("]")})
 }
 
-func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName string) string {
-	prefix := map[string]string{
+func handWrittenMatcher(family, condition string) (match.Matcher, []string, error) {
+	m, err := facet.NewMatcher(family, condition)
+	if err != nil {
+		return nil, nil, fmt.Errorf("condition: %w", err)
+	}
+	var warnings []string
+	if m.InspectsTruncatableFacet() {
+		warnings = append(warnings, "The preview replays recorded requests without their bodies, so it does not count matches on the body.")
+	}
+	return m, warnings, nil
+}
+
+// GenerateEndpointRule is an admin's rule for an endpoint, with no
+// request to generate the condition from: the condition is the one
+// written, or none for a rule on every request. A profile, when set,
+// limits it to that profile.
+func GenerateEndpointRule(policy *config.CompiledPolicy, endpoint, profile string, req RuleRequest) (*ScopedRule, error) {
+	if policy == nil {
+		return nil, fmt.Errorf("policy not loaded")
+	}
+	switch req.Verdict {
+	case ruleVerdictDeny, ruleVerdictAllow, ruleVerdictApprove:
+	default:
+		return nil, fmt.Errorf("verdict must be deny, allow or approve")
+	}
+	ep := policy.Endpoints[endpoint]
+	if ep == nil {
+		return nil, fmt.Errorf("no endpoint %q", endpoint)
+	}
+	if profile != "" && (policy.Profiles[profile] == nil || policy.Profiles[profile].Endpoints[endpoint] == nil) {
+		return nil, fmt.Errorf("profile %q does not reach endpoint %q", profile, endpoint)
+	}
+	req.Condition = strings.TrimSpace(req.Condition)
+	req.Scope, req.PinHeader = "", ""
+	sum := sha256.Sum256([]byte(strings.Join([]string{endpoint, profile, req.Verdict, req.Approver, req.Condition}, "\x00")))
+	rule := &ScopedRule{
+		RuleName:     fmt.Sprintf("%s_%s_%x", ruleNamePrefix(req.Verdict), safeRuleNamePart(ep.Name), sum[:3]),
+		Verdict:      req.Verdict,
+		EndpointName: ep.Name,
+		Family:       ep.Family,
+		Condition:    req.Condition,
+		Profile:      profile,
+		HandWritten:  req.Condition != "",
+	}
+	if req.Condition != "" {
+		m, warnings, err := handWrittenMatcher(ep.Family, req.Condition)
+		if err != nil {
+			return nil, err
+		}
+		rule.matcher, rule.Warnings = m, warnings
+	}
+	if req.Verdict == ruleVerdictAllow {
+		rule.Warnings = append(rule.Warnings, fmt.Sprintf("A pre-approval at priority %d is tried before the endpoint's rules of lower priority, deny rules included: the requests it matches skip them.", adminGuardrailPriority))
+	}
+	f := hclwrite.NewEmptyFile()
+	writeScopedRuleBlock(f.Body(), rule, endpointRef(ep), req, nil)
+	rule.HCL = string(f.Bytes())
+	return rule, nil
+}
+
+func ruleNamePrefix(verdict string) string {
+	return map[string]string{
 		ruleVerdictDeny:    "block",
 		ruleVerdictAllow:   "allow",
 		ruleVerdictApprove: "approve",
-	}[req.Verdict]
-	sumInput := strings.Join([]string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader}, "\x00")
+	}[verdict]
+}
+
+func scopedRuleName(author *RuleAuthor, req RuleRequest, ev *Event, endpointName string) string {
+	prefix := ruleNamePrefix(req.Verdict)
+	fields := []string{ev.ID, ev.Endpoint, ev.Method, ev.Path, req.Verdict, req.Scope, req.PinHeader}
+	if req.Condition != "" {
+		// Only then: a generated rule keeps the name it always had.
+		fields = append(fields, req.Condition)
+	}
+	sumInput := strings.Join(fields, "\x00")
 	sum := sha256.Sum256([]byte(sumInput))
 	name := fmt.Sprintf("%s_%s_%x", prefix, safeRuleNamePart(endpointName), sum[:3])
 	if author != nil {
@@ -348,6 +590,11 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 			return "", nil, fmt.Errorf("no request path was recorded")
 		}
 		parts = append(parts, "http.path == "+celString(path))
+	case ruleScopeAnyPath:
+		if method == "" {
+			return "", nil, fmt.Errorf("no request method was recorded")
+		}
+		parts = append(parts, "http.method == "+celString(method))
 	case ruleScopePattern:
 		if path == "" {
 			return "", nil, fmt.Errorf("no request path was recorded")
@@ -361,7 +608,7 @@ func scopedHTTPCondition(ev *Event, req RuleRequest) (string, []string, error) {
 			warnings = append(warnings, "No segment of this path looks like an ID, so the pattern matches only this path.")
 		}
 	default:
-		return "", nil, fmt.Errorf("HTTP rules take scope exact, any_method or pattern")
+		return "", nil, fmt.Errorf("HTTP rules take scope exact, any_method, any_path or pattern")
 	}
 	if req.PinHeader != "" {
 		name := http.CanonicalHeaderKey(strings.TrimSpace(req.PinHeader))
@@ -423,8 +670,8 @@ type ruleReplay struct {
 }
 
 func newRuleReplay(rule *ScopedRule) (*ruleReplay, error) {
-	rp := &ruleReplay{rule: rule}
-	if rule.Condition != "" {
+	rp := &ruleReplay{rule: rule, matcher: rule.matcher}
+	if rp.matcher == nil && rule.Condition != "" {
 		m, err := facet.NewMatcher(rule.Family, rule.Condition)
 		if err != nil {
 			return nil, err
