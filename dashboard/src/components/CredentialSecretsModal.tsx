@@ -26,7 +26,10 @@ export function CredentialSecretsModal({
 }) {
   const slots = integration.slots ?? [];
   const label = credentialTypeLabel(integration.type, integration.name);
-  const [values, setValues] = useState<Record<string, string>>({});
+  // Visible slots start from their stored value; secret ones start empty.
+  const [values, setValues] = useState<Record<string, string>>(() => ({
+    ...integration.slot_values,
+  }));
   const [saving, setSaving] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   // notice: saved, but the verification probe could not reach a

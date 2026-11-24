@@ -415,7 +415,13 @@ function DetailsRow({
   const canConnect =
     i.manageable && !connected && (i.has_oauth || hasSlots || i.has_tailscale_auth);
   const canDisconnect =
-    i.manageable && (connected || canReset || verifyFailed || needsReauth || !!i.refresh_error);
+    i.manageable &&
+    (connected ||
+      canReset ||
+      verifyFailed ||
+      needsReauth ||
+      !!i.refresh_error ||
+      !!i.missing_slots?.length);
   const status = rowStatus(i, connected, hasSlots);
   const subtitle = rowSubtitle(i, connected);
   const profiles = i.profiles ?? [];
@@ -513,6 +519,7 @@ function rowStatus(i: Integration, connected: boolean, hasSlots: boolean): strin
   // not the grant's: not connected right now, but nothing for the
   // operator to re-authorise — the next sweep may well fix it.
   if (i.refresh_error) return i.refresh_error;
+  if (i.missing_slots?.length) return "missing " + i.missing_slots.join(", ").toLowerCase();
   if (i.verify_error) return "verification failed: " + i.verify_error;
   if (i.has_tailscale_auth) {
     return tailscaleStatusLabel(i.tailscale_auth?.state);

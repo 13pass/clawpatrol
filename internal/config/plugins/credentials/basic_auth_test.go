@@ -3,6 +3,7 @@ package credentials
 import (
 	"encoding/base64"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/denoland/clawpatrol/internal/config/runtime"
@@ -77,20 +78,34 @@ func TestBasicAuthInjectHTTPUsesTheStoredUsername(t *testing.T) {
 	}
 }
 
-func TestBasicAuthInjectHTTPWaitsForBothHalves(t *testing.T) {
+func TestBasicAuthInjectHTTPNamesTheMissingHalf(t *testing.T) {
 	for name, sec := range map[string]runtime.Secret{
-		"no username": {Bytes: []byte("api-token")},
-		"no password": {Extras: map[string]string{basicAuthUsernameSlot: "alice@example.org"}},
+		"Password": {Extras: map[string]string{basicAuthUsernameSlot: "alice@example.org"}},
+		"Username": {Bytes: []byte("api-token")},
 	} {
 		req, err := http.NewRequest("GET", "https://example.com/api", nil)
 		if err != nil {
 			t.Fatalf("new request: %v", err)
 		}
-		if err := (&BasicAuth{}).InjectHTTP(req.Context(), req, sec); err != nil {
-			t.Fatalf("%s: inject: %v", name, err)
+		err = (&BasicAuth{}).InjectHTTP(req.Context(), req, sec)
+		if err == nil || !strings.Contains(err.Error(), "missing "+name) {
+			t.Errorf("missing %s: err = %v, want one naming it", name, err)
 		}
 		if got := req.Header.Get("Authorization"); got != "" {
-			t.Errorf("%s: Authorization = %q, want none", name, got)
+			t.Errorf("missing %s: Authorization = %q, want none", name, got)
 		}
+	}
+}
+
+func TestBasicAuthMissingSecretSlots(t *testing.T) {
+	b := &BasicAuth{}
+	if got := b.MissingSecretSlots(map[string]bool{basicAuthUsernameSlot: true}); len(got) != 1 || got[0] != "Password" {
+		t.Errorf("username only: missing = %v, want [Password]", got)
+	}
+	if got := b.MissingSecretSlots(map[string]bool{basicAuthUsernameSlot: true, "": true}); len(got) != 0 {
+		t.Errorf("both: missing = %v, want none", got)
+	}
+	if got := (&BasicAuth{Username: "agent"}).MissingSecretSlots(map[string]bool{"": true}); len(got) != 0 {
+		t.Errorf("configured username: missing = %v, want none", got)
 	}
 }

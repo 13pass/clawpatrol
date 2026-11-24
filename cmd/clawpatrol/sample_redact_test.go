@@ -4,6 +4,9 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+
+	"github.com/denoland/clawpatrol/internal/config/plugins/credentials"
+	"github.com/denoland/clawpatrol/internal/config/runtime"
 )
 
 func TestInjectedHeaderSecrets(t *testing.T) {
@@ -28,5 +31,13 @@ func TestInjectedHeaderSecrets(t *testing.T) {
 	}
 	if s := redactCredentialSample("echo: Authorization: Basic dXNlcjpzM2NyZXQtcGFzc3dvcmQ= ok", got); strings.Contains(s, "dXNlcjpz") {
 		t.Fatalf("derived credential survived redaction: %q", s)
+	}
+}
+
+func TestCredentialRedactionsSkipVisibleSlots(t *testing.T) {
+	sec := runtime.Secret{Bytes: []byte("api-token-value"), Extras: map[string]string{"username": "api"}}
+	got := appendCredentialSecretRedactions(nil, sec, &credentials.BasicAuth{})
+	if len(got) != 1 || got[0] != "api-token-value" {
+		t.Errorf("redactions = %q, want only the password", got)
 	}
 }

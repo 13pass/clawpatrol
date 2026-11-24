@@ -4,7 +4,8 @@ package config
 // dashboard's connect-credential modal. Single-slot credentials
 // (bearer / header / cookie / api-key) declare one slot with empty
 // Name; multi-slot credentials (mtls cert+key+ca, slack bot+app)
-// declare one entry per named field.
+// declare one entry per named field, and may also keep an unnamed one
+// (basic_auth: username + password).
 //
 // At runtime the secret store packs slot values into runtime.Secret:
 // the unnamed slot fills Bytes; named slots fill Extras[Name].
@@ -25,6 +26,13 @@ type SecretSlot struct {
 // The slots may depend on the credential's config, never on its secrets.
 type SecretSlotsProvider interface {
 	SecretSlots() []SecretSlot
+}
+
+// SecretCompleteness is the optional interface of a credential whose
+// slots only work together. MissingSecretSlots returns the labels of
+// the slots still to fill, given the names of the stored ones.
+type SecretCompleteness interface {
+	MissingSecretSlots(stored map[string]bool) []string
 }
 
 // NonInjectingCredential is the optional marker a credential plugin's

@@ -3478,7 +3478,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 					// branch is harmless if one ever does.
 					switch {
 					case wantsSign:
-						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
+						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec, cc.Credential.Body)
 						headersBefore := req.Header.Clone()
 						if err := signer.SignHTTPRequest(req.Context(), req, sec, ep.Body); err != nil {
 							log.Printf("sign %s: %v", cc.Credential.Symbol.Name, err)
@@ -3487,7 +3487,7 @@ func (g *Gateway) mitmHTTPSWithCertHost(c net.Conn, host, certHost string, ep *c
 							reqBodySecretRedactions = appendCredentialSecretRedaction(reqBodySecretRedactions, v)
 						}
 					case wantsHTTP:
-						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec)
+						reqBodySecretRedactions = appendCredentialSecretRedactions(reqBodySecretRedactions, sec, cc.Credential.Body)
 						rewriter, isRewriter := injector.(runtime.HTTPRequestRewriter)
 						rewritesRequest := isRewriter && rewriter.RewritesHTTPRequest()
 						// Match existing request-signing behavior: an injection failure is logged,

@@ -664,6 +664,12 @@ type IntegrationRow struct {
 	// recent probe failed; empty for verified-ok and for plugins
 	// without a verifier.
 	VerifyError string `json:"verify_error,omitempty"`
+	// MissingSlots names the slots a credential still needs before it
+	// injects anything (config.SecretCompleteness).
+	MissingSlots []string `json:"missing_slots,omitempty"`
+	// SlotValues holds the stored values of the visible (non-secret)
+	// slots, such as a basic_auth username.
+	SlotValues map[string]string `json:"slot_values,omitempty"`
 	// NeedsReauth is true when the gateway's last refresh of this
 	// credential's OAuth token was rejected at the grant level — the
 	// stored refresh token no longer buys an access token, so the card
@@ -788,6 +794,11 @@ func (w *webMux) statusListFor(v viewer, profile string) []IntegrationRow {
 			present, _ := credentialSlotPresence(w.g.db, name)
 			if len(present) > 0 {
 				row.Connected = true
+				if c, ok := ent.Body.(config.SecretCompleteness); ok {
+					row.MissingSlots = c.MissingSecretSlots(present)
+					row.Connected = len(row.MissingSlots) == 0
+				}
+				row.SlotValues = visibleSlotValues(w.g.db, name, row.Slots)
 			}
 			// Plugins that ship a synchronous verification probe
 			// (Slack auth.test, Discord users/@me) downgrade Connected
@@ -1399,5 +1410,23 @@ func (w *webMux) collectRuleSummaries(profileFilter string) []RuleSummary {
 		}
 		return out[i].Priority > out[j].Priority
 	})
+	return out
+}
+
+// visibleSlotValues reads the stored values of the visible slots.
+func visibleSlotValues(db *sql.DB, credential string, slots []config.SecretSlot) map[string]string {
+	if !slices.ContainsFunc(slots, func(s config.SecretSlot) bool { return s.Visible }) {
+		return nil
+	}
+	sec, _, err := readCredentialSecrets(db, credential)
+	if err != nil {
+		return nil
+	}
+	out := map[string]string{}
+	for _, s := range slots {
+		if v := sec.Extras[s.Name]; s.Visible && v != "" {
+			out[s.Name] = v
+		}
+	}
 	return out
 }

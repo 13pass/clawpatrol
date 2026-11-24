@@ -211,6 +211,7 @@ function disconnectedStatusLabel(i: Integration, hasSlots: boolean): string {
       : "needs re-authorisation";
   }
   if (i.refresh_error) return i.refresh_error;
+  if (i.missing_slots?.length) return "missing " + i.missing_slots.join(", ").toLowerCase();
   if (i.verify_error) return "verification failed: " + i.verify_error;
   if (i.has_tailscale_auth) return tailscaleStatusLabel(i.tailscale_auth?.state);
   if (i.has_oauth) return "click to connect";
@@ -303,7 +304,13 @@ function Card({
   // dropped, not only overwritten by a fresh flow.
   const needsReauth = !!i.needs_reauth;
   const showDisconnect =
-    i.manageable && (connected || canReset || verifyFailed || needsReauth || !!i.refresh_error);
+    i.manageable &&
+    (connected ||
+      canReset ||
+      verifyFailed ||
+      needsReauth ||
+      !!i.refresh_error ||
+      !!i.missing_slots?.length);
   const status =
     (connected ? connectedStatusLabel(i) : disconnectedStatusLabel(i, hasSlots)) +
     (i.manageable ? "" : " · managed by an admin");

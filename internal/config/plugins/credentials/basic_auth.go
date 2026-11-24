@@ -4,7 +4,9 @@ package credentials
 
 import (
 	"context"
+	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/hashicorp/hcl/v2/hclwrite"
 	"github.com/zclconf/go-cty/cty"
@@ -18,7 +20,9 @@ import (
 // The credential secret is the raw password. `username` is set in
 // config, or, when it is left out, entered on the dashboard next to the
 // password, which keeps a per-person account (an email) out of the
-// config files. Common credential binding fields apply: use `endpoint`
+// config files; from the environment it is
+// CLAWPATROL_SECRET_<NAME>_USERNAME. Common credential binding fields
+// apply: use `endpoint`
 // or `endpoints` to bind the credential to upstreams.
 //
 // When a profile has multiple Basic Auth credentials for the same HTTPS
@@ -39,12 +43,29 @@ func (b *BasicAuth) InjectHTTP(_ context.Context, req *http.Request, sec runtime
 	username := b.Username
 	if username == "" {
 		username = sec.Extras[basicAuthUsernameSlot]
+		if (username == "") != (len(sec.Bytes) == 0) {
+			return fmt.Errorf("basic_auth: missing %s", strings.Join(b.MissingSecretSlots(map[string]bool{
+				basicAuthUsernameSlot: username != "",
+				"":                    len(sec.Bytes) > 0,
+			}), ", "))
+		}
 	}
-	if len(sec.Bytes) == 0 || username == "" {
+	if len(sec.Bytes) == 0 {
 		return nil
 	}
 	req.SetBasicAuth(username, string(sec.Bytes))
 	return nil
+}
+
+// MissingSecretSlots is part of the clawpatrol plugin API.
+func (b *BasicAuth) MissingSecretSlots(stored map[string]bool) []string {
+	var missing []string
+	for _, s := range b.SecretSlots() {
+		if !stored[s.Name] {
+			missing = append(missing, s.Label)
+		}
+	}
+	return missing
 }
 
 // SecretSlots is part of the clawpatrol plugin API.
@@ -60,6 +81,7 @@ func (b *BasicAuth) SecretSlots() []config.SecretSlot {
 
 func init() {
 	var _ runtime.HTTPCredentialRuntime = (*BasicAuth)(nil)
+	var _ config.SecretCompleteness = (*BasicAuth)(nil)
 	config.Register(&config.Plugin{
 		Kind:           config.KindCredential,
 		Type:           "basic_auth",
